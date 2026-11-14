@@ -1151,10 +1151,10 @@ ModelLists._image_retired = {
 -- HELPER FUNCTIONS
 -------------------------------------------------------------------------------
 
--- The private Codex catalog is a picker-only overlay; it does not change
--- defaults or tier placements. Keep account order, then append known candidates
--- so a narrower account catalog cannot hide a newly shipped model from the UI.
--- The caller supplies a session/account-scoped list; no live data is persisted.
+-- The private Codex catalog lists the account's models for the picker. Keep
+-- account order, then append known candidates so a narrower account catalog
+-- cannot hide a newly shipped model from the UI. (Kindle build: the same list
+-- also sets the Codex tiers, codexAccountTiers below.)
 function ModelLists.getPickerModels(provider, codex_models)
     if provider == "openai_codex" and type(codex_models) == "table" and #codex_models > 0 then
         local models, seen = {}, {}
@@ -1168,6 +1168,80 @@ function ModelLists.getPickerModels(provider, codex_models)
         return models
     end
     return ModelLists[provider] or {}
+end
+
+-- Kindle build: the Codex tiers follow the signed-in account. Each tier takes
+-- the newest model of its family that the account's catalog lists; a family
+-- the account does not list keeps the curated pick. Only plain ids
+-- (gpt-<version>-<family>) count.
+local CODEX_FAMILY_TIERS = {
+    astra = { "frontier" },
+    sol   = { "flagship" },
+    terra = { "standard" },
+    luna  = { "fast", "ultrafast" },
+}
+local CODEX_CURATED_TIERS  -- the shipped picks, kept so a later catalog can fall back to them
+
+local function codexVersion(slug)
+    local version, family = slug:match("^gpt%-(%d+[%.%d]*)%-(%a+)$")
+    if not version or not CODEX_FAMILY_TIERS[family] then return nil end
+    local parts = {}
+    for n in version:gmatch("%d+") do parts[#parts + 1] = tonumber(n) end
+    return parts, family
+end
+
+local function newer(a, b)
+    for i = 1, math.max(#a, #b) do
+        local x, y = a[i] or 0, b[i] or 0
+        if x ~= y then return x > y end
+    end
+    return false
+end
+
+--- The tier picks a Codex account catalog calls for: { tier = slug }, only
+--- for the families it lists. Pure.
+function ModelLists.codexAccountTiers(ids)
+    local best = {}
+    for _idx, slug in ipairs(type(ids) == "table" and ids or {}) do
+        local version, family
+        if type(slug) == "string" then version, family = codexVersion(slug) end
+        if version and (not best[family] or newer(version, best[family].version)) then
+            best[family] = { slug = slug, version = version }
+        end
+    end
+    local picks = {}
+    for family, tiers in pairs(CODEX_FAMILY_TIERS) do
+        for _idx, tier in ipairs(tiers) do
+            if best[family] then picks[tier] = best[family].slug end
+        end
+    end
+    return picks
+end
+
+--- Put account picks in force for this session (nil or {} = the curated
+--- ones): the Codex tier ladder, and the default model (the Standard pick)
+--- first in the Codex list, which the provider default reads.
+function ModelLists.applyCodexAccountTiers(picks)
+    picks = type(picks) == "table" and picks or {}
+    if not CODEX_CURATED_TIERS then
+        CODEX_CURATED_TIERS = {}
+        for tier, map in pairs(ModelLists._tiers) do CODEX_CURATED_TIERS[tier] = map.openai_codex end
+    end
+    for tier, map in pairs(ModelLists._tiers) do
+        local pick = picks[tier]
+        map.openai_codex = (type(pick) == "string" and pick ~= "") and pick or CODEX_CURATED_TIERS[tier]
+    end
+    local default = ModelLists._tiers.standard.openai_codex
+    local list = ModelLists.openai_codex
+    for i = #list, 1, -1 do
+        if list[i] == default then table.remove(list, i) end
+    end
+    table.insert(list, 1, default)
+    local Defaults = require("koassistant.api.defaults")
+    if Defaults.ProviderDefaults.openai_codex then
+        Defaults.ProviderDefaults.openai_codex.model = default
+    end
+    return default
 end
 
 -- Get image-generation models for a provider (nil if unsupported)

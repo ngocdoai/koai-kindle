@@ -618,7 +618,7 @@ end
 
 -- Forward declarations for mutual recursion
 local showUpdatePopup
-local performUpdate
+local performUpdate, confirmUpdate
 
 --- Translate content using the AI and show in a new viewer
 --- @param markdown_content string: The markdown content to translate
@@ -699,7 +699,7 @@ local function translateAndShowContent(markdown_content, target_language, title,
                         text = _("Update Now"),
                         callback = function()
                             UIManager:close(translated_viewer)
-                            performUpdate(update_info)
+                            confirmUpdate(update_info)
                         end,
                     },
                 })
@@ -791,7 +791,7 @@ showUpdatePopup = function(update_info)
                 text = _("Update Now"),
                 callback = function()
                     UIManager:close(update_viewer)
-                    performUpdate(update_info)
+                    confirmUpdate(update_info)
                 end,
             },
         })
@@ -1757,15 +1757,20 @@ end
 --- Main auto-update orchestrator. Called when user taps "Update Now".
 --- Downloads, extracts, verifies, and installs the update with user file preservation.
 --- @param update_info table Contains zip_url, latest_version, and other update metadata
+-- Kindle build: Update Now installs the original release, which replaces this
+-- build's own changes. Say so first; Update anyway goes on. Settings, sign-in,
+-- chats and pictures are kept either way.
+confirmUpdate = function(update_info)
+    loadUI()
+    UIManager:show(ConfirmBox:new{
+        text = _("This is a customized Kindle build.\n\nUpdating installs the original release and removes this build's changes: Codex image generation, Explain as image, 7-day image cleanup, models that follow your account and the no-questions privacy setting. Your settings, sign-in, chats and pictures are kept.\n\nTo keep the changes, merge the new release on your computer and reinstall instead."),
+        ok_text = _("Update anyway"),
+        ok_callback = function() performUpdate(update_info) end,
+    })
+end
+
 performUpdate = function(update_info)
     loadUI()
-    -- Kindle build: an upstream release would overwrite this build's own
-    -- changes (Codex images, retention, storage layout). The check still says
-    -- a release exists; installing it is done by merging on the computer.
-    UIManager:show(InfoMessage:new{
-        text = _("This is a customized Kindle build. Updating here would remove its changes, so it is disabled.\n\nMerge the new release on your computer and reinstall the plugin."),
-    })
-    do return end
     getBinPaths()
     -- Guard: don't update git-based dev installs (would destroy repo). B379:
     -- a worktree or submodule checkout has a .git FILE

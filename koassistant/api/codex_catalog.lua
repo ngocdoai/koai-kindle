@@ -2,7 +2,8 @@
 -- The caller owns OAuth, the verified catalog URL, network gating and async GET.
 -- Pass only a successful HTTP response body to cache:put(account_id, body, now).
 -- Never persist or log the response or account id; a listed slug is not proof that
--- the model can answer on this account. Do not use this list for automatic picks.
+-- the model can answer on this account (Kindle build: main.lua applyCodexCatalog
+-- derives the Codex tiers from it, ModelLists.codexAccountTiers).
 local json = require("json")
 
 local Catalog = {

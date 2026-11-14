@@ -120,6 +120,8 @@ Registry.SETTINGS_SUBKEYS = {
     internal = {
         "languages_migrated", "behavior_migrated",
         "_reasoning_v2_migrated",
+        "codex_models_reset_v1",    -- Kindle build: hand-picked Codex models cleared once
+        "codex_account_tiers",      -- Kindle build: Codex tier picks from the account catalog (ids only; refetched)
         "_xray_auto_v2_migrated",
         "_xray_auto_legacy_optin",  -- one-way legacy grant (old master=true users' per-book
                                     -- boolean opt-ins key on it); can NEVER be re-derived

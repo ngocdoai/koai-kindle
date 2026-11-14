@@ -1552,6 +1552,7 @@ function AskGPT:initSettings()
       f._data_once = nil
     end
   end
+  self:initCodexAccountModels()
 
   -- Set default values if they don't exist
   if not self.settings:has("provider") then
@@ -2523,8 +2524,67 @@ function AskGPT:codexCatalogClient()
   return self._codex_catalog_client
 end
 
+-- Kindle build: the Codex models follow the signed-in account. Once (the
+-- reset stamp), the hand-picked Codex models are cleared so the account's
+-- picks apply; then the picks last derived from the account's catalog (model
+-- ids only, features.codex_account_tiers) are put in force before the
+-- settings migration, which moves a model that was not picked by hand to the
+-- current default.
+function AskGPT:initCodexAccountModels()
+  local f = self.settings:readSetting("features") or {}
+  local default = ModelLists.applyCodexAccountTiers(f.codex_account_tiers)
+  if not f.codex_models_reset_v1 then
+    local p = "openai_codex"
+    if type(f.tier_overrides) == "table" then f.tier_overrides[p] = nil end
+    if type(f.provider_default_models) == "table" then f.provider_default_models[p] = nil end
+    if type(f.model_explicit) == "table" then f.model_explicit[p] = nil end
+    if type(f.global_tier_models) == "table" then
+      for tier, pin in pairs(f.global_tier_models) do
+        if type(pin) == "table" and pin.provider == p then f.global_tier_models[tier] = nil end
+      end
+    end
+    if f.provider == p then f.model = default end
+    f.codex_models_reset_v1 = true
+    self.settings:saveSetting("features", f)
+    self.settings:flush()
+    logger.info("KOAssistant: hand-picked Codex models cleared; the account's models apply")
+  end
+end
+
+-- A fresh account catalog: new tier picks are stored and put in force, and
+-- the active Codex model follows the new default unless it was picked by hand.
+function AskGPT:applyCodexCatalog(models)
+  local picks = ModelLists.codexAccountTiers(models)
+  if next(picks) == nil then return false end
+  local f = self.settings:readSetting("features") or {}
+  local old = type(f.codex_account_tiers) == "table" and f.codex_account_tiers or {}
+  local changed = false
+  for tier, slug in pairs(picks) do
+    if old[tier] ~= slug then changed = true end
+  end
+  for tier in pairs(old) do
+    if picks[tier] == nil then changed = true end
+  end
+  if not changed then return false end
+  f.codex_account_tiers = picks
+  local default = ModelLists.applyCodexAccountTiers(picks)
+  local explicit = type(f.model_explicit) == "table" and f.model_explicit.openai_codex
+  if f.provider == "openai_codex" and not explicit and f.model ~= default then
+    logger.info("KOAssistant: Codex model follows the account:", tostring(f.model), "->", default)
+    f.model = default
+  end
+  self.settings:saveSetting("features", f)
+  self.settings:flush()
+  self:updateConfigFromSettings()
+  return true
+end
+
 function AskGPT:refreshCodexCatalog(on_change, force)
-  self:codexCatalogClient():refresh(function(_, source, reason, updated)
+  self:codexCatalogClient():refresh(function(models, source, reason, updated)
+    if updated and source == "live" then
+      local ok, err = pcall(self.applyCodexCatalog, self, models)
+      if not ok then logger.warn("KOAssistant: applying the Codex catalog failed:", err) end
+    end
     if on_change and updated then on_change() end
     if force then
       UIManager:show(Notification:new{
