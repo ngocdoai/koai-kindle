@@ -40,7 +40,8 @@ local function makeCollectedRequest(url, headers, body, response_transform)
                 headers = headers or {},
                 body = body or "",
                 resolved_ip = resolved_ip,
-                timeout = 180,
+                timeout = 300,
+                max_response_bytes = 48 * 1024 * 1024,
             })
             if status_code ~= 200 then
                 local message = status_code
@@ -72,7 +73,7 @@ local function makeCollectedRequest(url, headers, body, response_transform)
 end
 
 function CodexHandler:buildRequestBody(message_history, config)
-    local model = config.model or "gpt-5.6-terra"
+    local model = config.model or require("koassistant_model_lists").openai_codex[1]
     local built = self:buildResponsesRequest(message_history, config, model)
     built.url = CODEX_URL
     built.provider = "openai_codex"
@@ -80,6 +81,10 @@ function CodexHandler:buildRequestBody(message_history, config)
     -- ChatGPT's Codex backend chooses its own output ceiling and rejects the
     -- public Responses API's max_output_tokens field.
     built.body.max_output_tokens = nil
+    if require("koassistant_codex_images").enabled(config) then
+        built.body.tools = built.body.tools or {}
+        table.insert(built.body.tools, require("koassistant_codex_images").tool(config.features))
+    end
     return built
 end
 
@@ -132,8 +137,10 @@ function CodexHandler:query(message_history, config)
 
     local response_parser = function(response)
         if debug_enabled then
-            DebugUtils.print("OpenAI Codex Parsed Response:", response, config)
+            -- Response output may contain megabytes of base64 image data.
+            print("OpenAI Codex response status:", response.status)
         end
+        require("koassistant_codex_images").prepareResponse(response)
         local parse_success, result, reasoning, web_search_used = ResponseParser:parseResponse(response, parser_key)
         if not parse_success then
             return false, "Error: " .. result

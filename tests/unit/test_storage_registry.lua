@@ -231,6 +231,9 @@ local function scanStorageLiterals(plugin_dir)
     for token in out:gmatch('/(koassistant_[%w_]+)') do
         found[token] = true
     end
+    for token in out:gmatch('/(data/koassistant/[%w_%.]+)') do
+        found[token] = true
+    end
     return found
 end
 

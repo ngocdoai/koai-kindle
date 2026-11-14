@@ -341,7 +341,7 @@ local function exportAllArtifacts(ctx)
     if dir_option == "custom" and features.export_custom_path and features.export_custom_path ~= "" then
         default_path = features.export_custom_path
     elseif dir_option == "exports_folder" or dir_option == "ask" then
-        default_path = DataStorage:getDataDir() .. "/koassistant_exports"
+        default_path = DataStorage:getDataDir() .. "/data/koassistant/exports"
     else
         default_path = DataStorage:getDataDir()
     end

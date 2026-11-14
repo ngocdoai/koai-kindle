@@ -408,23 +408,30 @@ end
 --- @param ssl_sock table Connected SSL socket (after headers consumed)
 --- @param is_chunked boolean Whether Transfer-Encoding is chunked
 --- @return string body
-local function readFullBody(ssl_sock, is_chunked)
-    local chunks = {}
+local function readFullBody(ssl_sock, is_chunked, max_bytes)
+    local chunks, bytes = {}, 0
+    local function append(chunk)
+        if not chunk or chunk == "" then return true end
+        if max_bytes and bytes + #chunk > max_bytes then return false end
+        chunks[#chunks + 1] = chunk
+        bytes = bytes + #chunk
+        return true
+    end
     if is_chunked then
         while true do
             local size_line = ssl_sock:receive("*l")
             if not size_line then break end
             local chunk_size = tonumber(size_line:match("^%s*(%x+)"), 16)
             if not chunk_size or chunk_size == 0 then break end
+            if max_bytes and bytes + chunk_size > max_bytes then return nil, "response too large" end
             local chunk_data = ssl_sock:receive(chunk_size)
-            if chunk_data then table.insert(chunks, chunk_data) end
+            if not append(chunk_data) then return nil, "response too large" end
             ssl_sock:receive("*l")  -- trailing CRLF
         end
     else
         while true do
             local chunk, err, partial = ssl_sock:receive(8192)
-            if chunk then table.insert(chunks, chunk)
-            elseif partial and #partial > 0 then table.insert(chunks, partial) end
+            if not append(chunk or partial) then return nil, "response too large" end
             if err then break end
         end
     end
@@ -617,6 +624,24 @@ function BaseHandler.writeAllToFD(fd, data)
     return true
 end
 
+--- LTN12 sink that stops before retaining more than max_bytes of response data.
+--- An optional second return reports overflow even if the HTTP client swallows
+--- the sink's error. Existing callers without a limit keep their old behavior.
+function BaseHandler.limitedSink(chunks, max_bytes)
+    local bytes, exceeded = 0, false
+    return function(chunk)
+        if chunk then
+            if bytes + #chunk > max_bytes then
+                exceeded = true
+                return nil, "response too large"
+            end
+            chunks[#chunks + 1] = chunk
+            bytes = bytes + #chunk
+        end
+        return 1
+    end, function() return exceeded end
+end
+
 --- Complete (non-streaming) HTTP(S) fetch for use INSIDE a subprocess.
 --- Chooses the macOS raw-SSL path (http.request hangs after fork on macOS)
 --- or the standard http.request path. Pre-resolve DNS in the PARENT with
@@ -624,13 +649,18 @@ end
 --- @param url string
 --- @param opts table: { method = "GET"|"POST" (default GET), headers = table,
 ---                      body = string|nil, resolved_ip = string|nil,
----                      timeout = seconds (default 120) }
+---                      timeout = seconds (default 120),
+---                      max_response_bytes = number|nil }
 --- @return number|nil status_code (nil = transport error), string body_or_error
 function BaseHandler.fetchInSubprocess(url, opts)
     opts = opts or {}
     opts.headers = BaseHandler.withUserAgent(opts.headers)
     local method = opts.method or "GET"
     local timeout = opts.timeout or 120
+    local max_bytes = opts.max_response_bytes
+    if type(max_bytes) ~= "number" or max_bytes < 0 or max_bytes % 1 ~= 0 then
+        max_bytes = nil
+    end
     local is_https = url:sub(1, 8) == "https://"
     if is_https and ffi.os == "OSX" then
         local host = url:match("https://([^/:]+)")
@@ -639,8 +669,9 @@ function BaseHandler.fetchInSubprocess(url, opts)
         local ssl_sock = BaseHandler.connectSSLInSubprocess(opts.resolved_ip, host, port, timeout)
         local status_code, is_chunked, resp_headers = sendRequestAndReadHeaders(
             ssl_sock, method, path, host, opts.headers, opts.body)
-        local resp_body = readFullBody(ssl_sock, is_chunked)
+        local resp_body, body_error = readFullBody(ssl_sock, is_chunked, max_bytes)
         ssl_sock:close()
+        if body_error then return nil, body_error, resp_headers end
         return status_code, resp_body, resp_headers
     end
     local su_ok, socketutil = pcall(require, "socketutil")
@@ -663,11 +694,17 @@ function BaseHandler.fetchInSubprocess(url, opts)
         req_headers["Host"] = host_header
     end
     local chunks = {}
+    local sink, exceeded
+    if max_bytes then
+        sink, exceeded = BaseHandler.limitedSink(chunks, max_bytes)
+    else
+        sink = ltn12.sink.table(chunks)
+    end
     local request = {
         url = request_url,
         method = method,
         headers = req_headers,
-        sink = ltn12.sink.table(chunks),
+        sink = sink,
     }
     if opts.body then
         request.source = ltn12.source.string(opts.body)
@@ -675,6 +712,7 @@ function BaseHandler.fetchInSubprocess(url, opts)
     local ok, code, resp_headers = pcall(function()
         return socket.skip(1, http.request(request))
     end)
+    if exceeded and exceeded() then return nil, "response too large" end
     if not ok then
         return nil, tostring(code)
     end

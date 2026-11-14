@@ -14,7 +14,7 @@ local ChatHistoryManager = {}
 local index_operation_pending = false
 
 -- Constants
-ChatHistoryManager.CHAT_DIR = DataStorage:getDataDir() .. "/koassistant_chats"
+ChatHistoryManager.CHAT_DIR = DataStorage:getDataDir() .. "/data/koassistant/chats"
 ChatHistoryManager.GENERAL_CHAT_FILE = DataStorage:getSettingsDir() .. "/koassistant_general_chats.lua"
 ChatHistoryManager.LIBRARY_CHAT_FILE = DataStorage:getSettingsDir() .. "/koassistant_library_chats.lua"
 

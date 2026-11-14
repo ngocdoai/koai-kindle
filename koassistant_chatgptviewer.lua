@@ -38,6 +38,8 @@ local _ = require("koassistant_gettext")
 local Screen = Device.screen
 local MD = require("apps/filemanager/lib/md")
 local MathRender = require("koassistant_math")
+local ChatMarkup = require("koassistant_chat_markup")
+local Mermaid = require("koassistant_mermaid")
 local SpinWidget = require("ui/widget/spinwidget")
 local UIConstants = require("koassistant_ui.constants")
 local Languages = require("koassistant_languages")
@@ -793,10 +795,28 @@ local function showLinkDialog(link_url)
 end
 
 -- Handle link taps in HTML content
-local function handleLinkTap(link)
-    if link and link.uri then
-        showLinkDialog(link.uri)
+local function handleLinkTap(link, viewer)
+    if not (link and link.uri) then return end
+    if link.uri:match("^koassistant%-image:") then
+        local name = require("koassistant_codex_images").nameFromURI(link.uri)
+        local ok, shown = pcall(require("koassistant_codex_images").show, name)
+        if not ok or not shown then
+            UIManager:show(InfoMessage:new{ text = _("This generated image is unavailable or has been deleted.") })
+        end
+        return
     end
+    local diagram_id = link.uri:match("^koassistant%-mermaid://(%d+)$")
+    if diagram_id then
+        local source = viewer and viewer._mermaid_sources
+            and viewer._mermaid_sources[tonumber(diagram_id)]
+        if source then
+            local ok = Mermaid.show(source, _("Flowchart"))
+            if ok then return end
+        end
+        UIManager:show(InfoMessage:new{ text = _("This Mermaid diagram cannot be displayed; its source remains in the chat.") })
+        return
+    end
+    showLinkDialog(link.uri)
 end
 
 -- Show content picker dialog for Copy/Note "Ask every time" mode
@@ -1189,7 +1209,25 @@ local function getViewerCSS(text_align)
 body {
     margin: 0;
     line-height: 1.3;
+    font-family: 'Noto Sans', 'FreeSerif', sans-serif;
 %s    padding: 0;
+}
+
+img, svg {
+    max-width: 100%%;
+    height: auto;
+}
+
+.koa-generated-image {
+    display: block;
+    text-align: center;
+    margin: 0.5em 0;
+}
+
+.koa-generated-image img {
+    display: block;
+    max-width: 100%%;
+    max-height: %dpx;
 }
 
 blockquote {
@@ -1212,7 +1250,7 @@ code {
     background-color: #f0f0f0;
     padding: 0.1em 0.3em;
     border-radius: 3px;
-    font-family: monospace;
+    font-family: 'Droid Sans Mono', 'Noto Sans', 'FreeSerif', monospace;
     font-size: 0.9em;
 }
 
@@ -1288,7 +1326,42 @@ hr {
     border-top: 1px solid #999;
     margin: 0.8em 0;
 }
-]], align_rule)
+]], align_rule, math.floor(Screen:getHeight() * 0.6))
+end
+
+local function renderChatHTML(viewer, source_text)
+    local dict_lang = viewer.configuration and viewer.configuration.features
+        and viewer.configuration.features.dictionary_language
+    local needs_rtl_fix = (viewer.compact_view or viewer.dictionary_view) and Languages.isRTL(dict_lang)
+    local text = source_text or "Missing text."
+    if needs_rtl_fix then text = fixIPABidi(text) end
+
+    viewer._mermaid_sources = {}
+    text = ChatMarkup.linkMermaidBlocks(text, function(source)
+        if #viewer._mermaid_sources >= 8 or #source > 8192 then return nil end
+        local id = #viewer._mermaid_sources + 1
+        viewer._mermaid_sources[id] = source
+        return id
+    end, _("View diagram"))
+
+    local image_state = {}
+    local masked, restore_images = ChatMarkup.protectImages(applyMath(viewer, text), function(uri)
+        return require("koassistant_codex_images").inlineHTML(uri, image_state)
+    end)
+    local auto_linked = autoLinkUrls(masked)
+    local bracket_escaped = preprocessBrackets(auto_linked)
+    local preprocessed_text = preprocessMarkdownTables(bracket_escaped)
+    local html_body, err = MD(preprocessed_text, {})
+    if err then
+        logger.warn("ChatGPTViewer: could not generate HTML")
+        local escaped = text:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;")
+        html_body = "<pre>" .. escaped .. "</pre>"
+    else
+        html_body = restore_images(ChatMarkup.stripRawImages(html_body))
+    end
+    html_body = addHtmlBidiAttributes(html_body, { use_starts_with_rtl = needs_rtl_fix })
+    return applyExchangePageBreaks(html_body, viewer.configuration,
+        viewer._stream_carry_anchor, viewer._stream_carry_occurrence)
 end
 
 local ChatGPTViewer = InputContainer:extend {
@@ -1946,6 +2019,12 @@ function ChatGPTViewer:init()
         end
       end
     end
+  end
+
+  -- Image replies open in the renderer that can display their local previews,
+  -- even when the global default was text-only. The user can still toggle TXT.
+  if require("koassistant_codex_images").hasReference(self.text) then
+    self.render_markdown = true
   end
 
   -- Minimal buttons for the dictionary windows (compact and full-size)
@@ -3243,30 +3322,7 @@ function ChatGPTViewer:init()
   -- plain text otherwise
   local html_body, display_text
   if self.render_markdown then
-    -- Convert Markdown to HTML and render in a ScrollHtmlWidget
-    -- 1. Auto-linkify plain URLs, 2. Escape non-link brackets, 3. Convert tables
-    local source_text = self.text
-    -- Fix IPA BiDi issues before HTML conversion when RTL dictionary language
-    if needs_rtl_fix then
-      source_text = fixIPABidi(source_text)
-    end
-    local auto_linked = autoLinkUrls(applyMath(self, source_text))
-    local bracket_escaped = preprocessBrackets(auto_linked)
-    local preprocessed_text = preprocessMarkdownTables(bracket_escaped)
-    local err
-    html_body, err = MD(preprocessed_text, {})
-    if err then
-      logger.warn("ChatGPTViewer: could not generate HTML", err)
-      -- Fallback to plain text if HTML generation fails
-      html_body = "<pre>" .. (self.text or "Missing text.") .. "</pre>"
-    end
-    -- For dictionary popup with RTL language, use "starts with RTL" detection
-    local bidi_opts = { use_starts_with_rtl = needs_rtl_fix }
-    html_body = addHtmlBidiAttributes(html_body, bidi_opts)
-    -- Page breaks run POST-bidi (2026-08-15): the paragraph splitter copies
-    -- the classified opening tag so a split Arabic paragraph keeps direction
-    html_body = applyExchangePageBreaks(html_body, self.configuration,
-      self._stream_carry_anchor, self._stream_carry_occurrence)
+    html_body = renderChatHTML(self, self.text)
   else
     -- If not rendering Markdown, optionally strip markdown syntax for cleaner display
     display_text = self.strip_markdown_in_text_mode and stripMarkdown(self.text, self.para_direction_rtl) or self.text
@@ -3281,13 +3337,14 @@ function ChatGPTViewer:init()
     if html_body then
       return ScrollHtmlWidget:new {
         html_body = html_body,
+        html_resource_directory = require("koassistant_image_generator").getImagesDir(),
         css = getViewerCSS(self.text_align),
         default_font_size = Screen:scaleBySize(self.markdown_font_size),
         width = self.width - 2 * self.text_padding - 2 * self.text_margin,
         height = h,
         dialog = self,
         highlight_text_selection = true,
-        html_link_tapped_callback = handleLinkTap,
+        html_link_tapped_callback = function(link) handleLinkTap(link, self) end,
       }
     end
     return ScrollTextWidget:new {
@@ -4797,6 +4854,8 @@ function ChatGPTViewer:appendSelectionToNotebook(text)
 end
 
 function ChatGPTViewer:update(new_text, scroll_to_bottom)
+  if require("koassistant_codex_images").hasReference(new_text)
+      and new_text ~= self.text then self.render_markdown = true end
   self.text = new_text
   -- New content invalidates the init-time carry anchor: keeping it would pin a
   -- stray page break at an old paragraph. A reply landing on this path (B5
@@ -4810,36 +4869,19 @@ function ChatGPTViewer:update(new_text, scroll_to_bottom)
   end
   
   if self.render_markdown then
-    -- Convert Markdown to HTML and update the ScrollHtmlWidget
-    -- 1. Auto-linkify plain URLs, 2. Escape non-link brackets, 3. Convert tables
-    local auto_linked = autoLinkUrls(applyMath(self, new_text))
-    local bracket_escaped = preprocessBrackets(auto_linked)
-    local preprocessed_text = preprocessMarkdownTables(bracket_escaped)
-    local html_body, err = MD(preprocessed_text, {})
-    if err then
-      logger.warn("ChatGPTViewer: could not generate HTML", err)
-      html_body = "<pre>" .. (new_text or "Missing text.") .. "</pre>"
-    end
-    -- For dictionary popup with RTL language, use "starts with RTL" detection
-    local dict_lang = self.configuration and self.configuration.features
-        and self.configuration.features.dictionary_language
-    local bidi_opts = { use_starts_with_rtl = (self.compact_view or self.dictionary_view) and Languages.isRTL(dict_lang) }
-    html_body = addHtmlBidiAttributes(html_body, bidi_opts)
-    -- Page breaks run POST-bidi (2026-08-15): the paragraph splitter copies
-    -- the classified opening tag so a split Arabic paragraph keeps direction
-    html_body = applyExchangePageBreaks(html_body, self.configuration,
-      self._stream_carry_anchor, self._stream_carry_occurrence)
+    local html_body = renderChatHTML(self, new_text)
 
     -- Recreate the ScrollHtmlWidget with new content
     self.scroll_text_w = ScrollHtmlWidget:new {
       html_body = html_body,
+        html_resource_directory = require("koassistant_image_generator").getImagesDir(),
       css = getViewerCSS(self.text_align),
       default_font_size = Screen:scaleBySize(self.markdown_font_size),
       width = self.width - 2 * self.text_padding - 2 * self.text_margin,
       height = self.textw:getSize().h - 2 * self.text_padding - 2 * self.text_margin,
       dialog = self,
       highlight_text_selection = true,
-      html_link_tapped_callback = handleLinkTap,
+      html_link_tapped_callback = function(link) handleLinkTap(link, self) end,
     }
     
     -- Update the frame container with the new scroll widget
@@ -4988,37 +5030,17 @@ function ChatGPTViewer:rebuildScrollWidget()
   local needs_rtl_fix = (self.compact_view or self.dictionary_view) and Languages.isRTL(dict_lang)
 
   if self.render_markdown then
-    -- Convert to markdown
-    -- 1. Auto-linkify plain URLs, 2. Escape non-link brackets, 3. Convert tables
-    local source_text = self.text
-    -- Fix IPA BiDi issues before HTML conversion when RTL dictionary language
-    if needs_rtl_fix then
-      source_text = fixIPABidi(source_text)
-    end
-    local auto_linked = autoLinkUrls(applyMath(self, source_text))
-    local bracket_escaped = preprocessBrackets(auto_linked)
-    local preprocessed_text = preprocessMarkdownTables(bracket_escaped)
-    local html_body, err = MD(preprocessed_text, {})
-    if err then
-      logger.warn("ChatGPTViewer: could not generate HTML", err)
-      html_body = "<pre>" .. (self.text or "Missing text.") .. "</pre>"
-    end
-    -- For dictionary popup with RTL language, use "starts with RTL" detection
-    local bidi_opts = { use_starts_with_rtl = needs_rtl_fix }
-    html_body = addHtmlBidiAttributes(html_body, bidi_opts)
-    -- Page breaks run POST-bidi (2026-08-15): the paragraph splitter copies
-    -- the classified opening tag so a split Arabic paragraph keeps direction
-    html_body = applyExchangePageBreaks(html_body, self.configuration,
-      self._stream_carry_anchor, self._stream_carry_occurrence)
+    local html_body = renderChatHTML(self, self.text)
     self.scroll_text_w = ScrollHtmlWidget:new {
       html_body = html_body,
+        html_resource_directory = require("koassistant_image_generator").getImagesDir(),
       css = getViewerCSS(self.text_align),
       default_font_size = Screen:scaleBySize(self.markdown_font_size),
       width = self.width - 2 * self.text_padding - 2 * self.text_margin,
       height = textw_height - 2 * self.text_padding - 2 * self.text_margin,
       dialog = self,
       highlight_text_selection = true,
-      html_link_tapped_callback = handleLinkTap,
+      html_link_tapped_callback = function(link) handleLinkTap(link, self) end,
     }
   else
     -- Convert to plain text with optional markdown stripping
@@ -5475,7 +5497,7 @@ function ChatGPTViewer:exportCacheContent()
   if dir_option == "custom" and features.export_custom_path and features.export_custom_path ~= "" then
     default_path = features.export_custom_path
   elseif dir_option == "exports_folder" or dir_option == "ask" then
-    default_path = DataStorage:getDataDir() .. "/koassistant_exports"
+    default_path = DataStorage:getDataDir() .. "/data/koassistant/exports"
   else
     default_path = DataStorage:getDataDir()
   end
@@ -5541,32 +5563,17 @@ function ChatGPTViewer:toggleTranslateQuoteVisibility()
   local textw_height = self.textw:getSize().h
 
   if self.render_markdown then
-    local auto_linked = autoLinkUrls(self.text)
-    local bracket_escaped = preprocessBrackets(auto_linked)
-    local preprocessed_text = preprocessMarkdownTables(bracket_escaped)
-    local html_body, err = MD(preprocessed_text, {})
-    if err then
-      logger.warn("ChatGPTViewer: could not generate HTML", err)
-      html_body = "<pre>" .. (self.text or "Missing text.") .. "</pre>"
-    end
-    -- For dictionary popup with RTL language, use "starts with RTL" detection
-    local dict_lang = self.configuration and self.configuration.features
-        and self.configuration.features.dictionary_language
-    local bidi_opts = { use_starts_with_rtl = (self.compact_view or self.dictionary_view) and Languages.isRTL(dict_lang) }
-    html_body = addHtmlBidiAttributes(html_body, bidi_opts)
-    -- Page breaks run POST-bidi (2026-08-15): the paragraph splitter copies
-    -- the classified opening tag so a split Arabic paragraph keeps direction
-    html_body = applyExchangePageBreaks(html_body, self.configuration,
-      self._stream_carry_anchor, self._stream_carry_occurrence)
+    local html_body = renderChatHTML(self, self.text)
     self.scroll_text_w = ScrollHtmlWidget:new {
       html_body = html_body,
+        html_resource_directory = require("koassistant_image_generator").getImagesDir(),
       css = getViewerCSS(self.text_align),
       default_font_size = Screen:scaleBySize(self.markdown_font_size),
       width = self.scroll_text_w.width,
       height = self.scroll_text_w.height,
       dialog = self,
       highlight_text_selection = true,
-      html_link_tapped_callback = handleLinkTap,
+      html_link_tapped_callback = function(link) handleLinkTap(link, self) end,
     }
   else
     -- Plain text mode with optional markdown stripping
@@ -6618,25 +6625,7 @@ function ChatGPTViewer:refreshMarkdownDisplay()
     return
   end
 
-  -- Re-convert markdown with new settings and update display
-  -- 1. Auto-linkify plain URLs, 2. Escape non-link brackets, 3. Convert tables
-  local auto_linked = autoLinkUrls(self.text)
-  local bracket_escaped = preprocessBrackets(auto_linked)
-  local preprocessed_text = preprocessMarkdownTables(bracket_escaped)
-  local html_body, err = MD(preprocessed_text, {})
-  if err then
-    logger.warn("ChatGPTViewer: could not generate HTML", err)
-    html_body = "<pre>" .. (self.text or "Missing text.") .. "</pre>"
-  end
-  -- For dictionary popup with RTL language, use "starts with RTL" detection
-  local dict_lang = self.configuration and self.configuration.features
-      and self.configuration.features.dictionary_language
-  local bidi_opts = { use_starts_with_rtl = (self.compact_view or self.dictionary_view) and Languages.isRTL(dict_lang) }
-  html_body = addHtmlBidiAttributes(html_body, bidi_opts)
-  -- Page breaks run POST-bidi (2026-08-15): the paragraph splitter copies
-  -- the classified opening tag so a split Arabic paragraph keeps direction
-  html_body = applyExchangePageBreaks(html_body, self.configuration,
-    self._stream_carry_anchor, self._stream_carry_occurrence)
+  local html_body = renderChatHTML(self, self.text)
 
   -- Calculate current height
   local textw_height = self.textw:getSize().h
@@ -6644,13 +6633,14 @@ function ChatGPTViewer:refreshMarkdownDisplay()
   -- Create new scroll widget with updated settings
   self.scroll_text_w = ScrollHtmlWidget:new {
     html_body = html_body,
+        html_resource_directory = require("koassistant_image_generator").getImagesDir(),
     css = getViewerCSS(self.text_align),
     default_font_size = Screen:scaleBySize(self.markdown_font_size),
     width = self.width - 2 * self.text_padding - 2 * self.text_margin,
     height = textw_height - 2 * self.text_padding - 2 * self.text_margin,
     dialog = self,
     highlight_text_selection = true,
-    html_link_tapped_callback = handleLinkTap,
+    html_link_tapped_callback = function(link) handleLinkTap(link, self) end,
   }
 
   -- Update the frame container

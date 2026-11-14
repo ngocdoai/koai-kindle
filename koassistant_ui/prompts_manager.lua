@@ -850,13 +850,15 @@ function PromptsManager:showPromptDetails(prompt)
         -- was misleading, device 2026-08-13)
         info_text = info_text .. "\n\n"
             .. (prompt.local_note or _("This is a local action: no AI call is made."))
-        if prompt.id == "image_gen" then
+        if prompt.id == "image_gen" or prompt.id == "image_explain" then
             -- The REAL prompt template, rendered through the live builder with
             -- the current framing toggles — display can never drift from wire
             local ImageGenerator = require("koassistant_image_generator")
             local feats = self.plugin.settings:readSetting("features") or {}
             info_text = info_text .. "\n\n" .. _("─── Image Prompt ───")
-                .. "\n" .. ImageGenerator.promptTemplateText(feats)
+                .. "\n" .. ImageGenerator.promptTemplateText(feats,
+                    prompt.id == "image_explain" and "study" or nil,
+                    self.plugin.getEffectivePrimaryLanguage and self.plugin:getEffectivePrimaryLanguage())
                 .. "\n\n" .. _("Book title/author and surrounding text are included only when available for the request.")
         end
     else

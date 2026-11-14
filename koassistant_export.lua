@@ -389,7 +389,7 @@ function Export.getDirectory(settings, book_path, chat_type)
     -- Determine base directory
     local base_dir
     if dir_option == "exports_folder" then
-        base_dir = DataStorage:getDataDir() .. "/koassistant_exports"
+        base_dir = DataStorage:getDataDir() .. "/data/koassistant/exports"
     elseif dir_option == "custom" then
         base_dir = custom_path
         if not base_dir or base_dir == "" then
@@ -397,7 +397,7 @@ function Export.getDirectory(settings, book_path, chat_type)
         end
     else
         -- Default fallback
-        base_dir = DataStorage:getDataDir() .. "/koassistant_exports"
+        base_dir = DataStorage:getDataDir() .. "/data/koassistant/exports"
     end
 
     -- Add subfolder based on chat type

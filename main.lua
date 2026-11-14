@@ -199,6 +199,8 @@ local AskGPT = WidgetContainer:extend{
 }
 
 function AskGPT:init()
+  util.makePath(DataStorage:getDataDir() .. "/data/koassistant")
+  require("koassistant_image_generator").startRetention()
   logger.dbg("KOAssistant plugin: init() called")
 
   -- Store configuration on the instance (single source of truth)
@@ -267,6 +269,14 @@ function AskGPT:init()
       end)
     end
   end
+
+  -- Codex catalog refresh is independent of software updates. A deferred,
+  -- read-only fetch keeps provider submenu builders free of network side effects.
+  UIManager:scheduleIn(25, function()
+    if NetworkMgr:isWifiOn() and self:codexCatalogClient():account() then
+      self:refreshCodexCatalog()
+    end
+  end)
 
   -- Add to highlight dialog if highlight feature is available.
   -- All KOAssistant buttons register UNCONDITIONALLY; visibility is decided per
@@ -2508,8 +2518,32 @@ function AskGPT:getProviderDescriptor(provider_id)
   }
 end
 
+-- Codex discovery is deliberately separate from the universal fetch-to-custom
+-- flow: its private list is display-only and never written to settings.
+function AskGPT:codexCatalogClient()
+  if not self._codex_catalog_client then
+    local Client = require("koassistant_codex_catalog_client")
+    self._codex_catalog_client = Client.new(self.settings, ModelLists.openai_codex)
+  end
+  return self._codex_catalog_client
+end
+
+function AskGPT:refreshCodexCatalog(on_change, force)
+  self:codexCatalogClient():refresh(function(_, source, reason, updated)
+    if on_change and updated then on_change() end
+    if force then
+      UIManager:show(Notification:new{
+        text = updated and _("Subscription models updated for this session")
+          or (source == "live" and _("Could not refresh; keeping cached subscription models")
+          or _("Subscription catalog unavailable; showing curated models")),
+        timeout = 2,
+      })
+    end
+  end, force)
+end
+
 function AskGPT:providerSupportsFetch(provider_id)
-  if provider_id == "openai_codex" then return false end  -- no models endpoint
+  if provider_id == "openai_codex" then return false end  -- separate async discovery
   local d = self:getProviderDescriptor(provider_id)
   return d ~= nil and type(d.base_url) == "string" and d.base_url ~= ""
 end
@@ -3407,6 +3441,10 @@ function AskGPT:buildProviderMenu(simplified, show_all, hub)
           self_ref:showApiKeyDialog(prov_id, display_name, false,
             menuRefresher(touchmenu_instance))
         end
+      elseif prov_id == "openai_codex" then
+        -- An explicit provider pick is safe to refresh; menu-search builders
+        -- remain side-effect-free and never initiate network traffic.
+        self_ref:refreshCodexCatalog()
       end
     end
   end
@@ -4032,6 +4070,8 @@ function AskGPT:switchModel(provider, model, provider_display_name)
     else
       self:showApiKeyDialog(provider, provider_display_name, false)
     end
+  elseif provider == "openai_codex" then
+    self:refreshCodexCatalog()
   end
 end
 
@@ -4046,6 +4086,7 @@ function AskGPT:buildModelMenu(simplified, provider_override)
 
   -- Get models: built-in providers have model lists, custom providers only have custom models
   local models = {}
+  local codex_listed = nil
   local ollama_installed = nil  -- set = installed names on the active server (nil = never fetched)
   if provider == "ollama" then
     -- Live list: a local server can only run PULLED models, so the menu renders
@@ -4058,8 +4099,15 @@ function AskGPT:buildModelMenu(simplified, provider_override)
       ollama_installed = {}
       for _idx, m in ipairs(models) do ollama_installed[m] = true end
     end
+  elseif provider == "openai_codex" then
+    local discovered, source = self:codexCatalogClient():models()
+    models = ModelLists.getPickerModels(provider, discovered)
+    if source == "live" then
+      codex_listed = {}
+      for _idx, m in ipairs(discovered) do codex_listed[m] = true end
+    end
   elseif not is_custom_provider then
-    models = ModelLists[provider] or {}
+    models = ModelLists.getPickerModels(provider)
   end
 
   -- Get defaults
@@ -4219,6 +4267,11 @@ function AskGPT:buildModelMenu(simplified, provider_override)
     if ollama_installed and not ollama_installed[model] then
       display_name = display_name .. " " .. _("(not installed)")
     end
+    -- The account catalog describes display visibility, not serving rights.
+    -- Keep a saved selection visible even if this list no longer contains it.
+    if codex_listed and not codex_listed[model] then
+      display_name = display_name .. " " .. _("(not in account list)")
+    end
 
     -- Add default indicators
     local is_system_default = (model == system_default)
@@ -4272,6 +4325,17 @@ function AskGPT:buildModelMenu(simplified, provider_override)
         is_custom = false,
       })
       listed[models[i]] = true
+    end
+  end
+
+  if provider == "openai_codex" then
+    local f = self.settings:readSetting("features") or {}
+    local selected = self:getCurrentProvider() == provider and f.model or nil
+    for _idx, pinned in ipairs({ selected or "", effective_default }) do
+      if pinned ~= "" and not listed[pinned] then
+        table.insert(all_models, { name = pinned, is_custom = false })
+        listed[pinned] = true
+      end
     end
   end
 
@@ -4602,6 +4666,16 @@ function AskGPT:buildModelMenu(simplified, provider_override)
       })
     end
 
+    if provider == "openai_codex" then
+      table.insert(items, {
+        text = _("Refresh subscription models"),
+        keep_menu_open = true,
+        callback = function(touchmenu_instance)
+          self_ref:refreshCodexCatalog(menuRefresher(touchmenu_instance), true)
+        end,
+      })
+    end
+
     -- Universal provider tooling (REVISION 2 M2): live model-list fetch and the
     -- micro probe for ANY provider with a fetchable endpoint, built-in or custom.
     -- Ollama: the fetch is a cache REFRESH, not an add-picker — the live list IS
@@ -4699,7 +4773,8 @@ function AskGPT:buildTierMenu(provider)
       end
     end
     if not self_ref:isCustomProvider(provider) then
-      for _idx, m in ipairs(ModelLists[provider] or {}) do add(m) end
+      local discovered = provider == "openai_codex" and self_ref:codexCatalogClient():models() or nil
+      for _idx, m in ipairs(ModelLists.getPickerModels(provider, discovered)) do add(m) end
     end
     for _idx, m in ipairs(self_ref:getCustomModels(provider)) do add(m) end
     add(override)
@@ -6831,6 +6906,7 @@ end
 
 -- Generated-images browser (Settings → Advanced → Image Generation)
 function AskGPT:showImageBrowser()
+  pcall(require("koassistant_image_generator").cleanupExpired)
   local ImageBrowser = require("koassistant_image_browser")
   ImageBrowser.show()
 end
@@ -15987,6 +16063,10 @@ end
 --- "building". Stop it now (nothing is lost that the sleep had not already
 --- lost) and park the build for onNetworkConnected to pick the same step back
 --- up. Never returns true: Suspend is a broadcast every module must see.
+function AskGPT:onResume()
+  pcall(require("koassistant_image_generator").cleanupExpired)
+end
+
 function AskGPT:onSuspend()
   if not Device:hasWifiManager() then return end
   -- A reconnect fire still in its settle delay would land in this sleep's
@@ -17192,7 +17272,8 @@ function AskGPT:showReasoningModelBrowser(on_close_callback, show_all)
   local function showModels(provider)
     local features = self_ref.settings:readSetting("features") or {}
     local buttons = {}
-    for _idx, model in ipairs(ModelLists[provider] or {}) do
+    local discovered = provider == "openai_codex" and self_ref:codexCatalogClient():models() or nil
+    for _idx, model in ipairs(ModelLists.getPickerModels(provider, discovered)) do
       if ModelConstraints.getReasoningProfile(provider, model).axis ~= "none" then
         local m = model
         table.insert(buttons, {{
@@ -17333,7 +17414,8 @@ function AskGPT:buildReasoningModelListMenu(provider)
   local ModelLists = require("koassistant_model_lists")
   local self_ref = self
   local items = {}
-  for _idx, model in ipairs(ModelLists[provider] or {}) do
+  local discovered = provider == "openai_codex" and self_ref:codexCatalogClient():models() or nil
+  for _idx, model in ipairs(ModelLists.getPickerModels(provider, discovered)) do
     if ModelConstraints.getReasoningProfile(provider, model).axis ~= "none" then
       local m = model
       items[#items + 1] = {
@@ -17682,6 +17764,18 @@ function AskGPT:onKOAssistantAISettings(on_close_callback)
       UIManager:close(dialog)
       local menu_items = self_ref:buildModelMenu(true)
       self_ref:showQuickSettingsPopup(_("Model"), menu_items, true, reopenQuickSettings)
+      if self_ref:getCurrentProvider() == "openai_codex" then
+        local shown = self_ref._quick_settings_dialog
+        self_ref:refreshCodexCatalog(function()
+          -- Do not resurrect a picker the reader has already closed.
+          if shown and self_ref._quick_settings_dialog == shown then
+            UIManager:close(shown)
+            self_ref._quick_settings_dialog = nil
+            self_ref:showQuickSettingsPopup(_("Model"), self_ref:buildModelMenu(true),
+              true, reopenQuickSettings)
+          end
+        end)
+      end
     end,
   }
 
@@ -19282,23 +19376,26 @@ function AskGPT:registerHighlightMenuActions()
   local MAX_SLOTS = 15
 
   -- Per-menu-open memo shared by all slot closures. KOReader calls every registered
-  -- factory synchronously in ONE sorted onShowHighlightMenu loop, so slot 01 always
+  -- factory synchronously in ONE sorted onShowHighlightMenu loop, so slot 00 always
   -- runs first among our slots: it resolves the ordered action list once and the
   -- other slots reuse it. Resolving per slot would re-run action requirement checks
   -- (hasAnyXray → loadCache dofile of the X-Ray cache) up to 15× per menu open —
   -- a real cost on e-ink storage.
   local menu_memo = nil
 
-  for i = 1, MAX_SLOTS do
+  -- Keep the requested study shortcut in a dedicated first slot. It must not
+  -- disappear behind provider readiness, saved menu membership or the slot cap.
+  -- The generator checks authorization when tapped and explains any setup issue.
+  for i = 0, MAX_SLOTS do
     local slot_index = i
     -- Numeric prefix for ordering: KOReader's orderedPairs sorts keys alphabetically;
     -- 90_ comes after KOReader's built-in items and before our koassistant_* buttons
     local dialog_id = string.format("90_%02d_koassistant_slot", i)
 
     self.ui.highlight:addToHighlightDialog(dialog_id, function(reader_highlight_instance)
-      -- Slot 01 refreshes the memo each menu open (current toggle/membership/order);
-      -- later slots fall back to resolving only if slot 01 somehow never ran
-      if slot_index == 1 or not menu_memo then
+      -- Slot 00 refreshes the memo each menu open (current toggle/membership/order);
+      -- later slots fall back to resolving only if slot 00 somehow never ran
+      if slot_index == 0 or not menu_memo then
         local cur_features = self.settings:readSetting("features") or {}
         local list = {}
         if cur_features.show_quick_actions_in_highlight ~= false then
@@ -19306,10 +19403,16 @@ function AskGPT:registerHighlightMenuActions()
           local document_path = has_open_book and self.ui.document.file
           list = self.action_service:getHighlightMenuActionObjects(has_open_book, document_path)
         end
-        menu_memo = { list = list, features = cur_features }
+        local filtered = {}
+        for _, entry in ipairs(list) do
+          if entry.id ~= "image_explain" then filtered[#filtered + 1] = entry end
+        end
+        menu_memo = { list = filtered, features = cur_features }
       end
       local cur_features = menu_memo.features
-      local action = menu_memo.list[slot_index]
+      local pinned_study = slot_index == 0
+      local action = pinned_study and require("prompts.actions").highlight.image_explain
+        or menu_memo.list[slot_index]
       if not action then
         -- Empty/hidden slot. NEVER return nil here: onShowHighlightMenu indexes the
         -- returned table unconditionally (readerhighlight.lua)
@@ -19394,16 +19497,16 @@ function AskGPT:registerHighlightMenuActions()
       end
       return {
         text = Constants.koaLabel(ActionService.getActionDisplayText(action, cur_features), "highlight", cur_features),
-        enabled = Device:hasClipboard(),
+        enabled = pinned_study or Device:hasClipboard(),
         allow_hold_when_disabled = true,
-        hold_callback = function()
+        hold_callback = not pinned_study and function()
           -- The menu stays open (the selection lives in it); a removed row leaves
           -- on the next open
           require("koassistant_action_hold").show(self, action, {
             surface = "highlight",
             run = Device:hasClipboard() and runSlot or nil,
           })
-        end,
+        end or nil,
         callback = function() runSlot(nil) end,
       }
     end)
@@ -20626,7 +20729,7 @@ function AskGPT:executeQuickAction(action, highlighted_text, context, selection_
   -- reach, so don't leave it on the shared config for them. Exception: the
   -- image_gen local handler consumes it itself, as prompt-framing context)
   configuration.features._selection_context_window =
-      (not action.local_handler or action.local_handler == "image_gen")
+      (not action.local_handler or action.local_handler == "image_gen" or action.local_handler == "image_explain")
       and sc_window or nil
   -- Block actions when declared requirements are unmet
   if self:_checkRequirements(action, nil, run_variant and run_variant.provider) then
@@ -23905,7 +24008,7 @@ function AskGPT:offerNotebookMigration(old_location, new_location)
     local Notebook = require("koassistant_notebook")
     local old_base_dir
     if old_location == "central" then
-      old_base_dir = DataStorage:getDataDir() .. "/koassistant_notebooks"
+      old_base_dir = DataStorage:getDataDir() .. "/data/koassistant/notebooks"
     else
       local features = self.settings:readSetting("features") or {}
       old_base_dir = features.notebook_custom_path
@@ -24109,7 +24212,7 @@ function AskGPT:openNotebookInChatViewer(notebook_path, document_path)
     if dir_option == "custom" and features.export_custom_path and features.export_custom_path ~= "" then
       default_path = features.export_custom_path
     elseif dir_option == "exports_folder" or dir_option == "ask" then
-      default_path = DataStorage:getDataDir() .. "/koassistant_exports"
+      default_path = DataStorage:getDataDir() .. "/data/koassistant/exports"
     else
       default_path = DataStorage:getDataDir()
     end

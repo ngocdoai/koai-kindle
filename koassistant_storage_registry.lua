@@ -402,42 +402,42 @@ Registry.entries = {
     --========================= Data dirs (getDataDir) =========================
     {
         id = "chats_v1_dir", label = "Legacy v1 chats",
-        location = "data_dir", ref = "koassistant_chats",
+        location = "data_dir", ref = "data/koassistant/chats",
         category = "internal", legacy = true, backup = false,
         reset_in = { "wipe_all" }, uninstall = true,
         notes = "v1 hash-dir storage, retired as a storage path in Track 37 (the importer survives). NOT cleared by Fresh Start: a dir left by an old-build restore may still hold un-imported chats.",
     },
     {
         id = "chats_backup_dir", label = "v1→v2 migration backup",
-        location = "data_dir", ref = "koassistant_chats.backup",
+        location = "data_dir", ref = "data/koassistant/chats.backup",
         category = "internal", backup = false,
         reset_in = { "fresh_start", "wipe_all" }, uninstall = true,
         notes = "The import's own copy of already-imported chats. Fresh Start removes it once chat_storage_version >= 2 (storage sweep 2026-09-03; was never purged before).",
     },
     {
         id = "backups_dir", label = "Backups",
-        location = "data_dir", ref = "koassistant_backups",
+        location = "data_dir", ref = "data/koassistant/backups",
         category = "backups", backup = false,
         -- NEVER auto-deleted: the survival point across uninstall/reinstall.
         uninstall = false,
     },
     {
         id = "exports_dir", label = "Exports",
-        location = "data_dir", ref = "koassistant_exports",
+        location = "data_dir", ref = "data/koassistant/exports",
         category = "exports", backup = false,
         opt_in_reset = true, uninstall = false,
         notes = "User-materialized files; preserved on teardown (user decision 2026-06-19).",
     },
     {
         id = "images_dir", label = "Generated images",
-        location = "data_dir", ref = "koassistant_images",
+        location = "data_dir", ref = "data/koassistant/images",
         category = "exports", backup = false,
         opt_in_reset = true, uninstall = false,
         notes = "Kept images from highlight image generation (keep-all policy 2026-07-16); filenames carry date + prompt; koassistant_image_browser.lua manages deletion. Also holds koassistant_index.lua (book-association index, agenda 2b) — covered by dir-level flows, no separate entry. Preserved on teardown like exports.",
     },
     {
         id = "notebooks_vault_dir", label = "Notebook vault (default)",
-        location = "data_dir", ref = "koassistant_notebooks",
+        location = "data_dir", ref = "data/koassistant/notebooks",
         category = "notebooks", backup = false,
         opt_in_reset = true, uninstall = false,
         notes = "Default vault only. A CUSTOM/Obsidian notebook path is never touched by any path.",

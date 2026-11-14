@@ -201,17 +201,18 @@ local REFUSAL_BODY = '{"error": {"message": "Request too large for model `openai
 
 --- Drive the real streaming loop over one recorded pipe buffer.
 --- @return boolean ok, string|nil content, string|nil err
-local function runStream(segments)
+local function runStream(segments, provider)
+    provider = provider or "groq"
     RL._reset()
     if type(segments) == "string" then segments = { { text = segments, delay = 0 } } end
     pipe.segs, pipe.idx, pipe.pos, pipe.tick, pipe.ready_at, held = segments, 1, 1, 0, 0, ""
     queue = {}
     local out = {}
     StreamHandler:new{}:showStreamDialog(
-        function() end, "groq", "openai/gpt-oss-20b",
+        function() end, provider, "openai/gpt-oss-20b",
         -- 125 ms: the drain grace is max(4 polls, 0.5 s / interval), so this keeps
         -- the bound at 4 polls; the replay never sleeps, so it costs nothing.
-        { provider_name = "groq", model = "openai/gpt-oss-20b",
+        { provider_name = provider, model = "openai/gpt-oss-20b",
           poll_interval_ms = 125, display_interval_ms = 1, prompt_chars = 100 },
         function(ok, content, err)
             -- pipe.tick counts pipe polls; snapshot it AT completion so the
@@ -431,6 +432,34 @@ end)
 
 -- ------------------------------------------------------------------
 RL._reset()
+TestRunner:test("Codex image SSE reaches chat once through the real streaming loop", function()
+    local Images = require("koassistant_codex_images")
+    local old_save, saves = Images.save, 0
+    Images.save = function()
+        saves = saves + 1
+        return "codex-20261004-120000.png"
+    end
+    local body = 'data: {"type":"response.output_item.done","output_index":0,"item":{"type":"image_generation_call","id":"ig_test","status":"completed","result":"synthetic"}}\n\n'
+        .. 'data: {"type":"response.completed","response":{"status":"completed","output":[{"type":"image_generation_call","id":"ig_test","status":"completed","result":"synthetic"}]}}\n\n'
+        .. 'data: [DONE]\n\n'
+    local ok, content = runStream(body, "openai_codex")
+    Images.save = old_save
+    TestRunner:assertTrue(ok, "image-only stream succeeds")
+    TestRunner:assertEqual(saves, 1, "done and completed are deduplicated")
+    TestRunner:assertTrue(content:find("koassistant-image://codex-20261004-120000.png", 1, true) ~= nil, "local image link")
+    TestRunner:assertTrue(content:find("synthetic", 1, true) == nil, "payload never reaches chat")
+end)
+TestRunner:test("Codex terminal event finishes even without DONE or socket close", function()
+    local body = 'data: {"type":"response.output_text.delta","delta":"Finished"}\n\n'
+        .. 'data: {"type":"response.completed","response":{"status":"completed","output":[]}}\n\n'
+    local ok, content, _err, polls, called = runStream({
+        {text=body, delay=0}, {text=": connection still open\n", delay=1000000},
+    }, "openai_codex")
+    TestRunner:assertTrue(called, "terminal event completes callback")
+    TestRunner:assertTrue(ok)
+    TestRunner:assertEqual(content, "Finished")
+    TestRunner:assertTrue(polls <= 15, "does not wait for HTTP connection to close")
+end)
 package.loaded["stream_handler"] = nil
 for _idx, k in ipairs(SAVED_KEYS) do package.loaded[k] = saved[k] end
 

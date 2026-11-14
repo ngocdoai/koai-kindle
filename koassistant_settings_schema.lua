@@ -767,7 +767,7 @@ local SettingsSchema = {
                     },
                     help_text = function(plugin)
                         local DataStorage = require("datastorage")
-                        local default_path = DataStorage:getDataDir() .. "/koassistant_exports"
+                        local default_path = DataStorage:getDataDir() .. "/data/koassistant/exports"
                         local f = plugin.settings:readSetting("features") or {}
                         local custom = f.export_custom_path
                         if custom and custom ~= "" then
@@ -2004,7 +2004,7 @@ local SettingsSchema = {
                     },
                     help_text = function(plugin)
                         local DataStorage = require("datastorage")
-                        local central = DataStorage:getDataDir() .. "/koassistant_notebooks"
+                        local central = DataStorage:getDataDir() .. "/data/koassistant/notebooks"
                         local f = plugin.settings:readSetting("features") or {}
                         local custom = f.notebook_custom_path
                         if custom and custom ~= "" then
@@ -2639,7 +2639,7 @@ local SettingsSchema = {
                 {
                     id = "backup_settings_info",
                     type = "header",
-                    text = _("Backups are stored in: koassistant_backups/"),
+                    text = _("Backups are stored in: data/koassistant/backups/"),
                     separator = true,
                 },
                 -- Maintenance
@@ -2933,32 +2933,34 @@ local SettingsSchema = {
                     items = {
                         {
                             type = "info",
-                            text = _("Generate images from highlighted text (button in the highlight menu)"),
+                            text = _("Generate images from text. Codex uses your existing subscription sign-in. Generated images are automatically deleted after 7 days, when KOReader next runs its cleanup."),
                         },
                         {
                             id = "image_gen_provider",
+                            type = "info",
+                            text = _("Provider: OpenAI Subscription (Codex)"),
+                            help_text = _("Images on this Kindle use your Codex subscription sign-in, including Generate Image and Explain as image. Previous API-key provider selections are ignored. Connect OpenAI Subscription in KOAssistant settings if needed."),
+                            separator = true,
+                        },
+                        {
+                            id = "codex_chat_images",
+                            type = "toggle",
+                            text = _("Image generation in Codex chat"),
+                            help_text = _("Allow Codex to generate an image when you ask in chat. Images are saved in Generated Images and can be opened from the reply. Uses your subscription sign-in. Turn this off if your model or account rejects the image tool."),
+                            path = "features.codex_chat_images",
+                            default = true,
+                        },
+                        {
+                            id = "image_gen_model_openai_codex",
                             type = "radio",
                             text_func = function(plugin)
                                 local f = plugin.settings:readSetting("features") or {}
-                                local v = f.image_gen_provider or "auto"
-                                local labels = {
-                                    auto = _("Follow main provider"),
-                                    openai = "OpenAI",
-                                    xai = "xAI (Grok)",
-                                    gemini = "Gemini",
-                                }
-                                return T(_("Provider: %1"), labels[v] or v)
+                                return T(_("Codex image model: %1"), f.image_gen_model_openai_codex or _("Default"))
                             end,
-                            help_text = _("Which provider generates images.\n\n'Follow main provider' uses your current chat provider when it supports images (OpenAI, xAI, Gemini). Picking one explicitly lets image generation work no matter which chat provider is active: it uses that provider's own API key.\n\nThe highlight-menu button only appears when the resolved provider has an API key."),
-                            path = "features.image_gen_provider",
-                            default = "auto",
-                            options = {
-                                { value = "auto", text = _("Follow main provider") },
-                                { value = "openai", text = "OpenAI" },
-                                { value = "xai", text = "xAI (Grok)" },
-                                { value = "gemini", text = "Gemini" },
-                            },
-                            separator = true,
+                            help_text = _("Default/auto lets Codex choose its image model. Explicit image models depend on account availability. The chat model remains the model selected for your Codex conversations."),
+                            path = "features.image_gen_model_openai_codex",
+                            default = "default",
+                            options = imageModelOptions("openai_codex"),
                         },
                         {
                             id = "image_gen_model_openai",

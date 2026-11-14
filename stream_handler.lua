@@ -503,6 +503,9 @@ function StreamHandler:showStreamDialog(backgroundQueryFunc, provider_name, mode
     -- storing the scheduler's return value left every pending tick alive.
     local poll_task = nil
     local stream_finished = false  -- finishStream runs once, whoever calls it twice
+    -- Exact one-shot marker, consumed before this Codex stream starts. Other
+    -- providers and unarmed streams never inspect SSE metadata or write a report.
+    local media_probe = require("koassistant_media_probe").start(provider_name, settings)
     local ui_update_task = nil  -- Forward declaration for display throttling
     local first_content_received = false
 
@@ -734,6 +737,11 @@ The provider read about %1% of it (%2 tokens) and answered from that part. The r
     local function finishStream()
         if stream_finished then return end
         stream_finished = true
+        if media_probe then
+            require("koassistant_media_probe").finish(media_probe,
+                self.user_interrupted and "cancelled"
+                or (completed and not stream_error and not non200 and "completed" or "failed"))
+        end
         -- Capture the reader's spot BEFORE the dialog closes: if they paused the
         -- follow and were reading mid-response, the completion viewer lands there.
         -- Captured always, handed over only on the success path below.
@@ -827,7 +835,9 @@ The provider read about %1% of it (%2 tokens) and answered from that part. The r
         if result == "" then
             -- Log partial_data which might contain error info
             if partial_data and #partial_data > 0 then
-                logger.dbg("Stream ended with no content but partial_data:", partial_data:sub(1, 500))
+                if not media_probe then
+                    logger.dbg("Stream ended with no content but partial_data:", partial_data:sub(1, 500))
+                end
                 -- Try to extract error from partial data
                 if partial_data:sub(1, 1) == "{" then
                     local ok, j = pcall(json.decode, partial_data)
@@ -902,7 +912,8 @@ The provider read about %1% of it (%2 tokens) and answered from that part. The r
                 interrupted_detail = extractApiError(result) or extractApiError(partial_data) or true
                 result = before
                 logger.warn("Mid-stream API error detected after content, treating as interrupted:",
-                    type(interrupted_detail) == "string" and interrupted_detail or "no detail")
+                    media_probe and "details omitted"
+                    or (type(interrupted_detail) == "string" and interrupted_detail or "no detail"))
             end
         end
 
@@ -943,7 +954,7 @@ The provider read about %1% of it (%2 tokens) and answered from that part. The r
         end
 
         -- Debug: Print token usage from accumulated SSE events
-        if settings and settings.debug and usage_data then
+        if not media_probe and settings and settings.debug and usage_data then
             local DebugUtils = require("koassistant_debug_utils")
             print(string.format("[%s] Token usage: %s", provider_name or "Stream",
                 DebugUtils.formatUsage(usage_data)))
@@ -1232,6 +1243,10 @@ The provider read about %1% of it (%2 tokens) and answered from that part. The r
                         end
                         display = #display > 0 and (display .. "\n\n" .. status_suffix)
                             or status_suffix
+                    end
+                    local image_status = require("koassistant_codex_images").progressText(result_buffer._codex_images)
+                    if image_status then
+                        display = #display > 0 and (display .. "\n\n" .. image_status) or image_status
                     end
                 end
                 iw:setText(display, true)
@@ -1550,14 +1565,16 @@ The provider read about %1% of it (%2 tokens) and answered from that part. The r
             hidden_frame = hidden_animation:getNextFrame()
             return hiddenDisplay()
         end
-        return animation:getNextFrame()
+        return require("koassistant_codex_images").progressText(result_buffer._codex_images)
+            or animation:getNextFrame()
     end
     streamDialog._input_widget:setText(getWaitingText(), true)
     local function updateAnimation()
         if completed then return end
         if not first_content_received then
             streamDialog._input_widget:setText(getWaitingText(), true)
-            animation_task = UIManager:scheduleIn(0.4, updateAnimation)
+            animation_task = updateAnimation
+            UIManager:scheduleIn(result_buffer._codex_images and result_buffer._codex_images.active and 5 or 0.4, updateAnimation)
         elseif hidden_streaming then
             -- Sole frame owner for the hidden placeholder (B2). Keep ticking even
             -- while the output is revealed (Show pressed) so the dots resume
@@ -1566,10 +1583,12 @@ The provider read about %1% of it (%2 tokens) and answered from that part. The r
             if not hidden_output_visible then
                 streamDialog._input_widget:setText(hiddenDisplay(), true)
             end
-            animation_task = UIManager:scheduleIn(0.4, updateAnimation)
+            animation_task = updateAnimation
+            UIManager:scheduleIn(0.4, updateAnimation)
         end
     end
-    animation_task = UIManager:scheduleIn(0.4, updateAnimation)
+    animation_task = updateAnimation
+    UIManager:scheduleIn(0.4, updateAnimation)
 
     -- Mark streaming as active (for update checker to defer popups)
     _G.KOAssistantStreaming = true
@@ -1582,6 +1601,7 @@ The provider read about %1% of it (%2 tokens) and answered from that part. The r
         _G.KOAssistantStreaming = nil  -- Clear flag on subprocess failure
         cleanup()
         UIManager:close(streamDialog)
+        if media_probe then require("koassistant_media_probe").finish(media_probe, "failed") end
         if on_complete then on_complete(false, nil, _("Failed to start subprocess for request")) end
         return
     end
@@ -1715,6 +1735,12 @@ The provider read about %1% of it (%2 tokens) and answered from that part. The r
                 -- loop (break + each early return) — finishStream reads it for
                 -- error diagnostics.
                 local data = partial_data .. data_chunk
+                if provider_name == "openai_codex" and #data > 24 * 1024 * 1024 then
+                    stream_error = "Codex response exceeds the Kindle image size limit"
+                    completed = true
+                    endStream()
+                    return
+                end
                 local pos = 1
                 -- Marker protocol, hoisted out of the line loop below: the elseif
                 -- chain tests it once per line, and a file-local reference would
@@ -1756,8 +1782,12 @@ The provider read about %1% of it (%2 tokens) and answered from that part. The r
 
                         local ok, event = pcall(json.decode, json_str)
                         if ok and event then
-                            -- Debug: Log SSE event structure (first few events only)
-                            if settings and settings.debug and not first_content_received then
+                            if media_probe then
+                                require("koassistant_media_probe").observe(media_probe, event)
+                            end
+                            -- Existing debug preview is raw JSON: do not emit it
+                            -- during the explicitly armed metadata-only test.
+                            if provider_name ~= "openai_codex" and not media_probe and settings and settings.debug and not first_content_received then
                                 local preview = json_str:sub(1, 200)
                                 if #json_str > 200 then preview = preview .. "..." end
                                 print("SSE event:", preview)
@@ -1766,7 +1796,7 @@ The provider read about %1% of it (%2 tokens) and answered from that part. The r
                             -- Check for error response in SSE data (OpenRouter/OpenAI format)
                             if event.error then
                                 local err_message = event.error.message or event.error.type or json.encode(event.error)
-                                logger.warn("SSE error event received:", err_message)
+                                logger.warn("SSE error event received:", media_probe and "details omitted" or err_message)
                                 partial_data = data:sub(pos)
                                 completed = true
                                 stream_error = err_message  -- finishStream reports it once
@@ -1777,7 +1807,7 @@ The provider read about %1% of it (%2 tokens) and answered from that part. The r
                                 -- OpenAI Responses flat error event ({type:"error", code, message};
                                 -- Anthropic's {type:"error", error:{…}} hits the branch above)
                                 local err_message = event.message or event.code
-                                logger.warn("Responses stream error event:", err_message)
+                                logger.warn("Responses stream error event:", media_probe and "details omitted" or err_message)
                                 partial_data = data:sub(pos)
                                 completed = true
                                 stream_error = err_message
@@ -1789,7 +1819,7 @@ The provider read about %1% of it (%2 tokens) and answered from that part. The r
                                 -- OpenAI Responses terminal failure carrying the response object
                                 local rerr = event.response.error
                                 local err_message = rerr.message or rerr.code or "Request failed"
-                                logger.warn("Responses stream failed:", err_message)
+                                logger.warn("Responses stream failed:", media_probe and "details omitted" or err_message)
                                 partial_data = data:sub(pos)
                                 completed = true
                                 stream_error = err_message
@@ -1820,6 +1850,12 @@ The provider read about %1% of it (%2 tokens) and answered from that part. The r
                             end
 
                             local content, reasoning = self:extractContentFromSSE(event)
+                            if provider_name == "openai_codex" then
+                                result_buffer._codex_images = result_buffer._codex_images or {}
+                                local image_text = require("koassistant_codex_images").event(result_buffer._codex_images, event)
+                                if image_text then content = (content or "") .. image_text end
+                                if result_buffer._codex_images.active then scheduleUIUpdate() end
+                            end
 
                             -- Process <think> tags from R1-style models
                             content, reasoning = processThinkTags(content, reasoning)
@@ -2000,8 +2036,21 @@ The provider read about %1% of it (%2 tokens) and answered from that part. The r
                                     scheduleUIUpdate()
                                 end
                             end
+                            -- Responses has its own terminal events. Codex need not
+                            -- send [DONE] or close its HTTP connection immediately.
+                            if provider_name == "openai_codex" and (event.type == "response.completed"
+                                    or event.type == "response.incomplete") then
+                                partial_data = data:sub(pos)
+                                completed = true
+                                endStream()
+                                return
+                            end
                         else
-                            logger.warn("Failed to parse JSON from SSE data:", json_str)
+                            if media_probe or provider_name == "openai_codex" then
+                                logger.warn("Failed to parse Codex SSE JSON (body omitted)")
+                            else
+                                logger.warn("Failed to parse JSON from SSE data:", json_str)
+                            end
                         end
                     elseif line:sub(1, 6) == "event:" then
                         -- Ignore SSE event lines
@@ -2119,7 +2168,7 @@ The provider read about %1% of it (%2 tokens) and answered from that part. The r
                                 end
                             end
                         else
-                            logger.warn("Failed to parse NDJSON line:", line)
+                            logger.warn("Failed to parse NDJSON line:", media_probe and "body omitted" or line)
                         end
                     elseif line:sub(1, #PROTOCOL_NON_200) == PROTOCOL_NON_200 then
                         non200 = true
@@ -2149,10 +2198,11 @@ The provider read about %1% of it (%2 tokens) and answered from that part. The r
                             -- garbled JSON fragments into the viewer.
                             table.insert(error_body_lines, line)
                             -- warn once per stream (issue #104: warn always reaches crash.log)
+                            local safe_line = media_probe and "body omitted" or line
                             if #error_body_lines == 1 then
-                                logger.warn("Unrecognized line format:", line)
+                                logger.warn("Unrecognized line format:", safe_line)
                             else
-                                logger.dbg("Unrecognized line format:", line)
+                                logger.dbg("Unrecognized line format:", safe_line)
                             end
                         end
                     end
@@ -2174,6 +2224,13 @@ The provider read about %1% of it (%2 tokens) and answered from that part. The r
             return
         end
 
+        if result_buffer._codex_images and result_buffer._codex_images.active then
+            local bucket = math.floor(os.time() / 5)
+            if result_buffer._codex_images.display_bucket ~= bucket then
+                result_buffer._codex_images.display_bucket = bucket
+                scheduleUIUpdate()
+            end
+        end
         -- Schedule next poll
         UIManager:scheduleIn(check_interval_sec, pollForData)
         poll_task = pollForData

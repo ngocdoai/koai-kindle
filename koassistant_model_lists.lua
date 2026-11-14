@@ -1,6 +1,6 @@
 -- Model lists for each provider
 -- SINGLE SOURCE OF TRUTH for all model data
--- Last updated: 2026-07-28
+-- Codex and OpenAI image inventory refreshed: 2026-10-04
 --
 -- Structure:
 --   ModelLists[provider] = array of model IDs (for backward compat & dropdowns)
@@ -54,16 +54,22 @@ local ModelLists = {
     },
 
     openai_codex = {
+        -- Current Codex CLI 0.160.0 model/list, checked 2026-10-04.
+        -- Availability still depends on the signed-in account. Existing saved
+        -- choices remain unchanged; these also work as the offline picker list.
+        "gpt-6.1-sol",
+        "gpt-6-astra",
+        "gpt-6-sol",
+        "gpt-6-luna",
         -- OpenAI ChatGPT subscription (Codex OAuth) reuses the same curated
         -- subscription model slugs as direct OpenAI, but authenticates with
         -- device-code OAuth against ChatGPT's Codex backend.
         -- Probed live 2026-08-15 on a FREE ChatGPT account: terra/luna/5.5/
         -- 5.4-mini answer; sol, 5.4 and 5.4-nano are refused there ("not
         -- supported when using Codex with a ChatGPT account") with a clear
-        -- error. ALL slugs stay listed (paid plans unverified, may serve
-        -- more); default + tier picks use free-served slugs only, so
-        -- auto-selection never 400s (maintainer ruling 2026-08-15).
-        "gpt-5.6-terra",                -- balanced (default; served on free accounts)
+        -- error. Keep these older slugs for saved choices and tier mappings;
+        -- listing a slug does not guarantee this account can serve it.
+        "gpt-5.6-terra",                -- balanced legacy choice
         "gpt-5.6-sol",                  -- flagship (most capable; refused on free accounts)
         "gpt-5.6-luna",                 -- cost-optimized (served on free accounts)
         "gpt-5.5",                      -- served on free accounts
@@ -1033,8 +1039,17 @@ local ModelLists = {
 -------------------------------------------------------------------------------
 
 ModelLists._image_models = {
+    openai_codex = {
+        "auto", -- omit the tool model and let the Codex backend choose
+        "gpt-image-2.5-sunburst",
+        "gpt-image-2.5-flare",
+        "gpt-image-2",
+        "gpt-image-1.5",
+    },
     openai = {
         "gpt-image-1-mini",       -- fast (~15 s), cheapest (default)
+        "gpt-image-2.5-sunburst",
+        "gpt-image-2.5-flare",
         "gpt-image-1.5",
         "gpt-image-2",            -- flagship quality, slow (~60 s)
         "gpt-image-1",
@@ -1053,6 +1068,25 @@ ModelLists._image_models = {
 -------------------------------------------------------------------------------
 -- HELPER FUNCTIONS
 -------------------------------------------------------------------------------
+
+-- The private Codex catalog is a picker-only overlay; it does not change
+-- defaults or tier placements. Keep account order, then append known candidates
+-- so a narrower account catalog cannot hide a newly shipped model from the UI.
+-- The caller supplies a session/account-scoped list; no live data is persisted.
+function ModelLists.getPickerModels(provider, codex_models)
+    if provider == "openai_codex" and type(codex_models) == "table" and #codex_models > 0 then
+        local models, seen = {}, {}
+        for _, list in ipairs({ codex_models, ModelLists.openai_codex }) do
+            for _, model in ipairs(list) do
+                if not seen[model] then
+                    models[#models + 1], seen[model] = model, true
+                end
+            end
+        end
+        return models
+    end
+    return ModelLists[provider] or {}
+end
 
 -- Get image-generation models for a provider (nil if unsupported)
 function ModelLists.getImageModels(provider)

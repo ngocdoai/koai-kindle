@@ -52,13 +52,13 @@ local function shellOk(a, b, c)
 end
 
 local BackupManager = {
-    BACKUP_DIR = DataStorage:getDataDir() .. "/koassistant_backups",
+    BACKUP_DIR = DataStorage:getDataDir() .. "/data/koassistant/backups",
     BACKUP_VERSION = "1.0",
     PLUGIN_DIR = getPluginDir(),
     SETTINGS_DIR = DataStorage:getSettingsDir(),
-    CHAT_DIR = DataStorage:getDataDir() .. "/koassistant_chats",
+    CHAT_DIR = DataStorage:getDataDir() .. "/data/koassistant/chats",
     RESTORE_POINT_RETENTION_DAYS = 7,
-    LOCK_FILE = DataStorage:getDataDir() .. "/koassistant_backups/.backup_lock",
+    LOCK_FILE = DataStorage:getDataDir() .. "/data/koassistant/backups/.backup_lock",
     LOCK_TIMEOUT = 300,  -- 5 minutes
 }
 

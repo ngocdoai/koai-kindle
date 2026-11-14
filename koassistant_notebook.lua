@@ -84,7 +84,7 @@ function Notebook.getBaseDir(features)
     if location == "sidecar" then return nil end
     if location == "central" then
         local DataStorage = require("datastorage")
-        return DataStorage:getDataDir() .. "/koassistant_notebooks"
+        return DataStorage:getDataDir() .. "/data/koassistant/notebooks"
     end
     -- custom
     return features.notebook_custom_path
@@ -844,7 +844,7 @@ function Notebook.resolvePathForLocation(document_path, location, features, inde
     local base_dir
     if location == "central" then
         local DataStorage = require("datastorage")
-        base_dir = DataStorage:getDataDir() .. "/koassistant_notebooks"
+        base_dir = DataStorage:getDataDir() .. "/data/koassistant/notebooks"
     else
         base_dir = features.notebook_custom_path
     end
@@ -926,7 +926,7 @@ function Notebook.migrateAll(from_location, to_location, features)
             local base_dir
             if to_location == "central" then
                 local DataStorage = require("datastorage")
-                base_dir = DataStorage:getDataDir() .. "/koassistant_notebooks"
+                base_dir = DataStorage:getDataDir() .. "/data/koassistant/notebooks"
             else
                 base_dir = features.notebook_custom_path
             end

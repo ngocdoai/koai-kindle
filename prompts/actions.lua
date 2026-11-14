@@ -710,6 +710,19 @@ Use plain language first, adding the technical term in parentheses when it helps
         no_duplicate = true,
         builtin = true,
     },
+    image_explain = {
+        id = "image_explain",
+        text = _("Explain as image"),
+        description = _("Explain the selected passage as a clear learning diagram, with short labels and visual relationships. Tap once to generate."),
+        context = "highlight",
+        local_handler = "image_explain",
+        local_note = _("Sends the selected passage to your image provider with a built-in learning prompt. Codex uses your subscription sign-in. The full prompt is shown below and saved with the image."),
+        requires_image_provider = true,
+        in_highlight_menu = 10,
+        exclude_from_compact = true,
+        no_duplicate = true,
+        builtin = true,
+    },
     -- The model button (#86, B345 step 4): shows your model; a tap lists your
     -- favorites and recent picks and switches the model for good (main.lua
     -- draws it, koassistant_model_switch.lua). In the highlight menu by

@@ -814,7 +814,7 @@ function QuizViewer:_exportResults()
     filename = filename .. " Quiz " .. os.date("%Y-%m-%d") .. ".md"
 
     local DataStorage = require("datastorage")
-    local export_dir = DataStorage:getDataDir() .. "/koassistant_exports"
+    local export_dir = DataStorage:getDataDir() .. "/data/koassistant/exports"
     local lfs = require("libs/libkoreader-lfs")
     lfs.mkdir(export_dir)
     local filepath = export_dir .. "/" .. filename

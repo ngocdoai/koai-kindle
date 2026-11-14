@@ -1099,7 +1099,9 @@ local function pickProviderModel(opts)
                 end
             end
         else
-            models = ModelLists[provider_id] or {}
+            local discovered = provider_id == "openai_codex" and plugin and plugin.codexCatalogClient
+                and plugin:codexCatalogClient():models() or nil
+            models = ModelLists.getPickerModels(provider_id, discovered)
         end
         local buttons = {}
         if provider_row then
@@ -1148,6 +1150,14 @@ local function pickProviderModel(opts)
             buttons = buttons,
         }
         UIManager:show(sub)
+        if provider_id == "openai_codex" and plugin and plugin.refreshCodexCatalog then
+            plugin:refreshCodexCatalog(function()
+                if UIManager:isWidgetShown(sub) then
+                    UIManager:close(sub)
+                    pickModelFor(provider_id, provider_label, provider_row)
+                end
+            end)
+        end
     end
 
     pickProvider = function(show_all)
@@ -12517,7 +12527,7 @@ local function handleLocalAction(handler_name, ui, highlighted_text, document_pa
 
     if handler_name == "xray_lookup" then
         handleLocalXrayLookup(ui, highlighted_text, document_path, book_metadata, config, plugin)
-    elseif handler_name == "image_gen" then
+    elseif handler_name == "image_gen" or handler_name == "image_explain" then
         -- The old hardcoded highlight button as a local action (2026-08-13):
         -- same network gate + settings refresh; book association now follows
         -- document_path too, so viewer/file-browser launches credit the right
@@ -12545,7 +12555,9 @@ local function handleLocalAction(handler_name, ui, highlighted_text, document_pa
             if plugin and plugin.updateConfigFromSettings then plugin:updateConfigFromSettings() end
             require("koassistant_image_generator").generate(highlighted_text, config,
                 plugin and plugin.settings, book_info,
-                { window = window, book_metadata = book_metadata })
+                { window = window, book_metadata = book_metadata,
+                  purpose = handler_name == "image_explain" and "study" or nil,
+                  language = plugin and plugin.getEffectivePrimaryLanguage and plugin:getEffectivePrimaryLanguage() })
         end)
     else
         logger.warn("KOAssistant: Unknown local handler: " .. tostring(handler_name))
