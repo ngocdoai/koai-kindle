@@ -1,6 +1,6 @@
--- Unit tests for the one text matcher (koassistant_xray_parser.lua), the
--- per-book name index (koassistant_xray_index.lua) and the page-local marks
--- (koassistant_xray_marks.lua) against a mock crengine document.
+-- Unit tests for the one text matcher (koassistant/xray/xray_parser.lua), the
+-- per-book name index (koassistant/xray/xray_index.lua) and the page-local marks
+-- (koassistant/xray/xray_marks.lua) against a mock crengine document.
 -- docs/xray_marks_freeze_plan.md round 4.
 
 local function setupPaths()
@@ -23,7 +23,7 @@ os.execute('mkdir -p "' .. SIDECAR .. '"')
 package.loaded["docsettings"] = {
     getSidecarDir = function() return SIDECAR end,
 }
-package.loaded["koassistant_storage_registry"] = {
+package.loaded["koassistant.storage.storage_registry"] = {
     migrateSidecarFile = function() return false end,
 }
 -- Earlier files in the one-process suite leave their own device mocks
@@ -38,9 +38,9 @@ local UIManager = require("ui/uimanager")
 UIManager.unschedule = UIManager.unschedule or function() end
 UIManager.setDirty = UIManager.setDirty or function() end
 
-local XrayParser = require("koassistant_xray_parser")
-local XrayIndex = require("koassistant_xray_index")
-local XrayMarks = require("koassistant_xray_marks")
+local XrayParser = require("koassistant.xray.xray_parser")
+local XrayIndex = require("koassistant.xray.xray_index")
+local XrayMarks = require("koassistant.xray.xray_marks")
 
 local TestRunner = { passed = 0, failed = 0 }
 function TestRunner:suite(name) print(string.format("\n  [%s]", name)) end
@@ -198,7 +198,7 @@ local function newMockDoc(paragraphs, page_starts)
     return doc
 end
 
-package.loaded["koassistant_context_extractor"] = {
+package.loaded["koassistant.request.context_extractor"] = {
     documentEndXPointer = function(document) return document:endXPointer() end,
 }
 
@@ -411,13 +411,16 @@ TestRunner:test("prevPage / covers / missing", function()
     TestRunner:ok(not XrayIndex.covers(LAYOUT, unknown))
     TestRunner:eq(#XrayIndex.missing(LAYOUT, { "einstein", "mileva" }), 1)
 end)
-TestRunner:test("store/load: layouts keyed by stamp, two kept, newest first", function()
+TestRunner:test("store/load: layouts keyed by stamp, four kept, newest first", function()
     XrayIndex.store(doc.file, "S1", SCANNED)
     XrayIndex.store(doc.file, "S2", { einstein = "1:0" })
     XrayIndex.store(doc.file, "S1", { mileva = "" })
     local l1 = XrayIndex.layout(doc.file, "S1")
     TestRunner:ok(l1 and l1.forms.einstein == SCANNED.einstein and l1.forms.mileva == "",
         "new forms merge into the stored layout")
+    XrayIndex.store(doc.file, "S4", {})
+    XrayIndex.store(doc.file, "S5", {})
+    TestRunner:ok(XrayIndex.layout(doc.file, "S2") ~= nil, "four layouts fit (B505)")
     XrayIndex.store(doc.file, "S3", {})
     TestRunner:eq(XrayIndex.layout(doc.file, "S2"), nil, "the oldest layout drops")
     -- The file reads back the same (a fresh load, not the memo)
@@ -428,7 +431,24 @@ TestRunner:test("store/load: layouts keyed by stamp, two kept, newest first", fu
     local fn = assert((loadstring or load)(src))
     local data = fn()
     TestRunner:eq(data.layouts[1].stamp, "S3")
-    TestRunner:eq(data.layouts[2].forms.einstein, SCANNED.einstein)
+    TestRunner:eq(data.layouts[4].stamp, "S1")
+    TestRunner:eq(data.layouts[4].forms.einstein, SCANNED.einstein)
+end)
+
+TestRunner:test("a store keeps the layouts another device wrote meanwhile (B505)", function()
+    -- This device's memo holds S3, S5, S4, S1; a sync tool then brings a file
+    -- whose newest layout is another device's
+    local path = XrayIndex.path(doc.file)
+    local f = io.open(path, "rb")
+    local src = f:read("*a")
+    f:close()
+    local other = src:gsub('layouts = {\n', 'layouts = {\n    {\n      stamp = "OTHER",\n      forms = {\n        ["mileva"] = "",\n      },\n    },\n', 1)
+    f = io.open(path, "wb")
+    f:write(other)
+    f:close()
+    XrayIndex.store(doc.file, "S3", { einstein = "1:0" })
+    TestRunner:ok(XrayIndex.layout(doc.file, "OTHER") ~= nil, "the other device's layout survives this write")
+    TestRunner:eq(XrayIndex.layout(doc.file, "S3").forms.einstein, "1:0", "this device's own pass lands")
 end)
 
 TestRunner:test("an index written by the older matcher is read as missing (B339)", function()

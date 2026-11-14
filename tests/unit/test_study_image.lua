@@ -2,9 +2,9 @@ package.path = "./?.lua;./tests/lib/?.lua;" .. package.path
 require("mock_koreader")
 local T = require("test_runner"):new()
 package.loaded.mime = package.loaded.mime or { unb64 = function(s) return s end }
-local Generator = require("koassistant_image_generator")
-local Images = require("koassistant_codex_images")
-local Actions = require("prompts.actions")
+local Generator = require("koassistant.images.image_generator")
+local Images = require("koassistant.images.codex_images")
+local Actions = require("koassistant.prompts.actions")
 
 T:test("one-tap study image action is included in highlight defaults", function()
     local action = Actions.highlight.image_explain
@@ -29,7 +29,7 @@ T:test("study button joins an existing highlight menu and respects later dismiss
     local data = { highlight_menu_actions={"explain"}, features={provider="openai_codex"} }
     local settings = { readSetting=function(_,key) return data[key] end,
         saveSetting=function(_,key,value) data[key]=value end, flush=function() end }
-    local service = require("action_service"):new(settings)
+    local service = require("koassistant.prompts.action_service"):new(settings)
     service.Actions = Actions
     local ids = service:getHighlightMenuActions()
     local found = 0

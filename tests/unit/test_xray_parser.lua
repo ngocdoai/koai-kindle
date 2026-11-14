@@ -1,4 +1,4 @@
--- Unit tests for koassistant_xray_parser.lua JSON extraction + shared unescaped-quote repair.
+-- Unit tests for koassistant/xray/xray_parser.lua JSON extraction + shared unescaped-quote repair.
 
 local function setupPaths()
     local info = debug.getinfo(1, "S")
@@ -13,7 +13,7 @@ end
 setupPaths()
 require("mock_koreader")
 
-local XrayParser = require("koassistant_xray_parser")
+local XrayParser = require("koassistant.xray.xray_parser")
 
 local TestRunner = { passed = 0, failed = 0 }
 function TestRunner:suite(name) print(string.format("\n  [%s]", name)) end
@@ -67,7 +67,7 @@ TestRunner:test("a fully unquoted key before a structural value is recovered", f
     TestRunner:ok(d and d.characters and d.characters[1].name == "Alice")
 end)
 TestRunner:test("line-anchored: identifiers inside string values are untouched", function()
-    local JsonRepair = require("koassistant_json_repair")
+    local JsonRepair = require("koassistant.core.json_repair")
     local s = '{"characters":[{"name":"Alice","description":"she said\nquote\": no"}]}'
     TestRunner:eq(JsonRepair.quoteBareKeys('{"a": 1}'), '{"a": 1}')
     -- A bare word at line start followed by `":` IS the defect shape; inside a
@@ -643,7 +643,7 @@ print("")
 print("\n  [dropExtraClosers - stray-closer repair (state.lua:81 class)]")
 
 TestRunner:test("doubled final closer is dropped and the result parses", function()
-    local JR = require("koassistant_json_repair")
+    local JR = require("koassistant.core.json_repair")
     TestRunner:eq(JR.dropExtraClosers('{"characters":[{"name":"A","description":"d"}]}}'),
         '{"characters":[{"name":"A","description":"d"}]}', "final stray } dropped")
     local parsed = XrayParser.parse('```json\n{"characters":[{"name":"A","description":"d"}]}}\n```')
@@ -652,19 +652,19 @@ TestRunner:test("doubled final closer is dropped and the result parses", functio
 end)
 
 TestRunner:test("stray closer mid-document is dropped", function()
-    local JR = require("koassistant_json_repair")
+    local JR = require("koassistant.core.json_repair")
     local fixed = JR.dropExtraClosers('{"a":[{"x":1}]],"b":[2]}')
     TestRunner:eq(fixed, '{"a":[{"x":1}],"b":[2]}', "mismatched ] dropped where it appears")
 end)
 
 TestRunner:test("closers inside strings and escapes are untouched", function()
-    local JR = require("koassistant_json_repair")
+    local JR = require("koassistant.core.json_repair")
     local text = '{"name":"A }] \\" x","d":"]] }"}'
     TestRunner:eq(JR.dropExtraClosers(text), text, "string content never counts as structure")
 end)
 
 TestRunner:test("balanced input is byte-identical; missing closers are not papered over", function()
-    local JR = require("koassistant_json_repair")
+    local JR = require("koassistant.core.json_repair")
     local good = '{"characters":[{"name":"A"}]}'
     TestRunner:eq(JR.dropExtraClosers(good), good, "no-op on balanced input")
     local truncated = '{"characters":[{"name":"A"}]'
@@ -675,7 +675,7 @@ end)
 print("\n  [closeUnclosed - under-closed complete document]")
 
 TestRunner:test("complete document missing its final brace recovers", function()
-    local JR = require("koassistant_json_repair")
+    local JR = require("koassistant.core.json_repair")
     local txt = '{"type":"fiction","characters":[{"name":"A","description":"d"}],"current_state":{"summary":"s","questions":["q?"]}'
     TestRunner:eq(JR.closeUnclosed(txt), txt .. "}", "one missing } appended")
     local parsed = XrayParser.parse(txt)
@@ -684,12 +684,12 @@ TestRunner:test("complete document missing its final brace recovers", function()
 end)
 
 TestRunner:test("several missing closers append innermost first", function()
-    local JR = require("koassistant_json_repair")
+    local JR = require("koassistant.core.json_repair")
     TestRunner:eq(JR.closeUnclosed('{"a":[{"x":"y"}'), '{"a":[{"x":"y"}]}', "]} appended in order")
 end)
 
 TestRunner:test("true truncation still fails: mid-string, after comma, after colon, mid-number", function()
-    local JR = require("koassistant_json_repair")
+    local JR = require("koassistant.core.json_repair")
     for _i, cut in ipairs({
         '{"characters":[{"name":"A","description":"cut mid sent',
         '{"characters":[{"name":"A"},',
@@ -701,7 +701,7 @@ TestRunner:test("true truncation still fails: mid-string, after comma, after col
 end)
 
 TestRunner:test("balanced input untouched", function()
-    local JR = require("koassistant_json_repair")
+    local JR = require("koassistant.core.json_repair")
     local good = '{"characters":[{"name":"A"}]}'
     TestRunner:eq(JR.closeUnclosed(good), good, "no-op when nothing is open")
 end)
@@ -739,6 +739,36 @@ TestRunner:test("addStubAlias: adds, no-ops on known, refuses missing; resolves 
     TestRunner:ok(not XrayParser.addStubAlias(d, "Nobody", "x"), "missing stub refused")
     TestRunner:eq(#XrayParser.searchLedger(d, "the ferry master", { exact = true }), 1,
         "the new alias resolves")
+end)
+TestRunner:test("linkStubs: two carried rows become one, both books' names and texts kept (B314)", function()
+    local json = '{"characters":[{"name":"Tamsin Vael"}],"__dormant":['
+        .. '{"name":"Dorrit","category":"characters","description":"Kept the inn.","source":"Vol 1","file":"/b/v1.epub"},'
+        .. '{"name":"Dorrit Hale","aliases":["the innkeeper"],"category":"characters","description":"Keeps the ferry inn.","source":"Vol 2","file":"/b/v2.epub"},'
+        .. '{"name":"Saltmere","category":"locations","description":"Drowned town.","source":"Vol 1","file":"/b/v1.epub"}]}'
+    local d = XrayParser.parse(json)
+    TestRunner:ok(XrayParser.linkStubs(d, 1, "Dorrit", 2, "Dorrit Hale"))
+    TestRunner:eq(#d.__dormant, 2, "one row for the two")
+    -- Which row keeps the name is the fold's rule (the nearest book's)
+    local row = d.__dormant[1]
+    local names = { [row.name] = true }
+    for _i, a in ipairs(row.aliases or {}) do names[a] = true end
+    TestRunner:ok(names["Dorrit"] and names["Dorrit Hale"] and names["the innkeeper"],
+        "both names and the alias on the one row")
+    local texts = { row.description }
+    for _i, b in ipairs(row.background or {}) do texts[#texts + 1] = b.text end
+    table.sort(texts)
+    TestRunner:eq(table.concat(texts, "|"), "Keeps the ferry inn.|Kept the inn.", "both books' texts")
+    TestRunner:eq(XrayParser.foldLedger(d), 0, "nothing left to fold: a re-seed finds it settled")
+    -- A row that moved is found by its name; a missing one and another kind
+    -- of thing are refused and nothing changes
+    d = XrayParser.parse(json)
+    TestRunner:ok(XrayParser.linkStubs(d, 3, "Dorrit", 1, "Dorrit Hale"), "indices off, names right")
+    d = XrayParser.parse(json)
+    TestRunner:ok(not XrayParser.linkStubs(d, 1, "Dorrit", 2, "Nobody"), "a row that is gone")
+    TestRunner:ok(not XrayParser.linkStubs(d, 1, "Dorrit", 1, "Dorrit"), "a row with itself")
+    TestRunner:ok(not XrayParser.linkStubs(d, 1, "Dorrit", 3, "Saltmere"), "a person and a place")
+    TestRunner:eq(#d.__dormant, 3)
+    TestRunner:eq(d.__dormant[1].aliases, nil, "a refused link leaves the row as it was")
 end)
 TestRunner:test("foldLedgerHandles: stub handles join the exact route set", function()
     local d = XrayParser.parse(LEDGER_JSON)

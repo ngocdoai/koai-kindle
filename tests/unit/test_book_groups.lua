@@ -1,5 +1,5 @@
 --[[
-Unit tests: Book groups store (koassistant_book_groups.lua) — item 46, #90.
+Unit tests: Book groups store (koassistant/books/book_groups.lua) — item 46, #90.
 
 CRUD, manual ordering, first-group neighbor rule, move re-keying policy
 (move re-keys / copy never joins / delete keeps), and the merge picker's
@@ -36,8 +36,8 @@ package.loaded["docsettings"] = package.loaded["docsettings"] or {
     open = function() return { readSetting = function() end, close = function() end } end,
 }
 
-package.loaded["koassistant_book_groups"] = nil
-local BookGroups = require("koassistant_book_groups")
+package.loaded["koassistant.books.book_groups"] = nil
+local BookGroups = require("koassistant.books.book_groups")
 
 -- Functional in-memory store (the real one is LuaSettings over a settings-dir file)
 local mem = {}
@@ -121,6 +121,26 @@ TestRunner:test("updateForMove: move re-keys, copy never joins, delete keeps", f
     -- Overwrite-move onto an existing member: no duplicate
     BookGroups.updateForMove("/other.epub", "/new.epub", false)
     TestRunner:assertEqual(#BookGroups.byId(g.id).books, 1, "overwrite-move dedupes")
+    BookGroups.remove(g.id)
+end)
+
+TestRunner:test("updateForFolderMove: the members inside follow in their places (B507)", function()
+    local g = BookGroups.create("Saga")
+    for _idx, p in ipairs({ "/b/Saga/1.epub", "/b/Saga 2/x.epub", "/b/Saga/sub/2.epub", "/b/other.epub" }) do
+        BookGroups.addBook(g.id, p)
+    end
+    TestRunner:assertEqual(BookGroups.updateForFolderMove("/b/Saga", "/b/Done"), 2, "two re-keyed")
+    local books = BookGroups.byId(g.id).books
+    TestRunner:assertEqual(books[1], "/b/Done/1.epub", "inside: re-keyed, first still")
+    TestRunner:assertEqual(books[2], "/b/Saga 2/x.epub", "a folder named alike is another folder")
+    TestRunner:assertEqual(books[3], "/b/Done/sub/2.epub", "a subfolder follows")
+    TestRunner:assertEqual(books[4], "/b/other.epub", "outside: unchanged")
+    -- A member already at the new path: the old slot goes, no duplicate
+    BookGroups.addBook(g.id, "/b/New/1.epub")
+    BookGroups.updateForFolderMove("/b/Done", "/b/New")
+    books = BookGroups.byId(g.id).books
+    TestRunner:assertEqual(#books, 4, "no duplicate")
+    TestRunner:assertEqual(BookGroups.updateForFolderMove("/b/Elsewhere", "/b/Moved"), 0, "nothing inside")
     BookGroups.remove(g.id)
 end)
 
@@ -465,9 +485,9 @@ TestRunner:test("group settings: get/set/clear, settingsOf copy, no on_change; l
 end)
 
 TestRunner:test("follow-group helpers: a marker of a group that no longer exists reads as follow-global", function()
-    local BookSettings = require("koassistant_book_settings")
-    local BookStore = require("koassistant_book_store")
-    local GroupSettings = require("koassistant_group_settings")
+    local BookSettings = require("koassistant.books.book_settings")
+    local BookStore = require("koassistant.storage.book_store")
+    local GroupSettings = require("koassistant.books.group_settings")
     local g = BookGroups.create("Series")
     local key = "koassistant_book_research_mode"
     local function fakeDS(marker) return { readRaw = function(_, k) if k == key then return marker end end } end
@@ -487,6 +507,109 @@ TestRunner:test("shortName: UTF-8 safe cap with an ellipsis", function()
         "\u{0645}\u{0631}\u{062D}\u{2026}", "counts characters, not bytes")
     TestRunner:assertEqual(BookGroups.shortName("\u{0645}\u{0631}\u{062D}", 3), "\u{0645}\u{0631}\u{062D}", "exactly the cap untouched")
     TestRunner:assertEqual(BookGroups.shortName(nil), "", "nil is empty")
+end)
+
+TestRunner:test("the hub's files row adds one tapped book, and still takes a folder (B405)", function()
+    local GroupsUI = require("koassistant.books.book_groups_ui")
+    local saved = {}
+    for _i, name in ipairs({ "ui/widget/pathchooser", "libs/libkoreader-lfs", "document/documentregistry" }) do
+        saved[name] = package.loaded[name]
+    end
+    local orig_show_group, orig_settings = GroupsUI.showGroup, rawget(_G, "G_reader_settings")
+    local chooser, parent_taps, reopened = nil, 0, 0
+    package.loaded["ui/widget/pathchooser"] = {
+        new = function(_self, o) chooser = o; return o end,
+        onMenuSelect = function() parent_taps = parent_taps + 1; return true end,
+    }
+    package.loaded["libs/libkoreader-lfs"] = {
+        attributes = function(path) return path:match("%.epub$") and "file" or "directory" end,
+    }
+    package.loaded["document/documentregistry"] = {
+        hasProvider = function(_self, name) return name:match("%.epub$") ~= nil end,
+    }
+    _G.G_reader_settings = { readSetting = function() return "/books" end }
+    GroupsUI.showGroup = function() reopened = reopened + 1 end
+
+    local g = BookGroups.create("Shelf")
+    local ok, err = pcall(function()
+        GroupsUI.addFolderFlow(g.id, {})
+        TestRunner:assertEqual(chooser.select_file, true, "a file can be chosen")
+        TestRunner:assertEqual(chooser.select_directory, true, "and so can a folder")
+        TestRunner:assertEqual(chooser.file_filter("notes.txt"), false, "only books are listed")
+        TestRunner:assertEqual(chooser.file_filter("a.epub"), true)
+        -- A tap on a book asks the chooser's own "Choose this file?"; a tap on a folder opens it
+        local asked
+        chooser.onMenuHold = function(_self, item) asked = item.path; return true end
+        chooser.onMenuSelect(chooser, { path = "/books/a.epub", is_file = true })
+        TestRunner:assertEqual(asked, "/books/a.epub", "tap on a book = choose it")
+        chooser.onMenuSelect(chooser, { path = "/books/sub" })
+        TestRunner:assertEqual(parent_taps, 1, "tap on a folder navigates")
+        -- Choosing the book adds that one book and lands back on the hub
+        chooser.onConfirm("/books/a.epub")
+        TestRunner:assertEqual(#BookGroups.byId(g.id).books, 1, "one book joined")
+        TestRunner:assertEqual(BookGroups.byId(g.id).books[1], "/books/a.epub")
+        TestRunner:assertTrue(reopened > 0, "the hub is refreshed")
+        -- The same book again changes nothing
+        chooser.onConfirm("/books/a.epub")
+        TestRunner:assertEqual(#BookGroups.byId(g.id).books, 1, "no duplicate member")
+    end)
+    GroupsUI.showGroup = orig_show_group
+    _G.G_reader_settings = orig_settings
+    for name, mod in pairs(saved) do package.loaded[name] = mod end
+    for _i, name in ipairs({ "ui/widget/pathchooser", "libs/libkoreader-lfs", "document/documentregistry" }) do
+        if saved[name] == nil then package.loaded[name] = nil end
+    end
+    BookGroups.remove(g.id)
+    if not ok then error(err, 0) end
+end)
+
+TestRunner:test("a hub add row's picker stays on that row's source (B407)", function()
+    local GroupsUI = require("koassistant.books.book_groups_ui")
+    local BookPicker = require("koassistant.ui.book_picker")
+    local names = { "ui/widget/pathchooser", "libs/libkoreader-lfs", "document/documentregistry",
+        "ui/widget/buttondialog" }
+    local saved = {}
+    for _i, name in ipairs(names) do saved[name] = package.loaded[name] end
+    local orig = { show = BookPicker.show, list = BookPicker.listFolderBooks,
+        pick = BookPicker.pickCollection, group = GroupsUI.showGroup,
+        settings = rawget(_G, "G_reader_settings") }
+    local shown, chooser, ask = {}, nil, nil
+    BookPicker.show = function(_self, o) shown[#shown + 1] = o end
+    BookPicker.listFolderBooks = function() return { "/books/sub/a.epub", "/books/sub/b.epub" } end
+    BookPicker.pickCollection = function(on_pick) on_pick("Shelf", "Shelf", { "/c/a.epub" }) end
+    GroupsUI.showGroup = function() end
+    package.loaded["ui/widget/pathchooser"] = { new = function(_self, o) chooser = o; return o end }
+    package.loaded["libs/libkoreader-lfs"] = { attributes = function() return "directory" end }
+    package.loaded["document/documentregistry"] = { hasProvider = function() return true end }
+    package.loaded["ui/widget/buttondialog"] = { new = function(_self, o) ask = o; return o end }
+    _G.G_reader_settings = { readSetting = function() return "/books" end }
+    local function tap(label)
+        for _i, row in ipairs(ask.buttons) do
+            if row[1].text == label then return row[1].callback() end
+        end
+        error("no row: " .. label)
+    end
+
+    local g = BookGroups.create("Shelf")
+    local ok, err = pcall(function()
+        GroupsUI.addBooksFlow(g.id, {})
+        TestRunner:assertEqual(shown[1].fixed_source, true, "the history row")
+        TestRunner:assertEqual(shown[1].initial_source, nil, "which opens on the history")
+        GroupsUI.addFolderFlow(g.id, {})
+        chooser.onConfirm("/books/sub")
+        tap("Choose which…")
+        TestRunner:assertEqual(shown[2].fixed_source, true, "a folder's books")
+        TestRunner:assertEqual(shown[2].initial_source, "/books/sub")
+        GroupsUI.addCollectionFlow(g.id, {})
+        tap("Choose which…")
+        TestRunner:assertEqual(shown[3].fixed_source, true, "a collection's books")
+    end)
+    BookPicker.show, BookPicker.listFolderBooks, BookPicker.pickCollection = orig.show, orig.list, orig.pick
+    GroupsUI.showGroup = orig.group
+    _G.G_reader_settings = orig.settings
+    for _i, name in ipairs(names) do package.loaded[name] = saved[name] end
+    BookGroups.remove(g.id)
+    if not ok then error(err, 0) end
 end)
 
 local ok = TestRunner:summary()

@@ -2,7 +2,7 @@ package.path = "./?.lua;./tests/lib/?.lua;" .. package.path
 require("mock_koreader")
 package.loaded.mime = package.loaded.mime or {unb64=function(s) return s end}
 local T = require("test_runner"):new()
-local G = require("koassistant_image_generator")
+local G = require("koassistant.images.image_generator")
 local old_lfs, old_settings = package.loaded["libs/libkoreader-lfs"], package.loaded.luasettings
 local old_remove, old_dir = os.remove, G.getImagesDir
 local now, files, index, removed, fail, flushes = 2000000, {}, {}, {}, {}, 0

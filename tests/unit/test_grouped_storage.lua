@@ -5,7 +5,7 @@ package.loaded.datastorage={getDataDir=function() return "/fixture/koreader" end
 package.loaded.koassistant_storage_registry=nil
 package.loaded.koassistant_image_generator=nil
 package.loaded.mime=package.loaded.mime or {unb64=function(v) return v end}
-local registry=require("koassistant_storage_registry")
+local registry=require("koassistant.storage.storage_registry")
 local expected={images_dir="images",backups_dir="backups",exports_dir="exports",
     notebooks_vault_dir="notebooks",chats_v1_dir="chats",chats_backup_dir="chats.backup"}
 for _,entry in ipairs(registry.all()) do
@@ -17,5 +17,5 @@ for _,entry in ipairs(registry.all()) do
     end
 end
 assert(next(expected)==nil)
-assert(require("koassistant_image_generator").getImagesDir()=="/fixture/koreader/data/koassistant/images")
+assert(require("koassistant.images.image_generator").getImagesDir()=="/fixture/koreader/data/koassistant/images")
 return true

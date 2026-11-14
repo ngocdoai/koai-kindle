@@ -1,7 +1,7 @@
 -- Synthetic response chunks only: bound catalog downloads before accumulation.
 package.path = package.path .. ";./?.lua;./?/init.lua;./tests/lib/?.lua"
 require("mock_koreader")
-local BaseHandler = require("koassistant_api.base")
+local BaseHandler = require("koassistant.api.base")
 
 local chunks = {}
 local sink = BaseHandler.limitedSink(chunks, 5)

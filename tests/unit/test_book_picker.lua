@@ -1,4 +1,4 @@
--- Unit tests for koassistant_book_picker.lua pure ordering helpers (round 29).
+-- Unit tests for koassistant/ui/book_picker.lua pure ordering helpers (round 29).
 --
 -- Why this file exists: the picker hands callers a SET (hash keyed by file
 -- path). Any caller that cares about order — a book group's reading order
@@ -27,7 +27,7 @@ package.loaded["docsettings"] = package.loaded["docsettings"] or {
     open = function() return { readSetting = function() end, close = function() end } end,
 }
 
-local BookPicker = require("koassistant_book_picker")
+local BookPicker = require("koassistant.ui.book_picker")
 
 local TestRunner = { passed = 0, failed = 0 }
 function TestRunner:suite(name) print(string.format("\n  [%s]", name)) end
@@ -220,6 +220,47 @@ TestRunner:test("collectionBooks lists a collection in ITS order, names sorted, 
     package.loaded["readcollection"] = { coll = {} }
     TestRunner:ok(not BookPicker.hasCollections(), "no collections")
     package.loaded["readcollection"] = saved
+end)
+
+TestRunner:suite("the options menu")
+
+-- B407: a group hub has one add row per source, so the picker each opens
+-- stays on that source. The dialog class is the one the picker captured when
+-- it loaded (an earlier test file may have loaded it against another stub).
+TestRunner:test("a fixed source leaves the source rows out of the menu", function()
+    local BD
+    for i = 1, 60 do
+        local name, value = debug.getupvalue(BookPicker._showPickerOptions, i)
+        if not name then break end
+        if name == "ButtonDialog" then BD = value end
+    end
+    TestRunner:ok(type(BD) == "table", "the picker's dialog class")
+    local saved_new = rawget(BD, "new")
+    local captured
+    BD.new = function(_self, o) captured = o; return o end
+    local function labels(fixed)
+        local picker = setmetatable({
+            _selected = {}, _entries = {}, _current_source = "history", _fixed_source = fixed,
+        }, { __index = BookPicker })
+        picker:_showPickerOptions()
+        local out = {}
+        for i, row in ipairs(captured.buttons) do out[i] = row[1].text end
+        return table.concat(out, "|")
+    end
+    local ok, err = pcall(function()
+        local open = labels(nil)
+        TestRunner:ok(open:find("Sources:", 1, true), "the open picker lists its sources")
+        TestRunner:ok(open:find("Browse Folder…", 1, true), "and browses folders")
+        local fixed = labels(true)
+        TestRunner:ok(not fixed:find("Sources:", 1, true), "no sources header")
+        TestRunner:ok(not fixed:find("History", 1, true), "no history row")
+        TestRunner:ok(not fixed:find("Browse", 1, true), "no browse rows")
+        TestRunner:ok(fixed:find("Confirm Selection (0)", 1, true), "confirm stays")
+        TestRunner:ok(fixed:find("Filter…", 1, true) and fixed:find("Search…", 1, true),
+            "filter and search stay")
+    end)
+    rawset(BD, "new", saved_new)
+    if not ok then error(err, 0) end
 end)
 
 return TestRunner.failed == 0

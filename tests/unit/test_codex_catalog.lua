@@ -8,7 +8,7 @@ end
 
 setupPaths()
 require("mock_koreader")
-local Catalog = require("koassistant_codex_catalog")
+local Catalog = require("koassistant.api.codex_catalog")
 local json = require("json")
 local TestRunner = require("test_runner"):new()
 
@@ -126,7 +126,7 @@ end)
 
 -- Synthetic client fixture: the OAuth token, account, and model ids below are
 -- invented for tests; no live account or raw catalog response is committed.
-local Client = require("koassistant_codex_catalog_client")
+local Client = require("koassistant.api.codex_catalog_client")
 local function makeSettings(auth)
     return { readSetting = function(_, key)
         if key == "features" then return { openai_codex_oauth = auth } end
@@ -183,7 +183,7 @@ TestRunner:test("catalog client stays offline and falls back after failed or ove
 end)
 
 TestRunner:test("display overlay leaves curated defaults and tier picks untouched", function()
-    local lists = require("koassistant_model_lists")
+    local lists = require("koassistant.request.model_lists")
     local default = lists.openai_codex[1]
     local tier = lists._tiers.standard.openai_codex
     local discovered = { "gpt-new-synthetic" }

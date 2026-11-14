@@ -1,5 +1,5 @@
 -- Guard the five Markdown display/rebuild paths with one shared pipeline.
-local file = assert(io.open("koassistant_chatgptviewer.lua", "rb"))
+local file = assert(io.open("koassistant/ui/chatgptviewer.lua", "rb"))
 local source = file:read("*a")
 file:close()
 
@@ -18,7 +18,7 @@ assert(source:find("font%-family: 'Noto Sans', 'FreeSerif', sans%-serif"),
 assert(source:find("ChatMarkup.linkMermaidBlocks", 1, true), "Mermaid diagrams need a viewer action")
 assert(source:find("Mermaid.show", 1, true), "diagram action must render offline")
 local resources = 0
-for _ in source:gmatch('html_resource_directory = require%("koassistant_image_generator"%).getImagesDir%(%)') do
+for _ in source:gmatch('html_resource_directory = require%("koassistant%.images%.image_generator"%).getImagesDir%(%)') do
     resources = resources + 1
 end
 assert(resources == 5, "all five HTML paths must resolve local image resources")

@@ -1,5 +1,5 @@
 -- The highlight-menu and one-shot picker must use the same Codex catalog.
-local file = assert(io.open("koassistant_dialogs.lua", "rb"))
+local file = assert(io.open("koassistant/ui/dialogs.lua", "rb"))
 local source = file:read("*a")
 file:close()
 assert(source:find("ModelLists.getPickerModels(provider_id, discovered)", 1, true),

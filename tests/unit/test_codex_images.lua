@@ -1,9 +1,9 @@
 package.path = package.path .. ";./?.lua;./tests/lib/?.lua"
 require("mock_koreader")
 local T = require("test_runner"):new()
-local Images = require("koassistant_codex_images")
-local Handler = require("koassistant_api.openai_codex")
-local Parser = require("koassistant_api.response_parser")
+local Images = require("koassistant.images.codex_images")
+local Handler = require("koassistant.api.openai_codex")
+local Parser = require("koassistant.api.response_parser")
 local json = require("json")
 local original_mime = package.loaded.mime
 package.loaded.mime = { unb64 = function(value)
@@ -92,8 +92,8 @@ T:test("non-streaming image-only Responses SSE becomes a successful chat reply",
     T:assertTrue(json.encode(response):find("iVBOR", 1, true) == nil)
 end)
 T:test("image provider follows Codex sign-in without an API key", function()
-    local generator = require("koassistant_image_generator")
-    local oauth = require("koassistant_openai_codex_oauth")
+    local generator = require("koassistant.images.image_generator")
+    local oauth = require("koassistant.api.openai_codex_oauth")
     local read = oauth.readAuth
     oauth.readAuth = function() return {refresh_token="synthetic-refresh", chatgpt_account_id="synthetic-account"} end
     local provider = generator.effectiveProvider({}, "openai_codex", {})
@@ -115,25 +115,21 @@ T:test("image provider follows Codex sign-in without an API key", function()
     T:assertEqual(why, "no_oauth")
     oauth.readAuth = read
 end)
-T:test("image tab resolves OAuth asynchronously and forwards refreshed credentials", function()
-    local generator = require("koassistant_image_generator")
-    local oauth = require("koassistant_openai_codex_oauth")
-    local read, resolve, impl = oauth.readAuth, oauth.resolveAccessTokenAsync, generator._generateImpl
-    oauth.readAuth = function() return {refresh_token="synthetic-refresh", chatgpt_account_id="synthetic-account"} end
-    local called = 0
-    oauth.resolveAccessTokenAsync = function(settings, callback)
-        generator._generateImpl = function(word, conf, received_settings, book, opts, auth)
-            called = called + 1
-            T:assertEqual(word, "draw a tree")
-            T:assertEqual(auth.access_token, "refreshed-synthetic-token")
-            T:assertEqual(received_settings, settings)
-        end
-        callback({access_token="refreshed-synthetic-token", chatgpt_account_id="synthetic-account"})
-        callback(nil, "late duplicate")
-    end
-    impl("draw a tree", {provider="openai", features={image_gen_provider="openai"}}, {})
-    generator._generateImpl, oauth.readAuth, oauth.resolveAccessTokenAsync = impl, read, resolve
-    T:assertEqual(called, 1)
+T:test("image tab requests the hosted tool on the Codex backend and reads its picture", function()
+    local generator = require("koassistant.images.image_generator")
+    local request = generator.buildRequest("openai_codex", "gpt-5.6-terra", "draw a tree",
+        {image_gen_model_openai_codex = "gpt-image-2.5-flare"})
+    T:assertEqual(request.url, "https://chatgpt.com/backend-api/codex/responses")
+    T:assertEqual(request.key_header, "Authorization")
+    T:assertEqual(request.headers.Accept, "text/event-stream")
+    T:assertEqual(request.body.model, "gpt-5.6-terra")
+    T:assertEqual(request.body.tool_choice.type, "image_generation")
+    T:assertEqual(request.body.tools[1].model, "gpt-image-2.5-flare")
+    local picture = generator.parseResponse("openai_codex", json.encode({output = {item("ig_1")}}))
+    T:assertEqual(picture.bytes, "\137PNG\r\n\26\n")
+    local none, why = generator.parseResponse("openai_codex", json.encode({output = {}}))
+    T:assertEqual(none, nil)
+    T:assertTrue(why:find("no API-key fallback", 1, true) ~= nil)
 end)
 T:test("image links cannot traverse outside generated image storage", function()
     T:assertEqual(Images.path("../../settings.lua"), nil)

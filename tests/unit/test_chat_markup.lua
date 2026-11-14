@@ -1,7 +1,7 @@
 -- Synthetic chat-image fixtures; no live URLs are fetched.
 package.path = package.path .. ";./?.lua;./?/init.lua"
 
-local Markup = require("koassistant_chat_markup")
+local Markup = require("koassistant.ui.chat_markup")
 local T = { passed = 0, failed = 0 }
 
 function T:test(name, fn)

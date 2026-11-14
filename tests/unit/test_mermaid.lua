@@ -3,7 +3,7 @@ local source = debug.getinfo(1, "S").source:sub(2):gsub("\\", "/")
 local root = source:match("^(.*)/tests/unit/[^/]+$") or "."
 package.path = root .. "/?.lua;" .. package.path
 
-local Mermaid = require("koassistant_mermaid")
+local Mermaid = require("koassistant.ui.mermaid")
 local passed, failed = 0, 0
 local function test(name, fn)
     local ok, err = pcall(fn)

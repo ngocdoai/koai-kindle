@@ -14,7 +14,8 @@ The test suite must run from within a **KOReader installation** where KOAssistan
 
 | Platform | Path |
 |----------|------|
-| **Kobo/Kindle** | `/mnt/onboard/.adds/koreader/plugins/koassistant.koplugin/` |
+| **Kobo** | `/mnt/onboard/.adds/koreader/plugins/koassistant.koplugin/` |
+| **Kindle** | `/mnt/us/koreader/plugins/koassistant.koplugin/` |
 | **Android** | `/sdcard/koreader/plugins/koassistant.koplugin/` |
 | **macOS** | `~/Library/Application Support/koreader/plugins/koassistant.koplugin/` |
 | **Linux** | `~/.config/koreader/plugins/koassistant.koplugin/` |
@@ -24,7 +25,7 @@ The test suite must run from within a **KOReader installation** where KOAssistan
 
 > **Note:** The `tests/` directory is excluded from release zips to keep downloads small. To run tests, you need to **clone the repository** from GitHub:
 > ```bash
-> git clone https://github.com/zzzsm/koassistant.git
+> git clone https://github.com/zeeyado/koassistant.koplugin.git
 > ```
 > Then copy or symlink the cloned folder to your KOReader plugins directory.
 
@@ -32,10 +33,10 @@ The test suite must run from within a **KOReader installation** where KOAssistan
 2. **Clone KOAssistant** from GitHub (release zips don't include tests)
 3. **Copy to plugins folder** or create a symlink
 4. **Launch KOReader once** to create the settings file
-4. **Add your API keys** via Settings → API Keys (or create `apikeys.lua`)
-5. **Run tests** from the plugin directory
+5. **Add your API keys** via Settings → API Keys & Auth (or create `apikeys.lua`)
+6. **Run tests** from the plugin directory
 
-**Pro tip:** If you already have KOAssistant configured on your e-reader, use [Backup & Restore](../README.md#backup--restore) to export your settings and import them on your computer.
+**Pro tip:** If you already have KOAssistant configured on your e-reader, use [Backups and Updates](https://github.com/zeeyado/koassistant.koplugin/wiki/Backups-and-Updates) to export your settings and import them on your computer.
 
 ## Quick Start
 
@@ -95,11 +96,11 @@ lua tests/run_tests.lua -v
 ### Model Audit & Capability Probe (`model_audit.lua`)
 
 Discovery + empirical probing for model updates (agenda item 20). Fetches each
-keyed provider's live model list, diffs it against `koassistant_model_lists.lua`
+keyed provider's live model list, diffs it against `koassistant/request/model_lists.lua`
 (noise-filtered, snapshots/`-latest` aliases collapsed), then probes chosen
 models for the facts `/models` never reports — temperature acceptance, reasoning
 default, effort ladder, disable support, output ceiling, tools — and emits DRAFT
-`model_constraints.lua` stanzas annotated against the current resolution layer.
+`koassistant/request/model_constraints.lua` stanzas annotated against the current resolution layer.
 Never auto-applies anything; tier placement stays human.
 
 ```bash
@@ -184,7 +185,7 @@ lua tests/inspect.lua --web --port 3000
 - Provider/model selection for every built-in provider
 - Behavior toggles, temperature slider, **max tokens slider**
 - **Domain loading** from your actual `domains/` folder
-- **Action loading** from `prompts/actions.lua` + custom actions from settings
+- **Action loading** from `koassistant/prompts/actions.lua` + custom actions from settings
 - **Ask action** available in all contexts (like plugin)
 - **Settings sync** from your `koassistant_settings.lua` (languages, behavior, temperature)
 - **Context simulation** (highlight text, book title/author, multi-book)
@@ -255,7 +256,7 @@ The 104 files, with what each one pins:
 - `test_loaders.lua` - BehaviorLoader and DomainLoader file loading, sorting, retrieval
 - `test_math.lua` - the LaTeX to readable HTML converter (#105), including the luamd safety rules
 - `test_max_tokens.lua` - `resolveMaxTokens` / `clampMaxTokens`: raise-where-known defaults, pin clamping
-- `test_message_builder.lua` - placeholder resolution in message_builder.lua, including the replace_placeholder loop gotcha
+- `test_message_builder.lua` - placeholder resolution in koassistant/request/message_builder.lua, including the replace_placeholder loop gotcha
 - `test_message_history.lua` - conversation tracking, token estimation, reasoning entries
 - `test_migrations.lua` - the one-time settings upgrade chain, fixture-based, including idempotence
 - `test_minimal_popup_registry.lua` - `Constants.resolveMinimalPopupActions` read-through (nil = defaults, empty stays empty)
@@ -328,7 +329,7 @@ The 104 files, with what each one pins:
 
 #### Model Validation (`--models`)
 
-Tests every model in `koassistant_model_lists.lua` with ultra-minimal requests to discover:
+Tests every model in `koassistant/request/model_lists.lua` with ultra-minimal requests to discover:
 - Invalid model names (404 errors)
 - Parameter constraints (temperature, max_tokens requirements)
 - Access restrictions
@@ -356,7 +357,7 @@ Detected Constraints:
 
 ### `tests/lib/constraint_utils.lua`
 
-Wrapper around plugin's `model_constraints.lua` module that eliminates duplicated constraint logic in tests.
+Wrapper around plugin's `koassistant/request/model_constraints.lua` module that eliminates duplicated constraint logic in tests.
 
 **Why it exists**: Tests used to duplicate temperature constraints, reasoning defaults, and error parsing logic. This caused drift when plugin constraints changed.
 

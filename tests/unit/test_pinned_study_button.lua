@@ -36,7 +36,7 @@ T:test("study shortcut stays visible and enabled without provider, clipboard or 
     T:assertEqual(row.hold_callback, nil)
 end)
 T:test("full menu keeps one study button plus all fifteen ordinary slots", function()
-    local actions={require("prompts.actions").highlight.image_explain}
+    local actions={require("koassistant.prompts.actions").highlight.image_explain}
     for i=1,15 do actions[#actions+1]={id="action"..i,text="Action "..i} end
     local factories=setup({},actions)
     T:assertEqual(factories["90_00_koassistant_slot"]({}).text,"Explain as image")

@@ -3,7 +3,7 @@ local source = debug.getinfo(1, "S").source:sub(2):gsub("\\", "/")
 local root = source:match("^(.*)/tests/unit/[^/]+$") or "."
 package.path = root .. "/?.lua;" .. package.path
 
-local Probe = require("koassistant_media_probe")
+local Probe = require("koassistant.request.media_probe")
 local fixture = {
     { type = "response.output_item.added", item = { type = "image_generation_call" } },
     { type = "response.image_generation_call.partial_image", partial_image_b64 = "SYNTHETIC_BASE64_NEVER_STORE", mime_type = "image/png" },
@@ -103,7 +103,7 @@ assert(Probe.start("openai_codex", { provider_name = "openai_codex" }, paths) ==
     "invalid marker must not arm")
 assert(io.open(arm_path, "rb"), "invalid marker must not be removed"):close()
 os.remove(arm_path)
-local source_file = assert(io.open("stream_handler.lua", "rb"))
+local source_file = assert(io.open("koassistant/request/stream_handler.lua", "rb"))
 local handler = source_file:read("*a"); source_file:close()
 assert(not handler:find('logger.warn("Failed to parse NDJSON line:", line)', 1, true),
     "armed probe must not log malformed raw NDJSON")

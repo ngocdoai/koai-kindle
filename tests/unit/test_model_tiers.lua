@@ -19,7 +19,7 @@ local function setupPaths()
 
     package.path = table.concat({
         plugin_dir .. "/?.lua",
-        plugin_dir .. "/koassistant_api/?.lua",
+        plugin_dir .. "/koassistant/api/?.lua",
         tests_dir .. "/?.lua",
         tests_dir .. "/lib/?.lua",
         package.path,
@@ -48,8 +48,8 @@ function TestRunner.assert(condition, message)
     end
 end
 
-local ModelLists = require("koassistant_model_lists")
-local ModelOverrides = require("koassistant_model_overrides")
+local ModelLists = require("koassistant.request.model_lists")
+local ModelOverrides = require("koassistant.request.model_overrides")
 
 -- Hermeticity: a developer's local custom_models.lua must not leak in
 -- (mock_koreader already does this; explicit here because these tests depend on it)
@@ -282,13 +282,13 @@ TestRunner.assert(ModelOverrides.userTierOverride("anthropic", "ultrafast") == "
 ModelOverrides.setGuiTiers({ anthropic = { ultrafast = "" }, openai = "not-a-table" })
 TestRunner.assert(ModelOverrides.tierOverride("anthropic", "ultrafast") == "claude-haiku-file",
     "empty-string GUI value falls through to the file layer")
-TestRunner.assert(ModelLists.getModelForTier("openai", "fast", false) == "gpt-5.6-luna",
+TestRunner.assert(ModelLists.getModelForTier("openai", "fast", false) == "gpt-6-luna",
     "non-table GUI provider entry is ignored (curated applies)")
 ModelOverrides._setUserForTests(false)
 
 -- Clearing re-exposes curated
 ModelOverrides.setGuiTiers(nil)
-TestRunner.assert(ModelLists.getModelForTier("anthropic", "ultrafast", false) == "claude-haiku-4-5-20251001",
+TestRunner.assert(ModelLists.getModelForTier("anthropic", "ultrafast", false) == "claude-haiku-5-5",
     "setGuiTiers(nil) clears the GUI layer")
 
 -- Custom provider with only a GUI placement: tier hints + fastest walk work
@@ -302,7 +302,7 @@ TestRunner.assert(ModelLists.resolveTierModel("custom_lm_studio", "fastest") == 
 ModelOverrides.setGuiTiers({ anthropic = { ultrafast = "claude-haiku-gui" } })
 TestRunner.assert(ModelLists.getTierForModel("anthropic", "claude-haiku-gui") == "ultrafast",
     "getTierForModel labels a GUI-placed model with its tier")
-TestRunner.assert(ModelLists.getTierForModel("anthropic", "claude-haiku-4-5-20251001") == "fast",
+TestRunner.assert(ModelLists.getTierForModel("anthropic", "claude-haiku-5-5") == "fast",
     "model in two tiers labels as the higher one (TIER_ORDER walk)")
 ModelOverrides.setGuiTiers(nil)
 
@@ -325,7 +325,7 @@ TestRunner.assert(p == "anthropic",
 -- Walk order: each STEP consults pin then ladder — an ultrafast LADDER hit
 -- beats a fast PIN in the fastest walk (ultrafast step resolves first)
 p, m = ModelLists.resolveTierTarget("anthropic", "fastest")
-TestRunner.assert(p == "anthropic" and m == "claude-haiku-4-5-20251001",
+TestRunner.assert(p == "anthropic" and m == "claude-haiku-5-5",
     "fastest: anthropic's own ultrafast beats a later-step fast pin")
 ModelOverrides.setGlobalTierPins({ ultrafast = { provider = "groq", model = "llama-3.1-8b-instant" } })
 p, m = ModelLists.resolveTierTarget("anthropic", "fastest")
@@ -335,7 +335,7 @@ TestRunner.assert(p == "groq",
 -- Key checker gates pins (revoked key → pin invisible, ladder applies)
 ModelOverrides.setKeyChecker(function(pid) return pid ~= "groq" end)
 p, m = ModelLists.resolveTierTarget("anthropic", "fastest")
-TestRunner.assert(p == "anthropic" and m == "claude-haiku-4-5-20251001",
+TestRunner.assert(p == "anthropic" and m == "claude-haiku-5-5",
     "unusable pin is invisible — ladder fallback")
 ModelOverrides.setKeyChecker(nil)
 
@@ -364,9 +364,9 @@ TestRunner.assert(ModelLists.resolveTierTarget("anthropic", "none") == nil,
 
 -- The ladder-only resolvers never see pins
 ModelOverrides.setGlobalTierPins({ ultrafast = { provider = "groq", model = "llama-3.1-8b-instant" } })
-TestRunner.assert(ModelLists.resolveTierModel("anthropic", "fastest") == "claude-haiku-4-5-20251001",
+TestRunner.assert(ModelLists.resolveTierModel("anthropic", "fastest") == "claude-haiku-5-5",
     "resolveTierModel stays ladder-only (per-provider GUI default rows depend on it)")
-TestRunner.assert(ModelLists.getModelForTier("anthropic", "ultrafast", false) == "claude-haiku-4-5-20251001",
+TestRunner.assert(ModelLists.getModelForTier("anthropic", "ultrafast", false) == "claude-haiku-5-5",
     "getModelForTier stays ladder-only")
 ModelOverrides.setGlobalTierPins(nil)
 
@@ -391,6 +391,17 @@ ModelOverrides.setGuiTiers({ gemini = { fast = "gemini-gui-fast" } })
 TestRunner.assert(ModelLists.getModelForTier("gemini", "fast", false) == "gemini-gui-fast",
     "a GUI tier pick is what the tag names")
 ModelOverrides.setGuiTiers(nil)
+
+print("== subscription catalogue includes current Codex models ==")
+do
+    local listed = {}
+    for _, model in ipairs(ModelLists.openai_codex) do listed[model] = true end
+    for _, model in ipairs({ "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna", "gpt-6-astra" }) do
+        TestRunner.assert(listed[model], "subscription picker includes " .. model)
+    end
+    TestRunner.assert(ModelLists.openai_codex[1] == "gpt-5.6-terra",
+        "adding paid-account models does not change the free-served default")
+end
 
 -- Summary
 print(string.format("\n%d passed, %d failed", TestRunner.passed, TestRunner.failed))

@@ -1,12 +1,12 @@
 package.path = "./?.lua;./tests/lib/?.lua;" .. package.path
 require("mock_koreader")
 local T = require("test_runner"):new()
-local Markup = require("koassistant_chat_markup")
-local Images = require("koassistant_codex_images")
-local saved_generator = package.loaded.koassistant_image_generator
+local Markup = require("koassistant.ui.chat_markup")
+local Images = require("koassistant.images.codex_images")
+local saved_generator = package.loaded["koassistant.images.image_generator"]
 local saved_lfs = package.loaded["libs/libkoreader-lfs"]
 local attr = { mode="file", size=1024 }
-package.loaded.koassistant_image_generator = { getImagesDir=function() return "/safe/images" end }
+package.loaded["koassistant.images.image_generator"] = { getImagesDir=function() return "/safe/images" end }
 package.loaded["libs/libkoreader-lfs"] = { symlinkattributes=function(path)
     assert(path == "/safe/images/codex-20261004-120000.png")
     return attr
@@ -69,6 +69,6 @@ T:test("large files retain a full-view link while preview budget is bounded", fu
     attr = {mode="file",size=1024}
     T:assertTrue(Images.inlineHTML(uri, {bytes=32*1024*1024}):find("<img", 1, true) == nil)
 end)
-package.loaded.koassistant_image_generator = saved_generator
+package.loaded["koassistant.images.image_generator"] = saved_generator
 package.loaded["libs/libkoreader-lfs"] = saved_lfs
 return T:summary()
