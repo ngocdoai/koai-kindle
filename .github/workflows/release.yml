@@ -1,6 +1,9 @@
 name: Create Release Zip
 
 on:
+  push:
+    tags:
+      - 'v*-kindle.*'
   release:
     types: [published]
   workflow_dispatch:
@@ -29,6 +32,10 @@ jobs:
       # shims of the layout change.
       - name: Build the plugin zip
         run: |
+          version="${GITHUB_REF_NAME#v}"
+          if [ "${GITHUB_REF_TYPE:-}" = tag ]; then
+            grep -Fq "version = \"$version\"" _meta.lua
+          fi
           mkdir -p build
           sh scripts/build_release_zip.sh HEAD build/koassistant.koplugin.zip
 
@@ -37,5 +44,7 @@ jobs:
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           files: build/koassistant.koplugin.zip
+          prerelease: false
+          fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

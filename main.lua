@@ -21923,6 +21923,10 @@ function AskGPT:checkForUpdates()
   end)
 end
 
+function AskGPT:configureKindleUpdateToken()
+  require("koassistant.storage.update_checker").showGitHubTokenDialog()
+end
+
 function AskGPT:showAbout()
   local UpdateChecker = require("koassistant.storage.update_checker")
   local version = UpdateChecker.getCurrentVersion() or _("Unknown")
@@ -21931,8 +21935,11 @@ function AskGPT:showAbout()
 
 An AI companion for KOReader. Chat about your books, highlights and library, translate and look things up, and build book artifacts (X-Ray, summaries, quizzes, recaps) with per-book settings, spoiler protection, and your choice of AI provider.
 
-Project page, guides and updates:
+Project page and guides:
 github.com/zeeyado/koassistant.koplugin
+
+Kindle releases:
+github.com/ngocdoai/koai-kindle/releases
 
 Gestures: assign KOAssistant actions in Settings → Taps and gestures → Gesture manager.]]), version),
   })

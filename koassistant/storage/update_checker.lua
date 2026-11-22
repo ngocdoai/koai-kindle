@@ -1,6 +1,6 @@
 local json = require("json")
 local logger = require("koassistant.core.logger")
-local Constants = require("koassistant.core.constants")
+local KindleRelease = require("koassistant.storage.kindle_release")
 local Registry = require("koassistant.storage.storage_registry")
 local ffi = require("ffi")
 local ffiutil = require("ffi/util")
@@ -20,7 +20,7 @@ local _ = require("koassistant.core.gettext")
 -- UI modules lazy-loaded on first use to avoid blocking startup.
 -- The auto-check path (checkForUpdates with auto=true) only needs core modules
 -- above; the ~25 UI widget modules below are only needed when showing popups.
-local InfoMessage, ConfirmBox, Device, Screen, BD, ButtonDialog, Notification
+local InfoMessage, Device, Screen, BD, ButtonDialog, Notification
 local NetworkMgr, LuaSettings, DataStorage
 local Blitbuffer, ButtonTable, CenterContainer, Font, FrameContainer, Geom
 local InputContainer, MovableContainer, ScrollHtmlWidget, ScrollTextWidget
@@ -29,7 +29,6 @@ local Size, TitleBar, VerticalGroup, GestureRange, MD, Languages
 local function loadUI()
     if Device then return end -- already loaded
     InfoMessage = require("ui/widget/infomessage")
-    ConfirmBox = require("ui/widget/confirmbox")
     Device = require("device")
     Screen = Device.screen
     BD = require("ui/bidi")
@@ -624,7 +623,7 @@ end
 
 -- Forward declarations for mutual recursion
 local showUpdatePopup
-local performUpdate, confirmUpdate
+local performUpdate
 
 --- Translate content using the AI and show in a new viewer
 --- @param markdown_content string: The markdown content to translate
@@ -706,10 +705,10 @@ local function translateAndShowContent(markdown_content, target_language, title,
             if update_info.zip_url and lfs.attributes(plugin_dir .. ".git", "mode") == nil then
                 table.insert(buttons, {
                     {
-                        text = _("Update Now"),
+                        text = _("Install Kindle update"),
                         callback = function()
                             UIManager:close(translated_viewer)
-                            confirmUpdate(update_info)
+                            performUpdate(update_info)
                         end,
                     },
                 })
@@ -757,7 +756,7 @@ showUpdatePopup = function(update_info)
     -- Format as markdown with version info header
     local markdown_content = string.format(
         "**%s**\n\n**%s** %s  \n**%s** %s\n\n---\n\n%s",
-        update_info.is_prerelease and _("New pre-release version available!") or _("New version available!"),
+        _("New Kindle build available!"),
         _("Current:"), update_info.current_version,
         _("Latest:"), update_info.latest_version,
         update_info.release_notes
@@ -798,10 +797,10 @@ showUpdatePopup = function(update_info)
     if update_info.zip_url and lfs.attributes(plugin_dir .. ".git", "mode") == nil then
         table.insert(buttons, {
             {
-                text = _("Update Now"),
+                text = _("Install Kindle update"),
                 callback = function()
                     UIManager:close(update_viewer)
-                    confirmUpdate(update_info)
+                    performUpdate(update_info)
                 end,
             },
         })
@@ -815,7 +814,7 @@ showUpdatePopup = function(update_info)
                 callback = function()
                     UIManager:close(update_viewer)
                     NetworkMgr:runWhenConnected(function()
-                        local title = update_info.is_prerelease and _("KOAssistant Pre-release Update") or _("KOAssistant Update Available")
+                        local title = _("Kindle Update Available")
                         if #translate_languages == 1 then
                             -- Single language: translate directly
                             translateAndShowContent(markdown_content, translate_languages[1], title, update_info)
@@ -852,7 +851,7 @@ showUpdatePopup = function(update_info)
     end
 
     update_viewer = MarkdownViewer:new{
-        title = update_info.is_prerelease and _("KOAssistant Pre-release Update") or _("KOAssistant Update Available"),
+        title = _("Kindle Update Available"),
         markdown_text = markdown_content,
         width = math.floor(Screen:getWidth() * 0.85),
         height = math.floor(Screen:getHeight() * 0.85),
@@ -881,15 +880,10 @@ end
 -- These are wall-clock timeouts that kill the subprocess regardless of connection state
 local AUTO_CHECK_TIMEOUT = 8    -- Timeout for automatic background checks (silent, non-intrusive)
 local MANUAL_CHECK_TIMEOUT = 15 -- Longer timeout for user-initiated checks
-local WARMUP_TIMEOUT = 0.5      -- Quick TCP warmup before fork (macOS fix)
 -- B379: the whole zip (6-7 MB) gets 10 minutes, so slow e-reader Wi-Fi
 -- finishes; a connection that stops sending is dropped after a minute of
 -- silence instead (the 2-minute total failed below about 55 KB/s)
 local DOWNLOAD_TIMEOUT = 600
-local DOWNLOAD_STALL_TIMEOUT = 60
-
--- Detect if running on macOS (for TCP warmup which is only needed on macOS)
-local IS_MACOS = ffi.os == "OSX"
 
 -- User-owned files and directories that must survive auto-updates.
 -- Derived from the storage registry (single source of truth, Track 33) — no
@@ -933,40 +927,8 @@ local function purgeTree(path)
     return os.remove(path)
 end
 
---- Wrap a file descriptor for ltn12 sink
-local function wrap_fd(fd)
-    local file_object = {}
-    function file_object:write(chunk)
-        ffiutil.writeToFD(fd, chunk)
-        return self
-    end
-    function file_object:close()
-        return true
-    end
-    return file_object
-end
-
---- Perform HTTP request in subprocess with absolute timeout
---- @param url string URL to fetch
---- @param timeout number Absolute timeout in seconds
---- @param callback function Called with (success, data_or_error)
-local function fetchWithAbsoluteTimeout(url, timeout, callback)
-    local ltn12 = require("ltn12")
-    local socket = require("socket")
-
-    -- Pre-resolve DNS in parent process (macOS only; the warmup was never used on
-    -- other platforms). After fork(), getaddrinfo() aborts or hangs the child under
-    -- macOS's post-fork restrictions, so skipping this guarantees a dead child and a
-    -- zero-byte pipe — auto-checks failed 100% on macOS as "empty response" while
-    -- manual checks (which warmed up) worked. Always resolve here: auto checks now
-    -- run ~20s after startup (off the render hot window), so the brief parent-side
-    -- resolve is acceptable.
-    local resolved_ip
-    if IS_MACOS and url:sub(1, 8) == "https://" then
-        local BaseHandler = require("koassistant.api.base")
-        resolved_ip = BaseHandler.resolveForSubprocess(url)
-    end
-
+--- Read the private GitHub release list in a subprocess with a wall-clock timeout.
+local function fetchWithAbsoluteTimeout(token, timeout, callback)
     local pid, parent_read_fd
     local completed = false
     local fd_closed = false
@@ -1023,146 +985,11 @@ local function fetchWithAbsoluteTimeout(url, timeout, callback)
     local function subprocess_func(subprocess_pid, child_write_fd)
         if not subprocess_pid or not child_write_fd then return end
 
-        local ok, err = pcall(function()
-            if IS_MACOS and url:sub(1, 8) == "https://" then
-                -- macOS: use raw SSL to bypass http.request which hangs after fork
-                local BaseHandler = require("koassistant.api.base")
-                local parsed_host = url:match("https://([^/:]+)")
-                local parsed_port = tonumber(url:match("https://[^/:]+:(%d+)")) or 443
-                local parsed_path = url:match("https://[^/]+(.*)") or "/"
-
-                local ssl_sock = BaseHandler.connectSSLInSubprocess(resolved_ip, parsed_host, parsed_port, 8)
-                local req_headers = {
-                    ["Accept"] = "application/vnd.github.v3+json",
-                    ["User-Agent"] = "KOReader-KOAssistant-Plugin",
-                }
-
-                -- Send GET request and read headers (reuse helper via raw protocol)
-                local req_lines = {
-                    string.format("GET %s HTTP/1.1", parsed_path),
-                    string.format("Host: %s", parsed_host),
-                }
-                for k, v in pairs(req_headers) do
-                    table.insert(req_lines, string.format("%s: %s", k, v))
-                end
-                table.insert(req_lines, "Connection: close")
-                table.insert(req_lines, "")
-                table.insert(req_lines, "")
-                ssl_sock:send(table.concat(req_lines, "\r\n"))
-
-                -- Read status line
-                local status_line = ssl_sock:receive("*l")
-                local status_code = status_line and tonumber(status_line:match("HTTP/%S+%s+(%d+)"))
-
-                -- Read response headers
-                local is_chunked = false
-                while true do
-                    local line = ssl_sock:receive("*l")
-                    if not line or line == "" then break end
-                    if line:lower():match("^transfer%-encoding:%s*chunked") then
-                        is_chunked = true
-                    end
-                end
-
-                if not status_code or status_code ~= 200 then
-                    -- Read error body and report
-                    local err_chunks = {}
-                    if is_chunked then
-                        while true do
-                            local size_line = ssl_sock:receive("*l")
-                            if not size_line then break end
-                            local chunk_size = tonumber(size_line:match("^%s*(%x+)"), 16)
-                            if not chunk_size or chunk_size == 0 then break end
-                            local chunk_data = ssl_sock:receive(chunk_size)
-                            if chunk_data then table.insert(err_chunks, chunk_data) end
-                            ssl_sock:receive("*l")
-                        end
-                    else
-                        while true do
-                            local chunk, recv_err, partial = ssl_sock:receive(8192)
-                            if chunk then table.insert(err_chunks, chunk)
-                            elseif partial and #partial > 0 then table.insert(err_chunks, partial) end
-                            if recv_err then break end
-                        end
-                    end
-                    -- Include the (truncated) error body so GitHub's actual message
-                    -- (rate limit, etc.) reaches the parent log instead of being discarded
-                    local err_body = table.concat(err_chunks):gsub("%s+$", ""):sub(1, 300)
-                    ffiutil.writeToFD(child_write_fd, "\n__UPDATE_CHECK_ERROR__:" .. tostring(status_code or "connection failed")
-                        .. (err_body ~= "" and (" - " .. err_body) or ""))
-                else
-                    -- Stream response body to pipe; track bytes so a clean close with an
-                    -- empty body (RST after headers, captive portal, TLS oddity) reports a
-                    -- diagnosable error instead of the parent's generic "empty response"
-                    local body_bytes = 0
-                    if is_chunked then
-                        while true do
-                            local size_line = ssl_sock:receive("*l")
-                            if not size_line then break end
-                            local chunk_size = tonumber(size_line:match("^%s*(%x+)"), 16)
-                            if not chunk_size or chunk_size == 0 then break end
-                            local chunk_data = ssl_sock:receive(chunk_size)
-                            if chunk_data then
-                                ffiutil.writeToFD(child_write_fd, chunk_data)
-                                body_bytes = body_bytes + #chunk_data
-                            end
-                            ssl_sock:receive("*l")
-                        end
-                    else
-                        while true do
-                            local chunk, recv_err, partial = ssl_sock:receive(8192)
-                            if chunk then
-                                ffiutil.writeToFD(child_write_fd, chunk)
-                                body_bytes = body_bytes + #chunk
-                            elseif partial and #partial > 0 then
-                                ffiutil.writeToFD(child_write_fd, partial)
-                                body_bytes = body_bytes + #partial
-                            end
-                            if recv_err then break end
-                        end
-                    end
-                    if body_bytes == 0 then
-                        ffiutil.writeToFD(child_write_fd, "\n__UPDATE_CHECK_ERROR__:HTTP 200 but empty body (connection closed after headers)")
-                    end
-                end
-
-                ssl_sock:close()
-            else
-                -- Non-macOS: use standard http.request path
-                local http = require("socket.http")
-                local subprocess_ltn12 = require("ltn12")
-
-                local su_ok, socketutil = pcall(require, "socketutil")
-                if su_ok and socketutil then
-                    socketutil:set_timeout(8, 15)  -- 8s block, 15s total
-                else
-                    local subprocess_https = require("ssl.https")
-                    subprocess_https.TIMEOUT = 8
-                end
-
-                local pipe_w = wrap_fd(child_write_fd)
-                local request = {
-                    url = url,
-                    method = "GET",
-                    headers = {
-                        ["Accept"] = "application/vnd.github.v3+json",
-                        ["User-Agent"] = "KOReader-KOAssistant-Plugin"
-                    },
-                    sink = subprocess_ltn12.sink.file(pipe_w),
-                }
-
-                local req_ok, code = pcall(function()
-                    return select(2, http.request(request))
-                end)
-
-                if not req_ok or (code and code ~= 200) then
-                    ffiutil.writeToFD(child_write_fd, "\n__UPDATE_CHECK_ERROR__:" .. tostring(code or "connection failed"))
-                end
-            end
-        end)
-
-        if not ok then
-            ffiutil.writeToFD(child_write_fd, "\n__UPDATE_CHECK_ERROR__:" .. tostring(err))
+        local ok, data, err = pcall(KindleRelease.fetch, token)
+        if ok and data then
+            ffiutil.writeToFD(child_write_fd, data)
+        else
+            ffiutil.writeToFD(child_write_fd, "\n__UPDATE_CHECK_ERROR__:" .. (ok and (err or "connection failed") or "connection failed"))
         end
 
         ffi.C.close(child_write_fd)
@@ -1254,17 +1081,7 @@ end
 --- Download a file via HTTPS in subprocess, writing directly to disk
 --- Uses the same subprocess pattern as fetchWithAbsoluteTimeout but writes
 --- binary data to file instead of piping through FD (avoids binary data issues)
---- @param url string URL to download
---- @param dest_path string Path to write the downloaded file
---- @param callback function Called with (success, error_msg_or_nil)
-local function downloadFile(url, dest_path, callback)
-    -- Pre-resolve DNS in parent process (macOS only)
-    local resolved_ip
-    if IS_MACOS and url:sub(1, 8) == "https://" then
-        local BaseHandler = require("koassistant.api.base")
-        resolved_ip = BaseHandler.resolveForSubprocess(url)
-    end
-
+local function downloadFile(update_info, token, dest_path, callback)
     local pid, parent_read_fd
     local completed = false
     local fd_closed = false
@@ -1328,114 +1145,13 @@ local function downloadFile(url, dest_path, callback)
     pid, parent_read_fd = ffiutil.runInSubProcess(function(subprocess_pid, child_write_fd)
         if not subprocess_pid or not child_write_fd then return end
 
-        local ok, sub_err = pcall(function()
-            if IS_MACOS and url:sub(1, 8) == "https://" then
-                -- macOS: use raw SSL to bypass http.request which hangs after fork
-                local BaseHandler = require("koassistant.api.base")
-                local parsed_host = url:match("https://([^/:]+)")
-                local parsed_port = tonumber(url:match("https://[^/:]+:(%d+)")) or 443
-                local parsed_path = url:match("https://[^/]+(.*)") or "/"
-
-                local ssl_sock = BaseHandler.connectSSLInSubprocess(resolved_ip, parsed_host, parsed_port, DOWNLOAD_STALL_TIMEOUT)
-
-                -- Send GET request
-                local req_lines = {
-                    string.format("GET %s HTTP/1.1", parsed_path),
-                    string.format("Host: %s", parsed_host),
-                    "User-Agent: KOReader-KOAssistant-Plugin",
-                    "Connection: close",
-                    "", "",
-                }
-                ssl_sock:send(table.concat(req_lines, "\r\n"))
-
-                -- Read status line
-                local status_line = ssl_sock:receive("*l")
-                local status_code = status_line and tonumber(status_line:match("HTTP/%S+%s+(%d+)"))
-
-                -- Read response headers, detect chunked TE and content-length
-                local is_chunked = false
-                local content_length = nil
-                while true do
-                    local line = ssl_sock:receive("*l")
-                    if not line or line == "" then break end
-                    if line:lower():match("^transfer%-encoding:%s*chunked") then
-                        is_chunked = true
-                    end
-                    local cl = line:lower():match("^content%-length:%s*(%d+)")
-                    if cl then content_length = tonumber(cl) end
-                end
-
-                if not status_code or status_code ~= 200 then
-                    os.remove(dest_path)
-                    ffiutil.writeToFD(child_write_fd, "ERROR:" .. tostring(status_code or "connection failed"))
-                else
-                    -- Write body to file
-                    local output_file = io.open(dest_path, "wb")
-                    if not output_file then
-                        ffiutil.writeToFD(child_write_fd, "ERROR:Failed to create file")
-                    else
-                        if is_chunked then
-                            while true do
-                                local size_line = ssl_sock:receive("*l")
-                                if not size_line then break end
-                                local chunk_size = tonumber(size_line:match("^%s*(%x+)"), 16)
-                                if not chunk_size or chunk_size == 0 then break end
-                                local chunk_data = ssl_sock:receive(chunk_size)
-                                if chunk_data then output_file:write(chunk_data) end
-                                ssl_sock:receive("*l")
-                            end
-                        else
-                            while true do
-                                local chunk, recv_err, partial = ssl_sock:receive(8192)
-                                if chunk then output_file:write(chunk)
-                                elseif partial and #partial > 0 then output_file:write(partial) end
-                                if recv_err then break end
-                            end
-                        end
-                        output_file:close()
-                        ffiutil.writeToFD(child_write_fd, "OK")
-                    end
-                end
-
-                ssl_sock:close()
-            else
-                -- Non-macOS: use standard https.request path
-                local subprocess_https = require("ssl.https")
-                local subprocess_ltn12 = require("ltn12")
-                subprocess_https.TIMEOUT = DOWNLOAD_STALL_TIMEOUT
-                -- Per read, no total: a total inherited from the parent's last
-                -- request must not cut a slow download
-                pcall(function() require("socketutil"):set_timeout(DOWNLOAD_STALL_TIMEOUT, -1) end)
-
-                local output_file = io.open(dest_path, "wb")
-                if not output_file then
-                    ffiutil.writeToFD(child_write_fd, "ERROR:Failed to create file")
-                    return
-                end
-
-                local req_ok, code = pcall(function()
-                    return select(2, subprocess_https.request{
-                        url = url,
-                        method = "GET",
-                        headers = {
-                            ["User-Agent"] = "KOReader-KOAssistant-Plugin",
-                        },
-                        sink = subprocess_ltn12.sink.file(output_file),
-                    })
-                end)
-
-                if not req_ok or (code and code ~= 200) then
-                    os.remove(dest_path)
-                    ffiutil.writeToFD(child_write_fd, "ERROR:" .. tostring(code or "connection failed"))
-                else
-                    ffiutil.writeToFD(child_write_fd, "OK")
-                end
-            end
-        end)
-
-        if not ok then
+        local ok, saved, err = pcall(KindleRelease.download,
+            update_info.zip_url, token, dest_path, update_info.zip_size)
+        if ok and saved then
+            ffiutil.writeToFD(child_write_fd, "OK")
+        else
             os.remove(dest_path)
-            ffiutil.writeToFD(child_write_fd, "ERROR:" .. tostring(sub_err))
+            ffiutil.writeToFD(child_write_fd, "ERROR:" .. (ok and (err or "connection failed") or "connection failed"))
         end
 
         ffi.C.close(child_write_fd)
@@ -1468,9 +1184,9 @@ local function downloadFile(url, dest_path, callback)
         cleanup(true)
 
         local error_msg = status_data:match("^ERROR:(.+)")
-        if error_msg then
+        if status_data ~= "OK" then
             os.remove(dest_path)
-            callback(false, error_msg)
+            callback(false, error_msg or _("Download did not complete"))
         else
             -- Verify file exists and is non-empty
             local attr = lfs.attributes(dest_path)
@@ -1746,19 +1462,20 @@ local function verifyDownload(path, update_info)
     end
     if update_info.zip_sha256 then
         local ok, sha = pcall(require, "ffi/sha2")
-        if ok and type(sha) == "table" and sha.sha256 then
-            local f = io.open(path, "rb")
-            if not f then return _("The download could not be read. Please try again.") end
-            local append = sha.sha256()
-            while true do
-                local chunk = f:read(65536)
-                if not chunk then break end
-                append(chunk)
-            end
-            f:close()
-            if append():lower() ~= update_info.zip_sha256:lower() then
-                return _("The download is damaged (it does not match the release). Please try again.")
-            end
+        if not ok or type(sha) ~= "table" or not sha.sha256 then
+            return _("SHA-256 verification is unavailable on this KOReader build.")
+        end
+        local f = io.open(path, "rb")
+        if not f then return _("The download could not be read. Please try again.") end
+        local append = sha.sha256()
+        while true do
+            local chunk = f:read(65536)
+            if not chunk then break end
+            append(chunk)
+        end
+        f:close()
+        if append():lower() ~= update_info.zip_sha256:lower() then
+            return _("The download is damaged (it does not match the release). Please try again.")
         end
     end
     return nil
@@ -1767,21 +1484,14 @@ end
 --- Main auto-update orchestrator. Called when user taps "Update Now".
 --- Downloads, extracts, verifies, and installs the update with user file preservation.
 --- @param update_info table Contains zip_url, latest_version, and other update metadata
--- Kindle build: Update Now installs the original release, which replaces this
--- build's own changes. Say so first; Update anyway goes on. Settings, sign-in,
--- chats and pictures are kept either way.
-confirmUpdate = function(update_info)
-    loadUI()
-    UIManager:show(ConfirmBox:new{
-        text = _("This is a customized Kindle build.\n\nUpdating installs the original release and removes this build's changes: Codex image generation, Explain as image, 7-day image cleanup, models that follow your account and the no-questions privacy setting. Your settings, sign-in, chats and pictures are kept.\n\nTo keep the changes, merge the new release on your computer and reinstall instead."),
-        ok_text = _("Update anyway"),
-        ok_callback = function() performUpdate(update_info) end,
-    })
-end
-
 performUpdate = function(update_info)
     loadUI()
     getBinPaths()
+    local token = KindleRelease.readToken()
+    if not token then
+        UpdateChecker.showGitHubTokenDialog()
+        return
+    end
     -- Guard: don't update git-based dev installs (would destroy repo). B379:
     -- a worktree or submodule checkout has a .git FILE
     if lfs.attributes(plugin_dir .. ".git", "mode") ~= nil then
@@ -1843,7 +1553,7 @@ performUpdate = function(update_info)
     UIManager:forceRePaint()
 
     -- Step 1: Download
-    downloadFile(update_info.zip_url, archive_path, function(dl_success, dl_error)
+    downloadFile(update_info, token, archive_path, function(dl_success, dl_error)
         UIManager:close(progress_msg)
 
         if not dl_success then
@@ -1998,7 +1708,64 @@ end
 
 UpdateChecker.AUTO_CHECK_COOLDOWN = AUTO_CHECK_COOLDOWN
 
-function UpdateChecker.checkForUpdates(auto, include_prereleases)
+function UpdateChecker.showGitHubTokenDialog(on_saved)
+    loadUI()
+    local InputDialog = require("ui/widget/inputdialog")
+    local has_token = KindleRelease.readToken() ~= nil
+    local dialog
+    local row = { {
+        text = _("Cancel"), id = "close",
+        callback = function() UIManager:close(dialog) end,
+    } }
+    if has_token then
+        row[#row + 1] = {
+            text = _("Remove token"),
+            callback = function()
+                if KindleRelease.clearToken() then
+                    UIManager:close(dialog)
+                else
+                    UIManager:show(InfoMessage:new{ text = _("Could not remove the GitHub token.") })
+                end
+            end,
+        }
+    end
+    row[#row + 1] = {
+        text = _("Save"),
+        is_enter_default = true,
+        callback = function()
+            local token = KindleRelease.normalizeToken(dialog:getInputText())
+            if not token then
+                UIManager:show(InfoMessage:new{ text = _("Enter a fine-grained GitHub token (github_pat_…).") })
+            elseif not KindleRelease.saveToken(token) then
+                UIManager:show(InfoMessage:new{ text = _("Could not save the GitHub token.") })
+            else
+                G_reader_settings:delSetting("koassistant_last_update_check")
+                _session_auto_check_done, _session_auto_last_attempt = false, nil
+                UIManager:close(dialog)
+                if on_saved then on_saved() end
+            end
+        end,
+    }
+    dialog = InputDialog:new{
+        title = _("GitHub token for Kindle updates"),
+        description = _("Create a fine-grained token for ngocdoai/koai-kindle with Contents: read-only access. The token is saved on this Kindle."),
+        input = "",
+        hint = has_token and _("Token saved. Paste a new one to replace it.") or "github_pat_…",
+        text_type = "password",
+        buttons = { row },
+    }
+    UIManager:show(dialog)
+    dialog:onShowKeyboard()
+end
+
+function UpdateChecker.checkForUpdates(auto)
+    local token = KindleRelease.readToken()
+    if not token then
+        if not auto then
+            UpdateChecker.showGitHubTokenDialog(function() UpdateChecker.checkForUpdates(false) end)
+        end
+        return
+    end
     -- One automatic check per session once one succeeded (the DONE flag is set
     -- only by a parsed answer, see the fetch callback, so a failed check is
     -- retried), never two at once (INFLIGHT: FileManager and ReaderUI both init
@@ -2014,31 +1781,14 @@ function UpdateChecker.checkForUpdates(auto, include_prereleases)
         _session_auto_last_attempt = os.time()
     end
 
-    -- Default to including prereleases since we're in alpha/beta
-    if include_prereleases == nil then
-        include_prereleases = true
-    end
-
     local timeout = auto and AUTO_CHECK_TIMEOUT or MANUAL_CHECK_TIMEOUT
-
-    -- Helper to extract version string from tag (handles v0.4.1, v.0.4.1, 0.4.1)
-    local function extractVersion(tag)
-        if not tag then return nil end
-        if type(tag) ~= "string" then
-            logger.warn("extractVersion: expected string tag, got " .. type(tag))
-            return nil
-        end
-        -- Remove common prefixes: "v", "v.", "V", "V."
-        local version = tag:gsub("^[vV]%.?", "")
-        return version
-    end
 
     -- Show loading message only for manual checks (auto checks are silent)
     local loading_msg = nil
     if not auto then
         loadUI()
         loading_msg = require("koassistant.ui.waiting").message{
-            text = _("Checking for updates..."),
+            text = _("Checking your Kindle releases..."),
         }
         UIManager:show(loading_msg)
         -- Force screen refresh to show loading message immediately
@@ -2053,14 +1803,17 @@ function UpdateChecker.checkForUpdates(auto, include_prereleases)
     end
 
     -- Use subprocess with absolute timeout
-    fetchWithAbsoluteTimeout(Constants.GITHUB.API_URL, timeout, function(fetch_success, response_data)
+    fetchWithAbsoluteTimeout(token, timeout, function(fetch_success, response_data)
         closeLoading()
         _session_auto_check_inflight = false
 
         if not fetch_success then
             logger.err("Failed to check for updates:", response_data)
             if not auto then
-                local error_text = response_data == "Timeout"
+                local token_denied = response_data == "HTTP 401" or response_data == "HTTP 403" or response_data == "HTTP 404"
+                local error_text = token_denied
+                    and _("GitHub denied access. Update your fine-grained token with Contents: read access to ngocdoai/koai-kindle.")
+                    or response_data == "Timeout"
                     and _("Failed to check for updates (timed out). Please try again.")
                     or _("Failed to check for updates. Please check your internet connection.")
                 UIManager:show(InfoMessage:new{
@@ -2118,24 +1871,13 @@ function UpdateChecker.checkForUpdates(auto, include_prereleases)
         G_reader_settings:saveSetting("koassistant_last_update_check", os.time())
 
         -- Find the latest release by comparing versions (don't rely on array order)
-        local latest_release = nil
-        local latest_version_str = nil
-        for _idx, release in ipairs(releases) do
-            if not release.draft then
-                if include_prereleases or not release.prerelease then
-                    local version_str = extractVersion(release.tag_name)
-                    if version_str and parseVersion(version_str) then
-                        if not latest_release then
-                            latest_release = release
-                            latest_version_str = version_str
-                        else
-                            -- Compare and keep the higher version
-                            if compareVersions(version_str, latest_version_str) > 0 then
-                                latest_release = release
-                                latest_version_str = version_str
-                            end
-                        end
-                    end
+        local latest_release, latest_version_str, latest_asset
+        for _, release in ipairs(releases) do
+            if type(release) == "table" and release.draft == false and release.prerelease == false then
+                local version = KindleRelease.version(release.tag_name)
+                local asset = version and KindleRelease.assetInfo(release.assets)
+                if asset and (not latest_version_str or compareVersions(version, latest_version_str) > 0) then
+                    latest_release, latest_version_str, latest_asset = release, version, asset
                 end
             end
         end
@@ -2181,32 +1923,15 @@ function UpdateChecker.checkForUpdates(auto, include_prereleases)
         logger.info("Update check: current=" .. current_version .. ", latest=" .. latest_version .. ", comparison=" .. comparison)
 
         if comparison < 0 then
-            -- Extract zip asset URL for auto-update
-            local zip_url, zip_size, zip_sha256 = nil, nil, nil
-            if latest_release.assets then
-                for _idx, asset in ipairs(latest_release.assets) do
-                    if asset.name and asset.name:match("%.zip$") then
-                        zip_url = asset.browser_download_url
-                        -- B379: what the download must match (a json null
-                        -- decodes to a function, so check the types)
-                        zip_size = type(asset.size) == "number" and asset.size or nil
-                        zip_sha256 = type(asset.digest) == "string"
-                            and asset.digest:match("^sha256:(%x+)$") or nil
-                        break
-                    end
-                end
-            end
-
             -- New version available
             local update_info = {
                 current_version = current_version,
                 latest_version = latest_version,
-                release_notes = latest_release.body or _("No release notes available."),
-                download_url = latest_release.html_url,
-                is_prerelease = latest_release.prerelease or false,
-                zip_url = zip_url,
-                zip_size = zip_size,
-                zip_sha256 = zip_sha256,
+                release_notes = type(latest_release.body) == "string" and latest_release.body or _("No release notes available."),
+                download_url = "https://github.com/" .. KindleRelease.REPO .. "/releases/tag/v" .. latest_version,
+                zip_url = latest_asset.url,
+                zip_size = latest_asset.size,
+                zip_sha256 = latest_asset.sha256,
             }
 
             -- Check if streaming is active - if so, defer the popup

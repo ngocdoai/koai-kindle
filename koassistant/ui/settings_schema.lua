@@ -3548,8 +3548,15 @@ local SettingsSchema = {
         {
             id = "check_updates",
             type = "action",
-            text = _("Check for Updates"),
+            text = _("Update my Kindle build"),
             callback = "checkForUpdates",
+            keep_menu_open = true,
+        },
+        {
+            id = "kindle_update_github_token",
+            type = "action",
+            text = _("GitHub token for Kindle updates"),
+            callback = "configureKindleUpdateToken",
             keep_menu_open = true,
         },
     },

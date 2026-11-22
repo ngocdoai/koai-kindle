@@ -275,6 +275,12 @@ Registry.entries = {
         reset_in = { "wipe_all" }, uninstall = true,
     },
     {
+        id = "kindle_github_token", label = "Private GitHub release token",
+        location = "settings_dir", ref = "koassistant_github_token",
+        category = "internal", backup = false,
+        reset_in = { "wipe_all" }, uninstall = true,
+    },
+    {
         id = "artifact_index_version", label = "Artifact index schema version",
         location = "global_key", ref = "koassistant_artifact_index_version",
         category = "internal", backup = false,

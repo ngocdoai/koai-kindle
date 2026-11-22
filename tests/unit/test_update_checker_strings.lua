@@ -55,15 +55,13 @@ TestRunner:test("a message with a version in it is a template", function()
     TestRunner:assertFalse(src:find('"You are running the latest version (" ..', 1, true), "no joined sentence")
 end)
 
-TestRunner:test("the 'New version available' header is two whole sentences, not a joined fragment", function()
-    TestRunner:assertTrue(src:find('_("New pre-release version available!")', 1, true), "pre-release header")
-    TestRunner:assertTrue(src:find('_("New version available!")', 1, true), "release header")
-    TestRunner:assertFalse(src:find('"pre-release "', 1, true), "no 'pre-release ' fragment to splice in")
+TestRunner:test("the Kindle release header is translated as a whole sentence", function()
+    TestRunner:assertTrue(src:find('_("New Kindle build available!")', 1, true), "release header")
 end)
 
 TestRunner:test("the checking message and the failure messages are wrapped", function()
     for _idx, text in ipairs({
-        "Checking for updates...",
+        "Checking your Kindle releases...",
         "Failed to check for updates (timed out). Please try again.",
         "Failed to check for updates. Please check your internet connection.",
         "Failed to check for updates: Empty response from server",
@@ -71,8 +69,8 @@ TestRunner:test("the checking message and the failure messages are wrapped", fun
         "No releases found",
         "Update check failed: invalid current version format",
         "Update check failed: invalid latest version format",
-        "KOAssistant Update Available",
-        "KOAssistant Pre-release Update",
+        "Kindle Update Available",
+        "Install Kindle update",
     }) do
         TestRunner:assertTrue(src:find('_("' .. text .. '")', 1, true), text)
     end
