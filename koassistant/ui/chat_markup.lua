@@ -11,9 +11,10 @@ function ChatMarkup.protectImages(text, resolve_local)
     if type(text) ~= "string" then return text, function(value) return value end end
     local marker = "KOAIMAGEPLACEHOLDER"
     while text:find(marker, 1, true) do marker = marker .. "X" end
-    local images = {}
-    local function protect(html)
+    local images, blocks = {}, {}
+    local function protect(html, block)
         images[#images + 1] = html
+        blocks[#images] = block
         return marker .. #images .. "X"
     end
 
@@ -25,7 +26,8 @@ function ChatMarkup.protectImages(text, resolve_local)
             local label = escapeHTML(alt ~= "" and alt or "image")
             local html
             if resolve_local and url:match("^koassistant%-image:") then
-                html = resolve_local(url) or ('Image unavailable: ' .. label)
+                local preview, block = resolve_local(url)
+                return protect(preview or ('Image unavailable: ' .. label), block)
             elseif bang ~= "!" then
                 return nil -- ordinary Markdown link
             elseif url:match("^https://[%w%._~:/%?#%[%]@!$&'()*+,;=%-]+$")
@@ -38,12 +40,12 @@ function ChatMarkup.protectImages(text, resolve_local)
         end)
         if resolve_local then
             segment = segment:gsub("^koassistant%-image:/+[^%s%)<>\"']+", function(uri)
-                local html = resolve_local(uri)
-                return html and protect(html) or nil
+                local html, block = resolve_local(uri)
+                return html and protect(html, block) or nil
             end)
             segment = segment:gsub("(%s)(koassistant%-image:/+[^%s%)<>\"']+)", function(space, uri)
-                local html = resolve_local(uri)
-                return html and (space .. protect(html)) or nil
+                local html, block = resolve_local(uri)
+                return html and (space .. protect(html, block)) or nil
             end)
         end
         return segment
@@ -85,6 +87,9 @@ function ChatMarkup.protectImages(text, resolve_local)
     end
 
     return table.concat(lines, "\n"), function(value)
+        value = value:gsub("<p>%s*" .. marker .. "(%d+)X%s*</p>", function(index)
+            return blocks[tonumber(index)]
+        end)
         return (value:gsub(marker .. "(%d+)X", function(index)
             return images[tonumber(index)] or ""
         end))

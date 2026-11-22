@@ -122,8 +122,10 @@ function Images.inlineHTML(uri, state)
         return '<a href="' .. link .. '">' .. _("Open generated image") .. '</a>'
     end
     state.bytes = state.bytes + attr.size
-    return '<a class="koa-generated-image" href="' .. link .. '"><img src="' .. name
-        .. '" alt="Generated image" /></a>'
+    local anchor = '<a href="' .. link .. '">'
+    local preview = anchor .. '<img src="' .. name .. '" alt="Generated image" /></a>'
+    return preview, '<div class="koa-generated-image"><p>' .. preview .. '</p>'
+        .. '<p class="koa-image-caption">' .. anchor .. _("Open full image") .. '</a></p></div>'
 end
 
 function Images.consume(state, item, index, save)

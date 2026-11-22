@@ -40,6 +40,7 @@ local Screen = Device.screen
 local MD = require("apps/filemanager/lib/md")
 local MathRender = require("koassistant.ui.math")
 local ChatMarkup = require("koassistant.ui.chat_markup")
+local ChatTables = require("koassistant.ui.chat_tables")
 local Mermaid = require("koassistant.ui.mermaid")
 local SpinWidget = require("ui/widget/spinwidget")
 local UIConstants = require("koassistant.ui.constants")
@@ -706,14 +707,6 @@ local function copyWithPicker(viewer, is_translate)
     end, copy_anchor)
 end
 
--- Pre-process markdown tables to HTML (luamd doesn't support tables)
--- Tables with more columns than this are rendered as stacked "Header: value"
--- blocks instead of a grid: MuPDF's HTML engine can't shrink a wide table below
--- the sum of its column minimum widths (it ignores table-layout:fixed and
--- word-wrap), so many-column grids run off the right edge with no way to scroll
--- back. Stacked blocks always fit the viewer width. Tune this to taste.
-local WIDE_TABLE_COLS = 3
-
 -- B066: two cheap robustness pre-passes ahead of luamd, one chokepoint for
 -- every MD() call site. (The third, footnote escaping, is unnecessary:
 -- preprocessBrackets already entity-escapes "[^1]" — probed 2026-08-25.)
@@ -780,135 +773,6 @@ local function healMarkdown(text)
     return text
 end
 
-local function preprocessMarkdownTables(text)
-    if not text then return text end
-    text = healMarkdown(text)
-
-    local lines = {}
-    for line in text:gmatch("([^\n]*)\n?") do
-        table.insert(lines, line)
-    end
-
-    local result = {}
-    local i = 1
-
-    while i <= #lines do
-        local line = lines[i]
-
-        -- Check if this line looks like a table row (contains | and isn't a code block)
-        local is_table_row = line:match("^%s*|.*|%s*$") or line:match("^%s*[^|]+|[^|]+")
-
-        -- Also check if next line is a separator row (|----|----| pattern)
-        local next_line = lines[i + 1]
-        local is_separator = next_line and next_line:match("^%s*|?[%s%-:]+|[%s%-:|]+$")
-
-        if is_table_row and is_separator then
-            -- Found a markdown table, parse it
-
-            -- Parse header row
-            local header_cells = {}
-            for cell in line:gmatch("[^|]+") do
-                local trimmed = cell:match("^%s*(.-)%s*$")
-                if trimmed and trimmed ~= "" then
-                    table.insert(header_cells, trimmed)
-                end
-            end
-
-            -- Parse alignment from separator row
-            local alignments = {}
-            for sep in next_line:gmatch("[^|]+") do
-                local trimmed = sep:match("^%s*(.-)%s*$")
-                if trimmed and trimmed:match("^:?%-+:?$") then
-                    if trimmed:match("^:.*:$") then
-                        table.insert(alignments, "center")
-                    elseif trimmed:match(":$") then
-                        table.insert(alignments, "right")
-                    else
-                        table.insert(alignments, "left")
-                    end
-                end
-            end
-
-            -- Skip header and separator rows
-            i = i + 2
-
-            -- Collect body rows (each is a list of cell strings)
-            local body_rows = {}
-            while i <= #lines do
-                local body_line = lines[i]
-
-                -- Check if still a table row
-                if not (body_line:match("^%s*|.*|%s*$") or body_line:match("^%s*[^|]+|[^|]+")) then
-                    break
-                end
-
-                -- Skip empty lines within table
-                if body_line:match("^%s*$") then
-                    break
-                end
-
-                local body_cells = {}
-                for cell in body_line:gmatch("[^|]+") do
-                    local trimmed = cell:match("^%s*(.-)%s*$")
-                    if trimmed then
-                        table.insert(body_cells, trimmed)
-                    end
-                end
-                table.insert(body_rows, body_cells)
-
-                i = i + 1
-            end
-
-            local table_html = {}
-            if #header_cells > WIDE_TABLE_COLS then
-                -- Too wide for MuPDF to fit -- stack each row as labeled blocks.
-                for _r, cells in ipairs(body_rows) do
-                    table.insert(table_html,
-                        '<div style="margin:0.6em 0; padding-left:0.6em; border-left:2px solid #ccc">')
-                    for j = 1, #header_cells do
-                        local val = cells[j]
-                        if val and val ~= "" then
-                            table.insert(table_html, string.format(
-                                '<p style="margin:0.15em 0"><b>%s:</b> %s</p>', header_cells[j], val))
-                        end
-                    end
-                    table.insert(table_html, '</div>')
-                end
-            else
-                -- Narrow enough for a normal grid.
-                table.insert(table_html, "<table>")
-                table.insert(table_html, "<thead><tr>")
-                for j, cell in ipairs(header_cells) do
-                    local align = alignments[j] or "left"
-                    table.insert(table_html, string.format('<th style="text-align:%s">%s</th>', align, cell))
-                end
-                table.insert(table_html, "</tr></thead>")
-
-                table.insert(table_html, "<tbody>")
-                for _r, cells in ipairs(body_rows) do
-                    table.insert(table_html, "<tr>")
-                    for j, cell in ipairs(cells) do
-                        local align = alignments[j] or "left"
-                        -- Skip empty cells that are just whitespace from leading/trailing |
-                        if cell ~= "" then
-                            table.insert(table_html, string.format('<td style="text-align:%s">%s</td>', align, cell))
-                        end
-                    end
-                    table.insert(table_html, "</tr>")
-                end
-                table.insert(table_html, "</tbody></table>")
-            end
-
-            table.insert(result, table.concat(table_html, "\n"))
-        else
-            table.insert(result, line)
-            i = i + 1
-        end
-    end
-
-    return table.concat(result, "\n")
-end
-
 -- Auto-linkify plain URLs that aren't already part of markdown links
 -- Converts https://example.com to [https://example.com](https://example.com)
 -- Also handles www.example.com (adds https://)
@@ -963,7 +827,7 @@ end
 
 -- LaTeX math → readable HTML (#105, koassistant/ui/math.lua). Display-only and
 -- FIRST in the markdown pre-pass: it must see raw "[" / "]" before
--- preprocessBrackets entity-escapes them, and its output carries no "$", so
+-- protectLinks entity-escapes them, and its output carries no "$", so
 -- healMarkdown's shield only ever meets spans this pass left alone (the toggle
 -- off, or prose like "$5 and 10$"). Saves, copies, exports and the plain-text
 -- view keep the original notation.
@@ -974,38 +838,44 @@ local function applyMath(viewer, text)
     return MathRender.render(text)
 end
 
--- Pre-process brackets to prevent them being rendered as links
--- Square brackets in markdown can be interpreted as link references
-local function preprocessBrackets(text)
-    if not text then return text end
-
-    -- Convert real markdown links to HTML <a> tags OURSELVES, before luamd runs:
-    -- luamd's own link parser truncates the URL at the first ')', so a link like
-    -- [Mercury](https://en.wikipedia.org/wiki/Mercury_(planet)) renders with an
-    -- empty href and the tail leaks as plain text. We emit the anchor with a
-    -- balanced-paren (%b()) URL match, and luamd passes inline HTML through
-    -- untouched. The generated anchors are stashed behind placeholders so the
-    -- bracket-escaping below can't touch the href/text.
+-- Protect balanced Markdown links until after luamd has parsed emphasis.
+-- Its inline parser can truncate parentheses or interpret underscores in hrefs.
+local function protectLinks(text)
+    local marker = "KOALINKPLACEHOLDER"
+    while text:find(marker, 1, true) do marker = marker .. "X" end
     local links = {}
-    local link_count = 0
-    local protected_text = text:gsub("%[([^%]]+)%](%b())", function(link_text, paren)
-        link_count = link_count + 1
-        local placeholder = "XMDLINKX" .. link_count .. "XMDLINKX"
-        links[link_count] = string.format('<a href="%s">%s</a>', paren:sub(2, -2), link_text)
-        return placeholder
+    text = text:gsub("%[([^%]]+)%](%b())", function(label, paren)
+        local href = paren:sub(2, -2):gsub("&", "&amp;"):gsub('"', "&quot;")
+            :gsub("<", "&lt;"):gsub(">", "&gt;")
+        links[#links + 1] = '<a href="' .. href .. '">'
+        return marker .. #links .. "X" .. label .. marker .. "ENDX"
     end)
-
-    -- Now escape all remaining square brackets to HTML entities
-    protected_text = protected_text:gsub("%[", "&#91;")
-    protected_text = protected_text:gsub("%]", "&#93;")
-
-    -- Restore the generated anchors from placeholders
-    for i = 1, link_count do
-        local placeholder = "XMDLINKX" .. i .. "XMDLINKX"
-        protected_text = protected_text:gsub(placeholder, function() return links[i] end)
+    text = text:gsub("%[", "&#91;"):gsub("%]", "&#93;")
+    return text, function(html)
+        html = html:gsub(marker .. "(%d+)X", function(id) return links[tonumber(id)] end)
+        return (html:gsub(marker .. "ENDX", "</a>"))
     end
+end
 
-    return protected_text
+local function escapeHTML(text)
+    return (text:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"))
+end
+
+local CELL_INLINE_TAGS = { b = true, i = true, em = true, strong = true, sup = true, sub = true, br = true }
+local function renderTableCell(cell)
+    if cell == "" then return "" end
+    -- Keep inline formatting and math, and prevent raw block/container tags
+    -- from changing the structure of the generated table.
+    cell = cell:gsub("<[^>]*>", function(tag)
+        local name = tag:match("^</?(%a+)%s*/?>$")
+        if name and CELL_INLINE_TAGS[name:lower()] then return tag end
+        return escapeHTML(tag)
+    end)
+    local prepared, restore_links = protectLinks(autoLinkUrls(cell))
+    -- Force an inline parse even when the cell starts with #, -, or a number.
+    local html = MD("KOACELL " .. prepared, {})
+    local content = html and html:match("^<p>KOACELL (.*)</p>$")
+    return content and restore_links(content) or escapeHTML(cell)
 end
 
 -- CSS for markdown rendering (function to support dynamic text-align)
@@ -1042,10 +912,18 @@ img, svg {
     margin: 0.5em 0;
 }
 
+.koa-generated-image p {
+    margin: 0.2em 0;
+    text-align: center;
+}
+
 .koa-generated-image img {
-    display: block;
     max-width: 100%%;
     max-height: %dpx;
+}
+
+.koa-generated-image .koa-image-caption {
+    font-size: 0.8em;
 }
 
 blockquote {
@@ -1120,23 +998,39 @@ p.koa-math {
     margin: 0.6em 0;
 }
 
-table {
+table.koa-table {
     border-collapse: collapse;
-    margin: 0.5em 0;
+    margin: 0.6em 0;
     width: 100%%;
-    table-layout: fixed;
 }
 
-td, th {
-    border: 1px solid #ccc;
-    padding: 0.3em 0.5em;
-    word-wrap: break-word;
+.koa-table td, .koa-table th {
+    border: 1px solid #aaa;
+    padding: 0.35em 0.45em;
+}
+
+.koa-table th {
+    background-color: #e9e9e9;
+    font-weight: bold;
+}
+
+.koa-table th[align="left"], .koa-table td[align="left"] { text-align: left; }
+.koa-table th[align="center"], .koa-table td[align="center"] { text-align: center; }
+.koa-table th[align="right"], .koa-table td[align="right"] { text-align: right; }
+.koa-table th[dir="rtl"][align="left"], .koa-table td[dir="rtl"][align="left"] { text-align: right; }
+.koa-table th[dir="rtl"][align="right"], .koa-table td[dir="rtl"][align="right"] { text-align: left; }
+
+.koa-table-row {
+    margin: 0.6em 0;
+    padding: 0.2em 0.6em;
+    border-left: 2px solid #aaa;
+    background-color: #f5f5f5;
     overflow-wrap: break-word;
 }
 
-th {
-    background-color: #f0f0f0;
-    font-weight: bold;
+.koa-table-row p {
+    margin: 0.25em 0;
+    overflow-wrap: break-word;
 }
 
 hr {
@@ -1166,15 +1060,16 @@ local function renderChatHTML(viewer, source_text)
     local masked, restore_images = ChatMarkup.protectImages(applyMath(viewer, text), function(uri)
         return require("koassistant.images.codex_images").inlineHTML(uri, image_state)
     end)
-    local auto_linked = autoLinkUrls(masked)
-    local bracket_escaped = preprocessBrackets(auto_linked)
-    local preprocessed_text = preprocessMarkdownTables(bracket_escaped)
-    local html_body, err = MD(preprocessed_text, {})
+    local width = viewer.width - 2 * viewer.text_padding - 2 * viewer.text_margin
+    local available_em = width / Screen:scaleBySize(viewer.markdown_font_size)
+    local without_tables, restore_tables = ChatTables.protect(masked, renderTableCell, available_em)
+    local prepared, restore_links = protectLinks(autoLinkUrls(without_tables))
+    local html_body, err = MD(healMarkdown(prepared), {})
     if err then
         logger.warn("ChatGPTViewer: could not generate HTML")
-        local escaped = text:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;")
-        html_body = "<pre>" .. escaped .. "</pre>"
+        html_body = "<pre>" .. escapeHTML(text) .. "</pre>"
     else
+        html_body = restore_tables(restore_links(html_body))
         html_body = restore_images(ChatMarkup.stripRawImages(html_body))
     end
     html_body = addHtmlBidiAttributes(html_body, { use_starts_with_rtl = needs_rtl_fix,
