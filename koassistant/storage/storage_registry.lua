@@ -275,7 +275,7 @@ Registry.entries = {
         reset_in = { "wipe_all" }, uninstall = true,
     },
     {
-        id = "kindle_github_token", label = "Private GitHub release token",
+        id = "kindle_github_token", label = "Legacy Kindle release token",
         location = "settings_dir", ref = "koassistant_github_token",
         category = "internal", backup = false,
         reset_in = { "wipe_all" }, uninstall = true,

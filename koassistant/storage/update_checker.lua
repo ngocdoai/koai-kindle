@@ -927,8 +927,8 @@ local function purgeTree(path)
     return os.remove(path)
 end
 
---- Read the private GitHub release list in a subprocess with a wall-clock timeout.
-local function fetchWithAbsoluteTimeout(token, timeout, callback)
+--- Read the Kindle GitHub release list in a subprocess with a wall-clock timeout.
+local function fetchWithAbsoluteTimeout(timeout, callback)
     local pid, parent_read_fd
     local completed = false
     local fd_closed = false
@@ -985,7 +985,7 @@ local function fetchWithAbsoluteTimeout(token, timeout, callback)
     local function subprocess_func(subprocess_pid, child_write_fd)
         if not subprocess_pid or not child_write_fd then return end
 
-        local ok, data, err = pcall(KindleRelease.fetch, token)
+        local ok, data, err = pcall(KindleRelease.fetch)
         if ok and data then
             ffiutil.writeToFD(child_write_fd, data)
         else
@@ -1081,7 +1081,7 @@ end
 --- Download a file via HTTPS in subprocess, writing directly to disk
 --- Uses the same subprocess pattern as fetchWithAbsoluteTimeout but writes
 --- binary data to file instead of piping through FD (avoids binary data issues)
-local function downloadFile(update_info, token, dest_path, callback)
+local function downloadFile(update_info, dest_path, callback)
     local pid, parent_read_fd
     local completed = false
     local fd_closed = false
@@ -1146,7 +1146,7 @@ local function downloadFile(update_info, token, dest_path, callback)
         if not subprocess_pid or not child_write_fd then return end
 
         local ok, saved, err = pcall(KindleRelease.download,
-            update_info.zip_url, token, dest_path, update_info.zip_size)
+            update_info.zip_url, dest_path, update_info.zip_size)
         if ok and saved then
             ffiutil.writeToFD(child_write_fd, "OK")
         else
@@ -1487,11 +1487,6 @@ end
 performUpdate = function(update_info)
     loadUI()
     getBinPaths()
-    local token = KindleRelease.readToken()
-    if not token then
-        UpdateChecker.showGitHubTokenDialog()
-        return
-    end
     -- Guard: don't update git-based dev installs (would destroy repo). B379:
     -- a worktree or submodule checkout has a .git FILE
     if lfs.attributes(plugin_dir .. ".git", "mode") ~= nil then
@@ -1553,7 +1548,7 @@ performUpdate = function(update_info)
     UIManager:forceRePaint()
 
     -- Step 1: Download
-    downloadFile(update_info, token, archive_path, function(dl_success, dl_error)
+    downloadFile(update_info, archive_path, function(dl_success, dl_error)
         UIManager:close(progress_msg)
 
         if not dl_success then
@@ -1708,64 +1703,7 @@ end
 
 UpdateChecker.AUTO_CHECK_COOLDOWN = AUTO_CHECK_COOLDOWN
 
-function UpdateChecker.showGitHubTokenDialog(on_saved)
-    loadUI()
-    local InputDialog = require("ui/widget/inputdialog")
-    local has_token = KindleRelease.readToken() ~= nil
-    local dialog
-    local row = { {
-        text = _("Cancel"), id = "close",
-        callback = function() UIManager:close(dialog) end,
-    } }
-    if has_token then
-        row[#row + 1] = {
-            text = _("Remove token"),
-            callback = function()
-                if KindleRelease.clearToken() then
-                    UIManager:close(dialog)
-                else
-                    UIManager:show(InfoMessage:new{ text = _("Could not remove the GitHub token.") })
-                end
-            end,
-        }
-    end
-    row[#row + 1] = {
-        text = _("Save"),
-        is_enter_default = true,
-        callback = function()
-            local token = KindleRelease.normalizeToken(dialog:getInputText())
-            if not token then
-                UIManager:show(InfoMessage:new{ text = _("Enter a fine-grained GitHub token (github_pat_…).") })
-            elseif not KindleRelease.saveToken(token) then
-                UIManager:show(InfoMessage:new{ text = _("Could not save the GitHub token.") })
-            else
-                G_reader_settings:delSetting("koassistant_last_update_check")
-                _session_auto_check_done, _session_auto_last_attempt = false, nil
-                UIManager:close(dialog)
-                if on_saved then on_saved() end
-            end
-        end,
-    }
-    dialog = InputDialog:new{
-        title = _("GitHub token for Kindle updates"),
-        description = _("Create a fine-grained token for ngocdoai/koai-kindle with Contents: read-only access. The token is saved on this Kindle."),
-        input = "",
-        hint = has_token and _("Token saved. Paste a new one to replace it.") or "github_pat_…",
-        text_type = "password",
-        buttons = { row },
-    }
-    UIManager:show(dialog)
-    dialog:onShowKeyboard()
-end
-
 function UpdateChecker.checkForUpdates(auto)
-    local token = KindleRelease.readToken()
-    if not token then
-        if not auto then
-            UpdateChecker.showGitHubTokenDialog(function() UpdateChecker.checkForUpdates(false) end)
-        end
-        return
-    end
     -- One automatic check per session once one succeeded (the DONE flag is set
     -- only by a parsed answer, see the fetch callback, so a failed check is
     -- retried), never two at once (INFLIGHT: FileManager and ReaderUI both init
@@ -1803,17 +1741,14 @@ function UpdateChecker.checkForUpdates(auto)
     end
 
     -- Use subprocess with absolute timeout
-    fetchWithAbsoluteTimeout(token, timeout, function(fetch_success, response_data)
+    fetchWithAbsoluteTimeout(timeout, function(fetch_success, response_data)
         closeLoading()
         _session_auto_check_inflight = false
 
         if not fetch_success then
             logger.err("Failed to check for updates:", response_data)
             if not auto then
-                local token_denied = response_data == "HTTP 401" or response_data == "HTTP 403" or response_data == "HTTP 404"
-                local error_text = token_denied
-                    and _("GitHub denied access. Update your fine-grained token with Contents: read access to ngocdoai/koai-kindle.")
-                    or response_data == "Timeout"
+                local error_text = response_data == "Timeout"
                     and _("Failed to check for updates (timed out). Please try again.")
                     or _("Failed to check for updates. Please check your internet connection.")
                 UIManager:show(InfoMessage:new{
@@ -1875,7 +1810,7 @@ function UpdateChecker.checkForUpdates(auto)
         for _, release in ipairs(releases) do
             if type(release) == "table" and release.draft == false and release.prerelease == false then
                 local version = KindleRelease.version(release.tag_name)
-                local asset = version and KindleRelease.assetInfo(release.assets)
+                local asset = version and KindleRelease.assetInfo(release.assets, version)
                 if asset and (not latest_version_str or compareVersions(version, latest_version_str) > 0) then
                     latest_release, latest_version_str, latest_asset = release, version, asset
                 end

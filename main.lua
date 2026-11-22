@@ -21923,10 +21923,6 @@ function AskGPT:checkForUpdates()
   end)
 end
 
-function AskGPT:configureKindleUpdateToken()
-  require("koassistant.storage.update_checker").showGitHubTokenDialog()
-end
-
 function AskGPT:showAbout()
   local UpdateChecker = require("koassistant.storage.update_checker")
   local version = UpdateChecker.getCurrentVersion() or _("Unknown")

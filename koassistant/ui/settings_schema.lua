@@ -3552,13 +3552,6 @@ local SettingsSchema = {
             callback = "checkForUpdates",
             keep_menu_open = true,
         },
-        {
-            id = "kindle_update_github_token",
-            type = "action",
-            text = _("GitHub token for Kindle updates"),
-            callback = "configureKindleUpdateToken",
-            keep_menu_open = true,
-        },
     },
 
     -- Helper functions for schema usage

@@ -1,12 +1,14 @@
 # KOAssistant
 
-[![GitHub Release](https://img.shields.io/github/v/release/zeeyado/koassistant.koplugin)](https://github.com/zeeyado/koassistant.koplugin/releases/latest)
+[![Kindle Release](https://img.shields.io/github/v/release/ngocdoai/koai-kindle)](https://github.com/ngocdoai/koai-kindle/releases/latest)
 [![Wiki](https://img.shields.io/badge/docs-wiki-blue)](https://github.com/zeeyado/koassistant.koplugin/wiki)
 [![License: GPL-3.0](https://img.shields.io/github/license/zeeyado/koassistant.koplugin)](LICENSE)
 [![AI-translated](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fhosted.weblate.org%2Fapi%2Fprojects%2Fkoassistant%2Fstatistics%2F&query=%24.fuzzy_percent&suffix=%25&label=AI-translated&color=8ab4f8&cacheSeconds=3600)](https://hosted.weblate.org/engage/koassistant/)
 [![Human-reviewed](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fhosted.weblate.org%2Fapi%2Fprojects%2Fkoassistant%2Fstatistics%2F&query=%24.translated_percent&suffix=%25&label=human-reviewed&color=brightgreen&cacheSeconds=3600)](https://hosted.weblate.org/engage/koassistant/)
 
 **Powerful, customizable AI assistant for KOReader.**
+
+This Kindle build is based on [upstream KOAssistant](https://github.com/zeeyado/koassistant.koplugin). Install `koassistant.koplugin.zip` from [the Kindle fork's releases](https://github.com/ngocdoai/koai-kindle/releases/latest). **Update my Kindle build** and the automatic startup check use that release channel.
 
 **Documentation:** the [Wiki](https://github.com/zeeyado/koassistant.koplugin/wiki) has a page for every feature; the full list is at the [end of this page](#documentation).
 
