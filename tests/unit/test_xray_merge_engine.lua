@@ -985,12 +985,63 @@ TestRunner:test("seedDormant + wake: a skip-volume stub wakes on the fresh book'
         end)
 end)
 
+-- Two earlier volumes with an X-Ray each: the case in which the question
+-- before a new X-Ray used to show, with all three of its choices
+local SERIES_PREDS = { ["/b/vol3.epub"] = { "/b/vol1.epub", "/b/vol2.epub" } }
+local SERIES_CACHES = {
+    ["/b/vol1.epub"] = { result = [[{"type":"fiction","characters":[{"name":"A","description":"a"}]}]] },
+    ["/b/vol2.epub"] = { result = [[{"type":"fiction","characters":[{"name":"B","description":"b"}]}]] },
+}
+
+TestRunner:test("no question before a new X-Ray in a series: the paid merge is not offered by the app (B770)", function()
+    TestRunner:assertEqual(XrayMerge.ASK_BEFORE_CREATE, false, "the question is off as shipped")
+    local BD = package.loaded["ui/widget/buttondialog"]
+    local orig_new = BD.new
+    local built, answered, asked = 0, 0, nil
+    BD.new = function(_self, o) built = built + 1; return o end
+    local ok_run, err = pcall(withSeedStubs, SERIES_PREDS, SERIES_CACHES, function()
+        asked = XrayMerge.preCreateFoldAsk({ file = "/b/vol3.epub" }, function() answered = answered + 1 end)
+    end)
+    BD.new = orig_new
+    if not ok_run then error(err, 0) end
+    TestRunner:assertEqual(asked, false, "no dialog applies, so the caller goes straight on to the request")
+    TestRunner:assertEqual(built, 0, "no dialog is built")
+    TestRunner:assertEqual(answered, 0, "and no answer is invented for the reader")
+end)
+
+TestRunner:test("after such a create nothing is shown, and a previous book without an X-Ray still gets its note", function()
+    -- With no question asked, the create's completion calls the gap note for
+    -- every later book of a series: it must stay silent when the previous
+    -- book has an X-Ray (the free carry already took what it knows)
+    local UIManager = require("ui/uimanager")
+    local orig_show = UIManager.show
+    local shown = {}
+    UIManager.show = function(_self, widget) shown[#shown + 1] = widget end
+    local ok_run, err = pcall(function()
+        withSeedStubs(SERIES_PREDS, SERIES_CACHES, function()
+            XrayMerge.maybeNotePredecessorGap({ file = "/b/vol3.epub" })
+        end)
+        TestRunner:assertEqual(#shown, 0, "the previous book has an X-Ray: no note, no question")
+        withSeedStubs(SERIES_PREDS, { ["/b/vol1.epub"] = SERIES_CACHES["/b/vol1.epub"] }, function()
+            XrayMerge.maybeNotePredecessorGap({ file = "/b/vol3.epub" })
+        end)
+        TestRunner:assertEqual(#shown, 1, "the previous book has none: one note")
+        TestRunner:assertTrue(tostring(shown[1].text):find("has no X-Ray yet", 1, true) ~= nil,
+            "which says so (" .. tostring(shown[1].text) .. ")")
+    end)
+    UIManager.show = orig_show
+    if not ok_run then error(err, 0) end
+end)
+
 TestRunner:test("preCreateFoldAsk: the free choice leads and the paid ones name their cost (B394 slice 3)", function()
     local BD = package.loaded["ui/widget/buttondialog"]
     local orig_new = BD.new
     local captured
     BD.new = function(_self, o) captured = o; return o end
     local modes = {}
+    -- The question is off as shipped (B770); the dialog itself is kept and
+    -- covered here for the day it returns
+    XrayMerge.ASK_BEFORE_CREATE = true
     local ok_run, err = pcall(withSeedStubs,
         { ["/b/vol3.epub"] = { "/b/vol1.epub", "/b/vol2.epub" } },
         {
@@ -1004,6 +1055,7 @@ TestRunner:test("preCreateFoldAsk: the free choice leads and the paid ones name 
             TestRunner:assertEqual(asked, true, "the previous book has an X-Ray: the ask shows")
         end)
     BD.new = orig_new
+    XrayMerge.ASK_BEFORE_CREATE = false
     if not ok_run then error(err, 0) end
     TestRunner:assertTrue(captured.title:find("carried into this book's X-Ray on its own", 1, true) ~= nil,
         "the dialog says the carry is automatic")
@@ -1185,17 +1237,26 @@ local GROUP_NAV_JSON = [[{
   ]
 }]]
 
-TestRunner:test("findByIdentity: matches by alias and across categories", function()
+TestRunner:test("findByIdentity: matches by alias, across the categories of one family", function()
     local XrayParser = require("koassistant.xray.xray_parser")
     local data = XrayParser.parse(GROUP_NAV_JSON)
     local item, cat, idx = XrayParser.findByIdentity(data, { "Mira Alvsund", "the keeper" }, "characters")
     TestRunner:assertEqual(item and item.name, "Alvsund", "alias bridges the drifted name")
     TestRunner:assertEqual(cat, "characters", "owning category returned")
     TestRunner:assertEqual(idx, 1, "index returned for nav context")
-    -- Category drift: the reader was in Cast, the match lives in World
-    local item2, cat2 = XrayParser.findByIdentity(data, { "Saltrest" }, "characters")
-    TestRunner:assertEqual(item2 and item2.name, "Saltrest", "found outside the preferred category")
-    TestRunner:assertEqual(cat2, "locations", "reports where it actually lives")
+    -- Category drift inside a family: a key figure elsewhere is this book's character
+    local item1, cat1 = XrayParser.findByIdentity(data, { "Kell Damsgard" }, "key_figures")
+    TestRunner:assertEqual(item1 and item1.name, "Kell Damsgard", "found in the family's other category")
+    TestRunner:assertEqual(cat1, "characters", "reports where it actually lives")
+    -- Another family is another entry (the wake-pass's rule, round 26): a
+    -- person called "Saltrest" is not the town
+    TestRunner:assertTrue(XrayParser.findByIdentity(data, { "Saltrest" }, "characters") == nil,
+        "not across families")
+    local item2, cat2 = XrayParser.findByIdentity(data, { "Saltrest" }, nil)
+    TestRunner:assertEqual(item2 and item2.name, "Saltrest", "with no category: every category")
+    TestRunner:assertEqual(cat2, "locations")
+    TestRunner:assertTrue(XrayParser.findByIdentity(data, { "the Turning", "Turning" }, "characters") == nil,
+        "a character's alias is not this book's term")
     -- Lexicon uses term, not name
     local item3, cat3 = XrayParser.findByIdentity(data, { "Turning" }, nil)
     TestRunner:assertEqual(cat3, "lexicon", "term-keyed categories match too")
@@ -1225,6 +1286,34 @@ TestRunner:test("findDormantByIdentity: carried entity is the honest landing", f
     TestRunner:assertTrue(
         XrayParser.findDormantByIdentity({ type = "fiction" }, { "Toby" }) == nil,
         "no ledger -> nil")
+    TestRunner:assertEqual((XrayParser.findDormantByIdentity(data, { "Toby" }, "key_figures") or {}).name,
+        "Tobias Renn", "a category of the row's family finds it")
+    TestRunner:assertTrue(XrayParser.findDormantByIdentity(data, { "Toby" }, "lexicon") == nil,
+        "another family's category does not")
+end)
+
+TestRunner:test("populateDormant: a source entry is already here only as an entry of its family", function()
+    local XrayParser = require("koassistant.xray.xray_parser")
+    local XrayMerge = require("koassistant.xray.xray_merge")
+    -- the device fixture's pair: this book's term "Warden", the earlier
+    -- book's character "the Warden" (alias "Warden")
+    local base = XrayParser.parse([[{
+      "type": "fiction",
+      "characters": [{"name": "Gil Rook", "description": "Grafts the rows."}],
+      "lexicon": [{"term": "Warden", "definition": "The keeper of a flooded grove."}]
+    }]])
+    local source = XrayParser.parse([[{
+      "type": "fiction",
+      "characters": [
+        {"name": "the Warden", "aliases": ["Warden"], "description": "Inspects the ferry manifests."},
+        {"name": "Gil", "aliases": ["Gil Rook"], "description": "A grafter."}
+      ]
+    }]])
+    XrayMerge.populateDormant(base, nil, source, "Vol 2", "/b/v2.epub", nil, "/b/v3.epub")
+    local names = {}
+    for _idx, s in ipairs(base[XrayParser.DORMANT_KEY] or {}) do names[s.name] = s.category end
+    TestRunner:assertEqual(names["the Warden"], "characters", "carried beside the term it is not")
+    TestRunner:assertTrue(names["Gil"] == nil, "a person already here as a person stays out")
 end)
 
 print("")

@@ -199,34 +199,10 @@ local function getPromptContext(config)
     return "highlight"  -- default
 end
 
--- Helper to persist domain selection to settings
--- This ensures domain selection survives restarts
-local function persistDomainSelection(plugin, domain_id)
-    if not plugin or not plugin.settings then return end
-    local features = plugin.settings:readSetting("features") or {}
-    features.selected_domain = domain_id
-    plugin.settings:saveSetting("features", features)
-    plugin.settings:flush()
-end
-
--- Helper to persist per-book domain selection to DocSettings
-local function persistBookDomain(doc_settings, domain_id)
-    if not doc_settings then return end
-    doc_settings:saveSetting(BookSettings.KEY_DOMAIN, domain_id)
-    doc_settings:flush()
-end
-
 -- Helper to read per-book domain from DocSettings
 local function getBookDomain(doc_settings)
     if not doc_settings then return nil end
     return doc_settings:readSetting(BookSettings.KEY_DOMAIN)
-end
-
--- Helper to persist per-book research mode to DocSettings
-local function persistBookResearchMode(doc_settings, value)
-    if not doc_settings then return end
-    doc_settings:saveSetting(BookSettings.KEY_RESEARCH, value)
-    doc_settings:flush()
 end
 
 -- Helper to read per-book research mode from DocSettings
@@ -458,6 +434,59 @@ end
 local function quickToolsOff(action, features, quick_on)
     if not action or action.accept_quick_answer ~= true then return false end
     return quickPresetForces("tools", quick_on, features)
+end
+
+-- The web decision of a request, read BEFORE the bake runs (B588): the
+-- message's hallucination nudge is built before buildUnifiedRequestConfig,
+-- so it reads the same layers the bake applies (the action's flag, a run
+-- option's web pick, the chat's toggle, the book's override, then the Quick
+-- preset turning web off unless the pick touched it); effective = the
+-- override, else the global default, else Perplexity's native search.
+-- Nothing is consumed here. tests/unit/test_run_options.lua checks it
+-- against the bake.
+local function webSearchPreview(action, features, provider)
+    features = features or {}
+    local ws = action and action.enable_web_search
+    local run_variant = features._run_variant
+    local run_web
+    local quick = features._quick_answer_active
+    local RunOptions = require("koassistant.request.run_options")
+    if type(run_variant) == "table" and not RunOptions.isModelOnly(action) then
+        if run_variant.quick == true then quick = true elseif run_variant.quick == false then quick = false end
+        run_web = run_variant.web
+    end
+    if quick and action and (action.accept_quick_answer ~= true or RunOptions.isModelOnly(action)) then
+        quick = nil
+    end
+    if ws == nil and run_web ~= nil then ws = run_web == true end
+    if ws == nil then ws = features._web_search_active end
+    if ws == nil then ws = bookWebSearchOverride(features) end
+    if run_web == nil and quickPresetForces("web", quick, features, action) then ws = false end
+    if ws ~= nil then return ws == true end
+    if features.enable_web_search ~= nil then return features.enable_web_search == true end
+    return provider == "perplexity"
+end
+
+-- A request whose answer is saved as a result has no later turn (B728): the
+-- window that opens is the saved result's, and a chat about it starts from the
+-- result, never from this prompt. A prompt-cache mark on such a request buys a
+-- cache nothing reads (Anthropic bills the write at 1.25 times the input price:
+-- 18% of a whole-book X-Ray, measured 2026-11-18), so the request says it is
+-- one-shot and the handlers that send a mark for the messages leave it off
+-- (anthropic_request.lua, openrouter.lua; the system block keeps its own mark,
+-- which a chain of checkpoint steps reads back). Not with web search on: the
+-- provider runs several passes inside that one request, which was not measured.
+-- config.system is built per request, so the mark ends with the request.
+-- Returns whether it marked.
+local function markOneShot(config, saves_result)
+    if not saves_result or type(config) ~= "table" or type(config.system) ~= "table" then
+        return false
+    end
+    local web = config.enable_web_search
+    if web == nil then web = config.features and config.features.enable_web_search end
+    if web == true then return false end
+    config.system.one_shot = true
+    return true
 end
 
 local function ensureReasoningHeadroom(api_params, provider, decision)
@@ -953,6 +982,11 @@ local function buildUnifiedRequestConfig(config, domain_context, action, plugin)
     -- which Defaults.ProviderDefaults never did).
     local reasoning_model = ModelConstraints.dispatchModel({
         provider = provider, model = config.model, features = config.features })
+    -- an id the provider no longer serves goes out as its replacement (the
+    -- wire maps it): the profile and the pref are the replacement's (the
+    -- sweep of 2026-11-06; a retired id's off sent a literal the new refuses)
+    reasoning_model = require("koassistant.request.model_lists").retiredReplacement(provider, reasoning_model)
+        or reasoning_model
     local reasoning_decision = ModelConstraints.resolveReasoning(provider, reasoning_model, {
         global_stance = ReasoningPrefs.getStance(features),
         model_pref = ReasoningPrefs.getModelPref(features, provider, reasoning_model),
@@ -978,6 +1012,37 @@ local function buildUnifiedRequestConfig(config, domain_context, action, plugin)
     end
 
     return true
+end
+
+-- THE dispatch transients: the just-in-time keys an entry sets on the SOURCE
+-- config for ONE dispatch (the chips' state, a run option, the scope and source
+-- picks, the Attach flag, the allowance, the X-Ray chat's prefix).
+-- handlePredefinedPrompt copies the config, then reads each key from the source
+-- and clears it: `entry` right after the copy, `later` at the site that reads
+-- it. A run the funnel's question cancels or refuses never reaches those
+-- reads, so DataAccess.askForDispatch clears the whole list through
+-- dropDispatchTransients, or a shared config would hand them to the next,
+-- unrelated request (the sweep of 2026-11-06).
+local DISPATCH_TRANSIENTS = {
+    entry = {
+        "_web_search_active", "_data_once",
+        "_quick_answer_active", "_reasoning_override_active", "_model_override_active",
+        "_session_quick_answer", "_chat_view_mode", "_session_reasoning", "_session_model",
+        "_session_book_info", "_run_variant",
+    },
+    later = {
+        "_attachments_active", "_xray_context_prefix", "_non_document_selection",
+        "_selection_context_window", "_highlight_context_active",
+        "_source_mode", "_highlight_section_scope", "_forced_document_context",
+        "_smart_retrieval_lookups", "_complete_analysis",
+    },
+    -- (the headless runs' own marks, _background_*, _ladder_* and _merge_payload,
+    -- are consumed too, but those runs never reach the question)
+}
+local function dropDispatchTransients(features)
+    if type(features) ~= "table" then return end
+    for _idx, k in ipairs(DISPATCH_TRANSIENTS.entry) do features[k] = nil end
+    for _idx, k in ipairs(DISPATCH_TRANSIENTS.later) do features[k] = nil end
 end
 
 local function createTempConfig(prompt, base_config)
@@ -1140,10 +1205,15 @@ local function pickProviderModel(opts)
         if #buttons == 0 then
             table.insert(buttons, {{ text = _("No models listed for this provider"), enabled = false }})
         end
-        table.insert(buttons, {{ text = _("Cancel"), callback = function() UIManager:close(sub) end }})
+        -- Cancel and a tap outside return where the caller says (B587)
+        table.insert(buttons, {{ text = _("Cancel"), callback = function()
+            UIManager:close(sub)
+            if opts.on_cancel then opts.on_cancel() end
+        end }})
         sub = ButtonDialog:new{
             title = T(_("Model · %1"), provider_label),
             buttons = buttons,
+            tap_close_callback = function() if opts.on_cancel then opts.on_cancel() end end,
         }
         UIManager:show(sub)
         if provider_id == "openai_codex" and plugin and plugin.refreshCodexCatalog then
@@ -1226,10 +1296,14 @@ local function pickProviderModel(opts)
                 end,
             }})
         end
-        table.insert(buttons, {{ text = _("Cancel"), callback = function() UIManager:close(sub) end }})
+        table.insert(buttons, {{ text = _("Cancel"), callback = function()
+            UIManager:close(sub)
+            if opts.on_cancel then opts.on_cancel() end
+        end }})
         sub = ButtonDialog:new{
             title = opts.provider_title or _("Model · pick a provider"),
             buttons = buttons,
+            tap_close_callback = function() if opts.on_cancel then opts.on_cancel() end end,
         }
         UIManager:show(sub)
     end
@@ -1314,10 +1388,15 @@ showQuickPresetModelMode = function(opts)
                 end,
             }})
         end
-        table.insert(buttons, {{ text = _("Cancel"), callback = function() UIManager:close(sub) end }})
+        -- Cancel and a tap outside return to the mode picker (B587)
+        table.insert(buttons, {{ text = _("Cancel"), callback = function()
+            UIManager:close(sub)
+            showQuickPresetModelMode(opts)
+        end }})
         sub = ButtonDialog:new{
             title = T(_("Tier for %1"), provider_label),
             buttons = buttons,
+            tap_close_callback = function() showQuickPresetModelMode(opts) end,
         }
         UIManager:show(sub)
     end
@@ -1365,6 +1444,7 @@ showQuickPresetModelMode = function(opts)
                     on_provider = function(provider_id, provider_label)
                         pickTier(provider_id, provider_label, true)
                     end,
+                    on_cancel = function() showQuickPresetModelMode(opts) end,
                 })
             end),
             row(mode == "model"
@@ -1385,9 +1465,14 @@ showQuickPresetModelMode = function(opts)
                         end)
                         finish()
                     end,
+                    on_cancel = function() showQuickPresetModelMode(opts) end,
                 })
             end),
-            {{ text = _("Cancel"), callback = function() UIManager:close(dialog) end }},
+            -- Cancel returns to the editor as the tap outside does (B587)
+            {{ text = _("Cancel"), callback = function()
+                UIManager:close(dialog)
+                finish()
+            end }},
         },
     }
     UIManager:show(dialog)
@@ -1774,6 +1859,7 @@ local function applyQuickReplyOverrides(config, plugin)
     -- One model id per request (audit B3): the shared resolver (see the bake).
     local model = ModelConstraints.dispatchModel({
         provider = provider, model = config.model, features = config.features })
+    model = require("koassistant.request.model_lists").retiredReplacement(provider, model) or model
     -- {follow=true} sentinel = reply-time "Follow settings" pick on a chat with
     -- a baked reasoning override: resolve WITHOUT a session layer (prefs/stance).
     local sr = f._session_reasoning
@@ -2039,35 +2125,12 @@ local function createSaveDialog(document_path, history, chat_history_manager, is
         },
     }
 
-    -- Add rotation support to save dialog
-    local recreate_save_dialog  -- Forward declaration for recursive calls
-    recreate_save_dialog = function(input_text)
-        local new_dialog
-        new_dialog = InputDialog:new{
-            title = _("Save Chat"),
-            input = input_text or suggested_title,
-            buttons = save_dialog.buttons,
-        }
-        new_dialog.onScreenResize = function(self, dimen)
-            local current_input = self:getInputText()
-            UIManager:close(self)
-            UIManager:scheduleIn(0.2, function()
-                recreate_save_dialog(current_input)
-            end)
-            return true
-        end
-        new_dialog.onSetRotationMode = function(self, rotation)
-            return self:onScreenResize(nil)
-        end
-        UIManager:show(new_dialog)
-    end
-
+    -- A turned screen (an Android device, a resized window): the dialog lays
+    -- itself out again in place, KOReader's own way, with what was typed. It
+    -- used to close and come back a moment later as a new dialog, at the same
+    -- moment as the chat window under it, which then landed on top of it
     save_dialog.onScreenResize = function(self, dimen)
-        local current_input = self:getInputText()
-        UIManager:close(self)
-        UIManager:scheduleIn(0.2, function()
-            recreate_save_dialog(current_input)
-        end)
+        self:reinit()
         return true
     end
 
@@ -2276,37 +2339,9 @@ local function showTagsMenu(document_path, chat_id, chat_history_manager)
                     },
                 }
 
-                -- Add rotation support to tag input dialog
-                local recreate_tag_dialog
-                recreate_tag_dialog = function(input_text)
-                    local new_tag_dialog
-                    new_tag_dialog = InputDialog:new{
-                        title = _("New Tag"),
-                        input = input_text or "",
-                        input_hint = _("Enter tag name"),
-                        buttons = tag_input.buttons,
-                    }
-                    new_tag_dialog.onScreenResize = function(self, dimen)
-                        local current = self:getInputText()
-                        UIManager:close(self)
-                        UIManager:scheduleIn(0.2, function()
-                            recreate_tag_dialog(current)
-                        end)
-                        return true
-                    end
-                    new_tag_dialog.onSetRotationMode = function(self, rotation)
-                        return self:onScreenResize(nil)
-                    end
-                    UIManager:show(new_tag_dialog)
-                    new_tag_dialog:onShowKeyboard()
-                end
-
+                -- A turned screen: laid out again in place with what was typed
                 tag_input.onScreenResize = function(self, dimen)
-                    local current_input = self:getInputText()
-                    UIManager:close(self)
-                    UIManager:scheduleIn(0.2, function()
-                        recreate_tag_dialog(current_input)
-                    end)
+                    self:reinit()
                     return true
                 end
 
@@ -2443,6 +2478,8 @@ local function showResponseDialog(title, history, highlightedText, addMessage, t
             update_debug_callback = state.update_debug_callback,
             -- Pass recreate function for subsequent rotations
             _recreate_func = recreate_func,
+            -- where the reader was (the viewer lands there before its first paint)
+            _initial_place = state.place,
         }
         -- Set close_callback after creation so new_viewer is defined.
         -- Inherits the stacked-view restore duty (see showResponseDialog's close_callback).
@@ -2457,11 +2494,6 @@ local function showResponseDialog(title, history, highlightedText, addMessage, t
 
         -- Show the new viewer
         UIManager:show(new_viewer)
-
-        -- Restore scroll position
-        if state.scroll_ratio and state.scroll_ratio > 0 then
-            new_viewer:restoreScrollPosition(state.scroll_ratio)
-        end
     end
 
     -- Check if compact view should be used
@@ -2570,10 +2602,12 @@ local function showResponseDialog(title, history, highlightedText, addMessage, t
         translate_view = use_translate_view,  -- Use translate view for translations
         translate_hide_quote = translate_hide_quote,  -- Initial hide state for original text
         selection_data = selection_data,  -- For "Save to Note" feature
-        -- Scroll to last question if setting enabled AND this is a follow-up response
-        -- First response should always start from top (user needs to read it)
+        -- Land on the reply when the setting allows, the FIRST answer included
+        -- (B561, 2026-11-06): a long question or highlight puts the answer on
+        -- page 2, and the reader came for the answer (the question is one
+        -- step back). The landing is a no-op when the reply is on page 1.
         scroll_to_last_question = not (temp_config and temp_config.features and temp_config.features.scroll_to_last_message == false)
-            and history and history.getAssistantTurnCount and history:getAssistantTurnCount() > 1,
+            and history and history.getAssistantTurnCount and history:getAssistantTurnCount() >= 1,
         -- Set BOTH property names for compatibility:
         -- original_history: used by toggleDebugDisplay, toggleHighlightVisibility, etc.
         -- _message_history: used by expandToFullView for text regeneration
@@ -2707,7 +2741,7 @@ local function showResponseDialog(title, history, highlightedText, addMessage, t
                     -- exchange. The scroll_to_last_message toggle keeps governing the
                     -- OPEN/resume paths only.
                     local to_last_question = history and history.getAssistantTurnCount
-                        and history:getAssistantTurnCount() > 1
+                        and history:getAssistantTurnCount() >= 1
                     logger.dbg("KOAssistant: reply landing — to_last_question:",
                         to_last_question and true or false)
                     -- Create a new viewer with updated content
@@ -3238,9 +3272,11 @@ local function showResponseDialog(title, history, highlightedText, addMessage, t
             -- Get effective document path
             local effective_path = document_path
             if not effective_path then
-                local is_general = temp_config and temp_config.features and temp_config.features.is_general_context
-                if is_general then
+                local tf = temp_config and temp_config.features
+                if tf and tf.is_general_context then
                     effective_path = "__GENERAL_CHATS__"
+                elseif tf and tf.is_library_context then
+                    effective_path = "__LIBRARY_CHATS__"
                 else
                     UIManager:show(InfoMessage:new{
                         text = _("Cannot tag: no document context"),
@@ -3396,16 +3432,20 @@ local function showResponseDialog(title, history, highlightedText, addMessage, t
     }
 
     -- Minimal popup view (Minimal Popup settings): registered highlight actions
-    -- open their response in a chrome-less popup next to the selection; tapping
-    -- it opens this full viewer. Eligibility (registration, highlight launch,
+    -- open their response in a chrome-less popup next to the selection (or in
+    -- a panel at the foot of the screen, minimal_popup_style); tapping it
+    -- opens this full viewer. Eligibility (registration, highlight launch,
     -- not full-page translate) was decided at dispatch (createTempConfig,
     -- _minimal_popup_eligible); the fit decision is made HERE because it needs
     -- the finished response ("When it fits" = only_if_fits below — the popup
-    -- reports whether the whole response renders without the ellipsis, so
-    -- script density and font size are handled by construction). The viewer is
+    -- reports whether the whole response fits under its height cap, measured
+    -- laid out, so script density and font size are handled by construction;
+    -- "Always" shows it whatever its length, scrolling). The viewer is
     -- fully built either way — the popup only defers showing it, so expand
     -- keeps every callback/history wire intact and dismissing leaves
     -- ActiveChatViewer untouched (no restore needed: it was never claimed).
+    -- The popup's content is this viewer's own drawing of the answer
+    -- (answerWidget): what the window would show, in the popup's frame.
     local mp_f = temp_config and temp_config.features
     local use_minimal_popup = mp_f and mp_f._minimal_popup_eligible == true
         and not mp_f.is_full_page_translate
@@ -3441,21 +3481,11 @@ local function showResponseDialog(title, history, highlightedText, addMessage, t
     if use_minimal_popup then
         popup_shown = require("koassistant.ui.minimal_popup").showForResponse({
             history = history,
+            viewer = chatgpt_viewer,
+            style = mp_f.minimal_popup_style,
             selection_data = selection_data,
             ui = ui_instance,
             only_if_fits = (mp_f.minimal_popup_mode or "short") == "short",
-            -- RTL hint: translate renders in the translation language, the
-            -- dictionary family in the dictionary language; anything else
-            -- auto-detects (dominant-RTL, same gate as the standard chat view).
-            rtl_language = (use_translate_view and mp_f.translation_language)
-                or ((use_compact_view or use_dictionary_view) and mp_f.dictionary_language)
-                or nil,
-            -- Text-mode settings + the dict-family gate for the IPA bidi fix:
-            -- the popup renders through the viewer's shared text-mode pipeline
-            -- and honors the same settings (strip_markdown_in_text_mode,
-            -- rtl_chat_text_mode).
-            features = mp_f,
-            is_dictionary = (use_compact_view or use_dictionary_view) or nil,
             on_expand = function()
                 _G.ActiveChatViewer = chatgpt_viewer
                 UIManager:show(chatgpt_viewer)
@@ -3704,27 +3734,15 @@ handlePredefinedPrompt = function(prompt_type_or_action, highlightedText, ui, co
     temp_config._not_saved = nil
     -- The per-chat Web value (if any) rode into temp_config with the features copy;
     -- consume it from the SOURCE config so it can't go stale on the shared table.
+    -- The allowance for this run (Allow once, B395) the same: the copy in
+    -- temp_config is the request's (the gather below judges on
+    -- temp_config.features) and the chat's, for its replies. The Quick controls
+    -- (the dispatch consumables AND the chip state: the copies are the chat's
+    -- live state for dialog launches) and the run option (B345, set
+    -- just-in-time by executeDirectAction / the input dialog, consumed from the
+    -- copy by the bake). The list is DISPATCH_TRANSIENTS.entry, one copy.
     if config and config.features then
-        config.features._web_search_active = nil
-        -- An allowance for this run (Allow once, B395): the copy in temp_config
-        -- is the request's (the gather below judges on temp_config.features) and
-        -- the chat's, for its replies; the source must not carry it into the
-        -- next request
-        config.features._data_once = nil
-        -- Quick controls: consume the dispatch consumables AND the chip state from
-        -- the SOURCE config (same staleness rule — the copies already rode into
-        -- temp_config for dialog launches, where they are the chat's live state).
-        config.features._quick_answer_active = nil
-        config.features._reasoning_override_active = nil
-        config.features._model_override_active = nil
-        config.features._session_quick_answer = nil
-        config.features._chat_view_mode = nil
-        config.features._session_reasoning = nil
-        config.features._session_model = nil
-        config.features._session_book_info = nil
-        -- Run option (B345): set just-in-time by executeDirectAction / the input
-        -- dialog; the copy in temp_config is consumed by the bake
-        config.features._run_variant = nil
+        for _idx, k in ipairs(DISPATCH_TRANSIENTS.entry) do config.features[k] = nil end
     end
     -- DIRECT entries (highlight menu / gestures / QA tiles — no dialog) must not
     -- inherit chip state: a reply-⚡ write on a shared-identity chat config can
@@ -3810,11 +3828,17 @@ handlePredefinedPrompt = function(prompt_type_or_action, highlightedText, ui, co
     end
     -- Attachments ride a freeform Send and plain actions only (D12, B395
     -- slice 5): never an action that writes an artifact, nor the dictionary
-    -- and translate family, whose answers are no chat about the attachment
-    if attachments_active and prompt and (prompt.use_response_caching or prompt.cache_as_xray
-            or prompt.cache_as_analyze or prompt.cache_as_summary
-            or prompt.dictionary_view or prompt.translate_view or prompt.compact_view) then
+    -- and translate family, whose answers are no chat about the attachment.
+    -- B525: such an action drops them and says so, or they rode the first
+    -- reply of its result's chat
+    if attachments_active and require("koassistant.request.attachments").skippedBy(prompt) then
         attachments_active = nil
+        if require("koassistant.request.attachments").dropFor(prompt) > 0 then
+            UIManager:show(require("ui/widget/notification"):new{
+                text = _("This action takes no attachments: they were not sent."),
+                timeout = 3,
+            })
+        end
     end
     -- Background auto-update (xray_background_plan.md §4): consume the dispatch flag
     -- (the fire path passes a config COPY, but consume defensively — same staleness
@@ -4024,6 +4048,13 @@ handlePredefinedPrompt = function(prompt_type_or_action, highlightedText, ui, co
         temp_config.features.hidden_streaming = true
     end
 
+    -- An answer that is data, not prose (an X-Ray build's JSON), streams as
+    -- the text it is: Markdown While Streaming would flow it into one paragraph
+    if prompt.cache_as_xray then
+        temp_config.features = temp_config.features or {}
+        temp_config.features.plain_streaming = true
+    end
+
     -- NEW ARCHITECTURE (v0.5.2+): Unified request config for all providers
     -- System prompt is built by buildUnifiedRequestConfig and passed in config.system
     -- No longer embedded in the consolidated message
@@ -4065,7 +4096,16 @@ handlePredefinedPrompt = function(prompt_type_or_action, highlightedText, ui, co
     -- sidecar. Other contexts keep preferring book_metadata.file (file browser/artifact
     -- target); book-level entries repopulate it for their target before reaching here.
     local per_book_file
-    if context == "highlight" and ui and ui.document and ui.document.file then
+    if context == "highlight" and config.features and config.features._xray_entry_book then
+        -- A chat or an AI Wiki article about an X-Ray entry is a highlight
+        -- request whose "highlight" belongs to the entry's book, which need not
+        -- be the open one (a Book Hub's or a group's X-Ray beside another open
+        -- book): the request took the open book's domain, languages, research
+        -- mode and spoiler posture, and judged the nearby-text gate for it,
+        -- while its text came from the entry's book (the shared-state map,
+        -- 2026-11-12). The entry's own entry points name the book.
+        per_book_file = config.features._xray_entry_book
+    elseif context == "highlight" and ui and ui.document and ui.document.file then
         per_book_file = ui.document.file
     elseif context == "general" or context == "library" then
         -- no book: a general or library action beside an open book took that
@@ -4122,6 +4162,10 @@ handlePredefinedPrompt = function(prompt_type_or_action, highlightedText, ui, co
     -- Consume X-Ray context prefix (transient flag set by action buttons from chatAboutItem)
     local xray_prefix = config.features and config.features._xray_context_prefix
     if config.features then config.features._xray_context_prefix = nil end
+    -- A chat about an X-Ray entry started by one of the dialog's actions is an
+    -- X-Ray chat like one started by a typed question (the Send sets the same
+    -- tag): the X-Ray browser's "X-Ray chats" row counts both
+    if xray_prefix then history.launched_from = "xray_chat" end
 
     local message_data = {
         highlighted_text = highlightedText,
@@ -4952,12 +4996,19 @@ if prune_book_text then
     end
 
     -- Full-document or update-to-100%: override progress to 100% so cache is stored at 1.0
-    -- and extraction covers the entire document
-    if config.features and (config.features._full_document_xray or config.features._update_to_full_progress or config.features._complete_analysis)
-            and ui and ui.document then
+    -- and extraction covers the entire document. A closed book's run (the file
+    -- browser's, or a hub's beside an open book) goes to 100% too, with no page
+    -- of the OPEN book as its own (the sweep of 2026-11-06); the complete
+    -- analysis flag is consumed here (a dialog's config carries it just in time)
+    local complete_analysis = config.features and config.features._complete_analysis
+    if config.features then config.features._complete_analysis = nil end
+    if config.features and (config.features._full_document_xray or config.features._update_to_full_progress or complete_analysis)
+            and ((ui and ui.document) or is_file_browser_target) then
         message_data.progress_decimal = "1.0"
         message_data.reading_progress = "100%"
-        message_data.progress_page = ui.document.info and ui.document.info.number_of_pages
+        if ui and ui.document and not is_file_browser_target then
+            message_data.progress_page = ui.document.info and ui.document.info.number_of_pages
+        end
     end
 
     -- Ladder rung (§6 slice 1): generate AS IF the reader stood at the rung boundary.
@@ -4971,6 +5022,23 @@ if prune_book_text then
         -- The target is a flow position; the saved page is raw (B335)
         message_data.progress_page = require("koassistant.request.context_extractor")
             .rawPageAt(ui.document, lt) or message_data.progress_page
+    end
+
+    -- B765: an X-Ray built up to a position that IS the end of the work ends
+    -- with the Conclusion, as a whole-book build does (the whole-book prompt
+    -- asks for it itself; an update takes its own swap in the cache branch)
+    if prompt and prompt.id == "xray" and type(prompt.prompt) == "string"
+            and not (config.features and config.features._full_document_xray)
+            and (tonumber(message_data.progress_decimal) or 0) >= 0.995 then
+        local at_end = PromptsActions.xrayPromptAtEnd(prompt.prompt)
+        if at_end ~= prompt.prompt then
+            local original_prompt = prompt
+            prompt = {}
+            for k, v in pairs(original_prompt) do prompt[k] = v end
+            prompt._is_copy = true
+            prompt.prompt = at_end
+            message_data._xray_at_end = true
+        end
     end
 
     -- Where the saved page starts in the text (B503): the page number holds in
@@ -5192,8 +5260,19 @@ if prune_book_text then
                     -- with nothing new may answer an empty object
                     local cached_status = PromptsActions.normalizeXrayStatus(cached_entry.xray_status)
                     message_data._xray_status_applied = cached_status
+                    -- A create prompt's end-of-work swap is not this update's
+                    message_data._xray_at_end = nil
                     if cached_status then
                         prompt.prompt = PromptsActions.xrayUpdateWithoutStatus(prompt.prompt)
+                    elseif current_progress >= 0.995 then
+                        -- B765: the update that reaches the end of the work
+                        -- asks for the Conclusion, as a whole-book build does
+                        local old = message_data._parsed_old_xray
+                        local at_end = PromptsActions.xrayPromptAtEnd(prompt.prompt,
+                            old and (XrayParser.isAcademic(old) and "academic"
+                                or XrayParser.isFiction(old) and "fiction" or "nonfiction") or nil)
+                        message_data._xray_at_end = at_end ~= prompt.prompt or nil
+                        prompt.prompt = at_end
                     end
                     if cached_entry.xray_categories then
                         local cat_keys = PromptsActions.xrayCategoryKeysFor(
@@ -5327,22 +5406,15 @@ if prune_book_text then
         end
     end
 
-    -- Determine if web search will be active for this request
-    -- Per-action override > per-chat toggle (dialog-launched actions) > per-book
-    -- override > global setting
-    -- Used by MessageBuilder to select web-aware hallucination nudge
-    local action_ws = prompt and prompt.enable_web_search
-    if action_ws == nil and config.features then
-        action_ws = config.features._web_search_active
-    end
-    if action_ws == nil then
-        action_ws = bookWebSearchOverride(config.features)
-    end
-    if action_ws ~= nil then
-        message_data.web_search_active = action_ws
-    else
-        message_data.web_search_active = config.features and config.features.enable_web_search == true
-    end
+    -- Whether web search will be active for this request: the bake's own
+    -- layers, read before it runs (B588: a run option's web pick and the
+    -- Quick preset were left out, so the nudge told the model to search
+    -- with web off). MessageBuilder picks the web-aware hallucination nudge
+    -- (the request's own copy, temp_config.features: the run option's pick
+    -- and the Quick preset's flags were consumed from the source config at
+    -- the dispatch entry and live only on the copy now).
+    message_data.web_search_active = webSearchPreview(prompt, temp_config.features,
+        temp_config.provider or config.provider or config.default_provider)
 
     -- Spoiler protection, message side (spoiler_posture_plan.md §3, B3/B4): resolve
     -- the request-layer posture for this action so prompts carrying
@@ -5529,14 +5601,20 @@ if prune_book_text then
                     -- it afterwards, and it would read as current)
                     if message_data._xray_status_applied == "off" then
                         parsed.current_state, parsed.current_position, parsed.conclusion = nil, nil, nil
+                    elseif using_cache and not message_data._xray_at_end then
+                        -- B765: a Conclusion is written by the request that
+                        -- reaches the end of the work, and by no update before
+                        -- it (it would hide every later status behind it)
+                        parsed.conclusion = nil
                     end
                     -- Merge partial update into existing data when available
                     if using_cache and message_data._parsed_old_xray then
                         -- To debug X-Ray merge: uncomment koassistant_debug_utils.dumpXrayMerge() below
-                        local never_pairs = cache_file
-                            and require("koassistant.artifacts.action_cache").getNeverMergePairs(cache_file)
-                        parsed = XrayParser.merge(message_data._parsed_old_xray, parsed,
-                            never_pairs and { never_pairs = never_pairs } or nil)
+                        -- the reader's never-merge pairs, and the update's own
+                        -- rule for a name that is only somebody's alias (B732)
+                        local merge_opts = cache_file
+                            and require("koassistant.artifacts.action_cache").updateMergeOptions(cache_file)
+                        parsed = XrayParser.merge(message_data._parsed_old_xray, parsed, merge_opts or nil)
                         logger.dbg("KOAssistant: Merged incremental X-Ray update into existing data")
                         -- Wake-pass (carry layer 2): entities arriving in this
                         -- slice promote their carried history
@@ -5603,6 +5681,17 @@ if prune_book_text then
                         if kept > 0 then
                             logger.dbg("KOAssistant: X-Ray create kept", kept, "hand-added entit(y/ies)")
                         end
+                        -- B533: an entry the reader renamed keeps the reader's name
+                        local renamed = XrayParser.keepRenames(parsed,
+                            require("koassistant.artifacts.action_cache").getUserAliases(cache_file))
+                        if renamed > 0 then
+                            logger.dbg("KOAssistant: X-Ray create kept", renamed, "renamed entit(y/ies)")
+                        end
+                    end
+                    -- B765: the Conclusion takes the place of the status it
+                    -- follows. An answer that sent none keeps what there is
+                    if message_data._xray_at_end and type(parsed.conclusion) == "table" then
+                        parsed.current_state, parsed.current_position = nil, nil
                     end
                     -- Round 28 (#90): reconcile mechanical background against the
                     -- book's group — backfill file identities onto legacy labeled
@@ -5834,6 +5923,22 @@ if prune_book_text then
                 if message_data._inherited_stamps and message_data._inherited_stamps.highlights then
                     highlights_were_provided = true
                 end
+                -- The reader's notes (B617): the annotations section carries them
+                -- unless it was degraded to a highlights-only copy (notes refused,
+                -- highlights allowed), which is highlights. No write stamped
+                -- used_annotations, so a result built with notes read as built
+                -- with highlights alone and a chat about it never asked for notes.
+                local annotations_sent = type(message_data.annotations) == "string" and message_data.annotations ~= ""
+                local annotations_were_provided = annotations_sent and message_data._annotations_degraded ~= true
+                -- either form holds the highlighted passages themselves
+                if annotations_sent then highlights_were_provided = true end
+                if using_cache and message_data.cached_used_annotations == true
+                        and message_data.cached_used_highlights ~= nil then
+                    annotations_were_provided = true
+                end
+                if message_data._inherited_stamps and message_data._inherited_stamps.annotations then
+                    annotations_were_provided = true
+                end
                 -- Position-irrelevant actions (no use_reading_progress) store 1.0
                 -- so the popup correctly shows "Redo" instead of misleading "Update to X%"
                 local save_progress = prompt and prompt.use_reading_progress
@@ -5846,6 +5951,9 @@ if prune_book_text then
                     save_progress,
                     { model = ConfigHelper:getModelInfo(temp_config), used_book_text = book_text_was_provided, provider = temp_config.provider,
                       used_highlights = highlights_were_provided,
+                      -- stamped beside a stated used_highlights only: alone, an old
+                      -- entry's used_annotations means highlights (Gates.stampedKinds)
+                      used_annotations = annotations_were_provided or nil,
                       -- the notebook, stamped since B395 slice 5
                       used_notebook = (message_data.notebook_content ~= nil and message_data.notebook_content ~= "") or nil,
                       used_reasoning = (reasoning ~= nil and reasoning ~= ""),
@@ -6006,6 +6114,14 @@ if prune_book_text then
                     -- be the copy nothing kept.
                     local rebuilding = config.features and config.features._xray_rebuild
                     local prev_xray = ActionCache.getXrayCache(cache_file)
+                    -- The AI merges this X-Ray holds stay on record across an
+                    -- update or a rebuild (their lines and carried rows are
+                    -- carried forward): the series chain skips done merges by
+                    -- it, and it keeps them when the groups change (B536)
+                    if prev_xray and xray_metadata.merged_from == nil then
+                        xray_metadata.merged_from = prev_xray.merged_from
+                        xray_metadata.merged_from_books = prev_xray.merged_from_books
+                    end
                     -- cache_answer guard (round 28): a skipped write must not
                     -- ring-archive the survivor it is leaving in place
                     if cache_answer and prev_xray and prev_xray.result and prev_xray.result ~= cache_answer
@@ -6269,6 +6385,12 @@ if prune_book_text then
         -- handleResponse's error display. Predefined actions carry _tools_active=false, so
         -- shouldUse returns false and this stays a plain send — queryWith just adds the
         -- quick-retry interception. This is the only send path that bypassed queryWith.
+        -- An answer that is saved as a result has no later turn: no cache mark (B728).
+        -- A run on a section is one too: its answer is saved under the section's
+        -- key, whatever the action's own caching says (the section runner turns
+        -- that off on its copy of the action)
+        local section_saved = config.features and (config.features._section_scope or config.features._section_xray)
+        markOneShot(temp_config, cache_enabled or (type(section_saved) == "table" and section_saved.cache_key ~= nil))
         local result = BookToolRunner.queryWith(queryChatGPT, history:getMessages(), temp_config, handleResponse, plugin, ui)
 
         -- If streaming is in progress, return nil (result comes via callback)
@@ -6522,7 +6644,7 @@ if prune_book_text then
         -- auto updates) keep today's silent send. The announce toast rides
         -- _ladder_send_toast and fires only when the request actually goes —
         -- nothing may announce a build the size warning can still cancel.
-        local xb_build = config.features and config.features._ladder_build
+        local xb_build = message_data._ladder_build
             and require("koassistant.xray.xray_auto").ladderBuild() or nil
         local function ladderSendToast()
             local toast = config.features and config.features._ladder_send_toast
@@ -7343,101 +7465,36 @@ local function showChatGPTDialog(ui_instance, highlighted_text, config, prompt_t
     local domain_target = (doc_settings and input_context ~= "general" and input_context ~= "library")
         and "book" or "global"
 
-    -- Function to show domain selector
-    -- Single list with target toggle at top when a book is open
+    -- The Domain chip (B586): the chip opens Book Settings' own Domain &
+    -- Research screen, one engine for the book's value, its group's (a book
+    -- that follows its group keeps following; the chip's own list wrote a
+    -- plain value over the marker) and the global one, as the Web and Tools
+    -- chips' holds open the engine. Its close re-reads what the chip shows.
     local function showDomainSelector()
         -- Close the on-screen keyboard first to prevent z-order issues
         input_dialog:onCloseKeyboard()
-
-        local DomainLoader = require("koassistant.prompts.domain_loader")
-        -- Get custom domains from settings
-        local features = plugin and plugin.settings and plugin.settings:readSetting("features") or {}
-        local custom_domains = features.custom_domains or {}
-        -- Get all domains (folder + UI-created) sorted
-        local sorted_domains = DomainLoader.getSortedDomains(custom_domains)
-
-        -- Helper to close and refresh input dialog
-        local function closeAndRefresh()
-            UIManager:close(_G.domain_selector_dialog)
-            refreshInputDialog()
-        end
-
-        local global_domain_label = nil
-        for _i, d in ipairs(sorted_domains) do
-            if d.id == selected_domain then
-                global_domain_label = d.name or d.display_name or d.id
-                break
-            end
-        end
-        local state = {
-            domains = sorted_domains,
-            has_book = doc_settings ~= nil,
-            is_book_target = (doc_settings and domain_target == "book") or false,
-            book_domain = book_domain_id,
-            global_domain = selected_domain,
-            global_domain_label = global_domain_label,
-            book_research = book_research_id,
-            global_research = configuration.features and configuration.features.research_mode,
-            background_label = doc_settings and BookSettings.backgroundRowLabel(doc_settings) or nil,
-        }
-
-        local cb = {
-            set_target = function(new_target)
-                domain_target = new_target
-                UIManager:close(_G.domain_selector_dialog)
-                showDomainSelector()
-            end,
-            pick_book_domain = function(val)
-                book_domain_id = val
-                persistBookDomain(doc_settings, val)
-                closeAndRefresh()
-            end,
-            pick_global_domain = function(id)
-                selected_domain = id
-                configuration.features = configuration.features or {}
-                configuration.features.selected_domain = id
-                persistDomainSelection(plugin, id)
-                closeAndRefresh()
-            end,
-            set_book_research = function(val)
-                book_research_id = val
-                persistBookResearchMode(doc_settings, val)
-                closeAndRefresh()
-            end,
-            set_global_research = function(val)
-                configuration.features = configuration.features or {}
-                configuration.features.research_mode = val
-                if plugin and plugin.settings then
-                    local f = plugin.settings:readSetting("features") or {}
-                    f.research_mode = val
-                    plugin.settings:saveSetting("features", f)
-                    plugin.settings:flush()
+        BookSettings.showDomainResearch({
+            plugin = plugin, ui = ui_instance, doc_settings = doc_settings,
+            document_path = document_path, global_only = doc_settings == nil,
+            on_close = function()
+                book_domain_id = getBookDomain(doc_settings)
+                book_research_id = getBookResearchMode(doc_settings)
+                -- A Global pick is written to the settings and to the plugin's
+                -- shared configuration; this dialog may run on a COPY of it (a
+                -- chat about an X-Ray entry does), which the pick never
+                -- reached: the chip and the Send kept the old domain (audit
+                -- 2026-11-12). The two global values are read from the
+                -- settings and put on this dialog's own configuration.
+                local saved = plugin and plugin.settings and plugin.settings:readSetting("features")
+                if type(saved) == "table" and configuration and configuration.features then
+                    configuration.features.selected_domain = saved.selected_domain
+                    configuration.features.research_mode = saved.research_mode
                 end
-                closeAndRefresh()
+                selected_domain = configuration and configuration.features
+                    and configuration.features.selected_domain or nil
+                refreshInputDialog()
             end,
-            -- Background (book_background_plan.md §4): book target only. Reopens this
-            -- picker so the row's preview refreshes; the input dialog itself is
-            -- refreshed on close (the Domain chip label doesn't show Background).
-            edit_background = function()
-                UIManager:close(_G.domain_selector_dialog)
-                BookSettings.showBackgroundEditor({
-                    plugin = plugin, doc_settings = doc_settings,
-                    on_close = showDomainSelector,
-                })
-            end,
-            close = function()
-                UIManager:close(_G.domain_selector_dialog)
-            end,
-        }
-
-        local buttons = BookSettings.buildDomainResearchButtons(state, cb)
-
-        local ButtonDialog = require("ui/widget/buttondialog")
-        _G.domain_selector_dialog = ButtonDialog:new{
-            title = _("Domain & Research"),
-            buttons = buttons,
-        }
-        UIManager:show(_G.domain_selector_dialog)
+        })
     end
 
     -- Get domain display name for button
@@ -7555,16 +7612,16 @@ local function showChatGPTDialog(ui_instance, highlighted_text, config, prompt_t
         -- showChatGPTDialog, which sits near the 60-upvalue LuaJIT cap). The
         -- dialog's own book beats whatever the reader has open.
         if action.local_handler then
-            -- Generate Image takes what was typed as its note (S5, D9), and a
-            -- hold menu's "Generate with a note…" asks for one
+            -- Generate Image takes what was typed as its note (S5, D9): its
+            -- popup opens with it
             require("koassistant.ui.dialogs").executeDirectAction(
                 ui_instance, action, highlighted_text or "", configuration, plugin,
-                { document_path = document_path, run_variant = run_variant,
+                { document_path = document_path,
                   note = action.local_handler == "image_gen" and additional_input or nil })
             return
         end
 
-        local function runAction()
+        local function runAction(update_opts)
             UIManager:scheduleIn(0.1, function()
                 local function onPromptComplete(history, temp_config_or_error)
                     if history then
@@ -7707,6 +7764,11 @@ local function showChatGPTDialog(ui_instance, highlighted_text, config, prompt_t
                     require("koassistant.request.attachments").count() > 0 or nil
                 -- Run option (B345): same just-in-time set-or-clear
                 configuration.features._run_variant = run_variant
+                -- Generate (complete) from the cache popup (Analyze Notes): the
+                -- run goes to 100% whatever the position; consumed by the
+                -- request, as executeFileBrowserAction's copy carries it
+                configuration.features._complete_analysis =
+                    (update_opts and update_opts.complete_analysis) or nil
 
                 handlePredefinedPrompt(action_id, highlighted_text, ui_instance, configuration, nil, plugin, additional_input, onPromptComplete, book_metadata)
             end)
@@ -9845,8 +9907,9 @@ local function showChatGPTDialog(ui_instance, highlighted_text, config, prompt_t
                         -- only, 60-cap)
                         if not require("koassistant.request.privacy_gates").allows("position",
                                 { features = configuration.features or {},
-                                  provider = require("koassistant.ui.dialogs").effectiveDispatchProvider(
-                                      configuration.features or {}, nil, configuration.provider) }) then
+                                  provider = send_rv and send_rv.provider
+                                      or require("koassistant.ui.dialogs").effectiveDispatchProvider(
+                                          configuration.features or {}, nil, configuration.provider) }) then
                             return
                         end
                         local prog = book_metadata and book_metadata.reading_progress
@@ -10193,6 +10256,14 @@ local function showChatGPTDialog(ui_instance, highlighted_text, config, prompt_t
                         -- the next dialog starts on the setting
                         shared_features._data_once = nil
                         shared_features._session_book_info = nil
+                        -- The consent to read past the position (written just
+                        -- above, before this copy) is this request's alone: it
+                        -- rides the copy, which spends it. Left on the shared
+                        -- table, the next chat opened by an entry that does not
+                        -- scrub (a file-browser or Book Hub chat) sent its first
+                        -- protected turn without the spoiler line (the
+                        -- shared-state map, 2026-11-12)
+                        shared_features._spoiler_scope_consent = nil
                         -- Per-chat conversation id on the private copy (B285 / #107)
                         configuration.conversation_id = history.conversation_id
                         -- Send's long-press pick rides the private copy to the bake
@@ -11298,9 +11369,20 @@ local function showChatGPTDialog(ui_instance, highlighted_text, config, prompt_t
         return true
     end
 
-    -- Rotation support via in-place refresh (no close-and-reopen gap)
+    -- A change of the screen (a turned Android device, a resized window): the
+    -- dialog is rebuilt for the new size with its text. On the next tick,
+    -- never inside the event: KOReader BROADCASTS a resize to every window and
+    -- starts over whenever a new window appears, so a dialog that replaced
+    -- itself inside its handler was told again as the new dialog, and again,
+    -- and the app hung (25,000 rebuilds in the first resize run in the real
+    -- app). Once per dialog, and not for one that was closed meanwhile
     input_dialog.onScreenResize = function(self, dimen)
-        refreshInputDialog()
+        if not self._koa_resize_pending then
+            self._koa_resize_pending = true
+            UIManager:nextTick(function()
+                if not self._koa_closed then refreshInputDialog() end
+            end)
+        end
         return true
     end
     input_dialog.onSetRotationMode = function(self, rotation)
@@ -11316,6 +11398,7 @@ local function showChatGPTDialog(ui_instance, highlighted_text, config, prompt_t
     -- paths (redundant-harmless here). Read the text before teardown; pcall for safety.
     local koaOrigOnCloseWidget = input_dialog.onCloseWidget
     input_dialog.onCloseWidget = function(self_dlg)
+        self_dlg._koa_closed = true  -- a rebuild waiting for its tick stands down
         if plugin and not self_dlg._koa_internal_close then
             local ok, txt = pcall(function() return self_dlg:getInputText() end)
             if ok and txt and txt ~= "" then plugin._last_input = txt end
@@ -11522,7 +11605,7 @@ local function mainLedgerData(document_path, maybe_main_data, best)
     if not (main and main.result and XrayParser.isJSON(main.result)) then return nil end
     local data = XrayParser.parse(main.result)
     if not data or data.error then return nil end
-    XrayParser.mergeUserAliases(data, ActionCache.getUserAliases(document_path))
+    XrayParser.mergeUserAliases(data, ActionCache.matchOverlay(document_path))
     return data
 end
 
@@ -11664,7 +11747,8 @@ local function showPredecessorEntity(opts)
     if live_data and live_data.error then live_data = nil end
     -- Q14 (device round 4): already here, in either form, is said instead
     -- of offered — the whole-chain list shows an earlier book's entry even
-    -- after it was carried
+    -- after it was carried. Both by the entry's family: the character "the
+    -- Warden" is not this book's term "Warden"
     local state
     if live_data then
         local names = { hit.name }
@@ -11675,7 +11759,7 @@ local function showPredecessorEntity(opts)
         end
         if XrayParser.findByIdentity(live_data, names, hit.category_key) then
             state = "live"
-        elseif XrayParser.findDormantByIdentity(live_data, names) then
+        elseif XrayParser.findDormantByIdentity(live_data, names, hit.category_key) then
             state = "carried"
         end
     end
@@ -12028,6 +12112,36 @@ local function predLookupHandled(ui, query, config, plugin, book_metadata,
     return true
 end
 
+-- Where "Add as alias…" lands at the lookup's own seams (the no-results
+-- dialog, the list across X-Rays): the entry in a browser on `data`, stacked
+-- on its category, or the carried row's page. Returns the picker's
+-- on_stub_committed and on_committed.
+local function aliasLandings(ui, data, cached, config, plugin, book_metadata, best, cw, document_path)
+    local XrayParser = require("koassistant.xray.xray_parser")
+    local function onStub(stub, new_data)
+        if not new_data then return end
+        local s2, i2 = XrayParser.findDormantByIdentity(new_data, { stub.name })
+        if s2 then
+            openCarriedStubDetail(ui, new_data, config, plugin,
+                book_metadata, cw, document_path, i2, s2)
+        end
+    end
+    local function onEntry(target_item, target_cat_key, target_name)
+        local XrayBrowser = openXrayBrowserFromCache(ui, data, cached, config, plugin,
+            book_metadata, best, cw, document_path)
+        for _c_idx, cat in ipairs(XrayParser.getCategories(data) or {}) do
+            if cat.key == target_cat_key then
+                XrayBrowser:showCategoryItems(cat)
+                break
+            end
+        end
+        -- Q6: direct entry — one X exits the browser
+        XrayBrowser._direct_entry_exit = true
+        XrayBrowser:showItemDetail(target_item, target_cat_key, target_name)
+    end
+    return onStub, onEntry
+end
+
 -- Show cross-section X-Ray search results as a standalone picker Menu.
 -- @param grouped_results table From ActionCache.searchAllXrays()
 -- @param query string The search query
@@ -12046,6 +12160,34 @@ local function showCrossSectionResults(grouped_results, query, ui, config, plugi
     end
 
     local items = {}
+    -- "Add as alias…" first, as on the browser's results list (ref #63): a
+    -- book with section X-Rays lands here instead, and a name worth adding
+    -- usually hits the entry it belongs to (a first name inside a full name).
+    -- It targets the main X-Ray, as the no-results dialog does; the alias is
+    -- the book's, so every X-Ray of it matches the name.
+    local q_trim = query and query:match("^%s*(.-)%s*$") or ""
+    local main_data = #q_trim > 2 and #q_trim <= 120 and mainLedgerData(document_path, nil, nil)
+    if main_data then
+        table.insert(items, {
+            text = T(_("Add \"%1\" as an alias…"), query),
+            bold = true,
+            separator = true,
+            callback = function()
+                local main = require("koassistant.artifacts.action_cache").getXrayCache(document_path)
+                if not (main and main.result) then return end
+                local on_stub, on_entry = aliasLandings(ui, main_data, main, config, plugin,
+                    book_metadata, { entry = main }, cleanup_widgets, document_path)
+                -- Defined further down; reached through the module's export
+                require("koassistant.ui.dialogs").showAliasTargetPicker{
+                    data = main_data,
+                    query = query,
+                    document_path = document_path,
+                    on_stub_committed = on_stub,
+                    on_committed = on_entry,
+                }
+            end,
+        })
+    end
     for _idx, group in ipairs(grouped_results) do
         -- Section header (non-tappable separator)
         local header_label
@@ -12229,7 +12371,7 @@ local function showAliasTargetPicker(ctx)
             return
         end
         -- Fold into the caller's parsed data so open views show it now
-        XrayParser.mergeUserAliases(data, ActionCache.getUserAliases(document_path))
+        XrayParser.mergeUserAliases(data, ActionCache.matchOverlay(document_path))
         UIManager:show(InfoMessage:new{
             text = T(_("Added \"%1\" as alias of %2."), query, target_name),
             timeout = 3,
@@ -12488,31 +12630,14 @@ local function showLookupNoResults(opts)
         nores_buttons[#nores_buttons + 1] =
             { { text = _("Add as alias of an entry…"), callback = function()
                 UIManager:close(nores)
+                local on_stub, on_entry = aliasLandings(ui, data, cached, config, plugin,
+                    book_metadata, best, cw, document_path)
                 showAliasTargetPicker{
                     data = data,
                     query = query,
                     document_path = document_path,
-                    on_stub_committed = function(stub, new_data)
-                        if not new_data then return end
-                        local s2, i2 = XrayParser.findDormantByIdentity(new_data, { stub.name })
-                        if s2 then
-                            openCarriedStubDetail(ui, new_data, config, plugin,
-                                book_metadata, cw, document_path, i2, s2)
-                        end
-                    end,
-                    on_committed = function(target_item, target_cat_key, target_name)
-                        local XrayBrowser = openXrayBrowserFromCache(ui, data, cached, config, plugin,
-                            book_metadata, best, cw, document_path)
-                        for _c_idx, cat in ipairs(XrayParser.getCategories(data) or {}) do
-                            if cat.key == target_cat_key then
-                                XrayBrowser:showCategoryItems(cat)
-                                break
-                            end
-                        end
-                        -- Q6: direct entry — one X exits the browser
-                        XrayBrowser._direct_entry_exit = true
-                        XrayBrowser:showItemDetail(target_item, target_cat_key, target_name)
-                    end,
+                    on_stub_committed = on_stub,
+                    on_committed = on_entry,
                 }
             end } }
     end
@@ -12736,7 +12861,7 @@ local function handleLocalXrayLookup(ui, query, document_path, book_metadata, co
 
     -- User search terms must match in lookup too, not only in the browser
     -- (F1, xray_marking_plan.md, ref #63)
-    XrayParser.mergeUserAliases(data, ActionCache.getUserAliases(document_path))
+    XrayParser.mergeUserAliases(data, ActionCache.matchOverlay(document_path))
 
     -- Carried card target (S1, ref #90): the card resolved a LEDGER stub —
     -- open its carried-detail page directly (a stale target falls through)
@@ -12831,25 +12956,10 @@ local function handleLocalXrayLookup(ui, query, document_path, book_metadata, co
         -- entry whose name/alias CONTAINS it and the lookup landed on a results
         -- list instead of the obvious entry. Exactness outranks fuzzy hits;
         -- the results list remains for fuzzy-only matches and for
-        -- disambiguation when several entities share the exact name.
-        local query_exact = XrayParser.normalizeArabic(
-            (query:lower():gsub("^%s+", ""):gsub("%s+$", "")))
-        local exact = {}
-        for _idx, r in ipairs(results) do
-            local handles = { XrayParser.getItemName(r.item, r.category_key) }
-            local r_aliases = r.item.aliases
-            if type(r_aliases) == "string" then r_aliases = { r_aliases } end
-            if type(r_aliases) == "table" then
-                for _idx2, a in ipairs(r_aliases) do table.insert(handles, a) end
-            end
-            for _idx2, h in ipairs(handles) do
-                if type(h) == "string"
-                    and XrayParser.normalizeArabic(h:lower()) == query_exact then
-                    table.insert(exact, r)
-                    break
-                end
-            end
-        end
+        -- disambiguation when several entities share the exact name. The
+        -- exact rule is the marks' and the exact search's (B601: a main name
+        -- set to not matched, a capitals-only name in the other case).
+        local exact = XrayParser.exactLookupHits(results, query)
 
         -- Carried tier (S1, ref #90): exact stub handles join the exact set.
         -- A same-handle stub in the SAME family cannot coexist with a live
@@ -12968,10 +13078,8 @@ local function handleLocalXrayLookup(ui, query, document_path, book_metadata, co
     end
 end
 
--- Dispatch a local (non-AI) action handler. opts (optional): run_variant (a
--- hold menu's run option: { image_note = true } asks Generate Image's note,
--- { image_settings = true } opens the image settings panel first), note (the
--- text typed in the input dialog: Generate Image's note)
+-- Dispatch a local (non-AI) action handler. opts (optional): note (the text
+-- typed in the input dialog: Generate Image's note)
 local function handleLocalAction(handler_name, ui, highlighted_text, document_path, book_metadata, config, plugin, opts)
     local logger = require("koassistant.core.logger")
 
@@ -13006,7 +13114,7 @@ local function handleLocalAction(handler_name, ui, highlighted_text, document_pa
         -- privacy values reach the generator's gate for the text around it. The
         -- prompt writer (S5) also reads the book's Background, the spoiler
         -- posture and the reader's note (the input dialog's text, or the one
-        -- "Generate with a note…" asks for)
+        -- typed in the popup)
         local features = (config and config.features) or {}
         local book_ds = book_info and require("koassistant.storage.doc_settings").resolve(book_info.file, ui) or nil
         local spoiler = BookSettings.resolveSpoilerFree(book_ds, features) or false
@@ -13033,27 +13141,61 @@ local function handleLocalAction(handler_name, ui, highlighted_text, document_pa
                 ImageGenerator.generate(highlighted_text, config, plugin and plugin.settings, book_info, gen_opts)
             end)
         end
-        local function runWithNote()
-            ImageGenerator.askNote(gen_opts.note, function(text)
-                gen_opts.note = text
-                run()
-            end)
-        end
-        local variant = opts and type(opts.run_variant) == "table" and opts.run_variant or {}
-        if variant.image_note then
-            runWithNote()
-        elseif variant.image_settings and plugin and plugin.settings then
-            -- the image settings panel (S9): a pick is the setting, then the
-            -- picture from the selection taken at the start
-            require("koassistant.images.image_options").show(plugin, {
-                writer = true,
-                actions = {
-                    { text = _("Generate"), callback = run },
-                    { text = _("Generate with a note…"), callback = runWithNote },
-                },
-            })
-        else
+        if not (plugin and plugin.settings) then
             run()
+        else
+            -- B537: a tap opens the picture popup (the scope popup's shape):
+            -- a note and X-Ray entries for this picture, then the settings it
+            -- is drawn with (a pick is the setting), then Generate, from the
+            -- selection taken at the start. The provider question first,
+            -- when the chat provider cannot draw
+            ImageGenerator.providerFirst(plugin, function()
+                -- B535: the entries the prompt writer reads start as the
+                -- ones the passage and the note name and can be changed by
+                -- hand; carried entries among them, none from a book whose
+                -- text is Never for the providers set now (the run judges
+                -- again with the providers it goes to)
+                local xray_data
+                if book_info and book_info.file then
+                    local f = plugin.settings:readSetting("features") or {}
+                    local main = require("koassistant.core.config_helper").mainProvider(f)
+                    local providers = {}
+                    local drawing = ImageGenerator.effectiveProvider(f, main, plugin.settings)
+                    if drawing then providers[#providers + 1] = drawing end
+                    if f.image_gen_writer ~= false then
+                        providers[#providers + 1] = require("koassistant.images.prompt_writer").target(f, main)
+                    end
+                    xray_data = ImageGenerator.pictureXray(book_info.file, f, providers, ui)
+                end
+                local state = { note = gen_opts.note }
+                if xray_data then
+                    state.picked = {}
+                    for _idx, e in ipairs(require("koassistant.images.prompt_writer").entriesFor(
+                            highlighted_text, xray_data)) do
+                        state.picked[#state.picked + 1] = e.name
+                    end
+                    -- the input dialog's note: its entries first, as a note's are
+                    if gen_opts.note then
+                        require("koassistant.images.image_options").addNoteEntries(state, xray_data,
+                            gen_opts.note, highlighted_text)
+                    end
+                end
+                require("koassistant.images.image_options").show(plugin, {
+                    title = _("Generate Image"),
+                    passage = highlighted_text,
+                    writer = true,
+                    note = true,
+                    xray = xray_data,
+                    state = state,
+                    actions = {
+                        { text = _("Generate"), callback = function()
+                            gen_opts.note = state.note
+                            gen_opts.picked = state.picked
+                            run()
+                        end },
+                    },
+                })
+            end)
         end
     else
         logger.warn("KOAssistant: Unknown local handler: " .. tostring(handler_name))
@@ -13210,7 +13352,7 @@ local function executeDirectAction(ui, action, highlighted_text, configuration, 
     -- Handle local-only actions (no AI call)
     if action.local_handler then
         handleLocalAction(action.local_handler, ui, highlighted_text, document_path, book_metadata, configuration, plugin,
-            opts and { run_variant = opts.run_variant, note = opts.note } or nil)
+            opts and { note = opts.note } or nil)
         return
     end
 
@@ -13527,6 +13669,28 @@ local function executeDirectAction(ui, action, highlighted_text, configuration, 
         local wiki_key = ActionCache.WIKI_PREFIX .. wiki_category .. ":" .. normalized
 
         -- Helper: show wiki in simple_view with regenerate/delete
+        -- The text around the selection (the wiki's surrounding-context section)
+        -- is the nearby_text kind: a headless run never asks at dispatch
+        -- (executeActionForResult sets _data_no_question), so the question is
+        -- asked here, once, as the X-Ray browser's AI Wiki asks; nothing to ask
+        -- without a selection window. A Cancel drops what this entry set on the
+        -- config (the run option, the window), as a dispatch would have consumed it
+        local function askWikiAccess(run)
+            local f = configuration and configuration.features
+            if not (f and f._selection_context_window) then
+                run()
+                return
+            end
+            require("koassistant.ui.data_access").withAccess(plugin, action, {
+                features = f, path = document_path, ui = ui,
+                provider = effectiveDispatchProvider(f, action, configuration.provider),
+                kinds = { { kind = "nearby_text", required = false } },
+                action_name = _("AI Wiki"),
+                on_cancel = function() dropDispatchTransients(f) end,
+                on_refused = function() dropDispatchTransients(f) end,
+            }, run)
+        end
+
         local function showWikiArtifact(wiki_text)
             local Notification = require("ui/widget/notification")
             local wiki_viewer = ChatGPTViewer:new{
@@ -13536,6 +13700,7 @@ local function executeDirectAction(ui, action, highlighted_text, configuration, 
                 cache_type_name = _("AI Wiki"),
                 configuration = configuration,
                 on_regenerate = function()
+                    askWikiAccess(function()
                     executeActionForResult(action, highlighted_text, ui, configuration, plugin, book_metadata,
                         function(result, meta)
                             if result then
@@ -13548,6 +13713,7 @@ local function executeDirectAction(ui, action, highlighted_text, configuration, 
                                 })
                             end
                         end)
+                    end)
                 end,
                 regenerate_label = _("Regenerate"),
                 on_delete = function()
@@ -13582,6 +13748,7 @@ local function executeDirectAction(ui, action, highlighted_text, configuration, 
             -- just-in-time, consumed by handlePredefinedPrompt
             configuration.features._run_variant = wiki_variant
         end
+        askWikiAccess(function()
         executeActionForResult(action, highlighted_text, ui, configuration, plugin, book_metadata,
             function(result, metadata)
                 if result then
@@ -13591,6 +13758,7 @@ local function executeDirectAction(ui, action, highlighted_text, configuration, 
                     showRequestError(_("Error: ") .. (metadata or "Unknown error"))
                 end
             end)
+        end)
         return
     end
 
@@ -13795,13 +13963,9 @@ local function generateSummaryCache(ui, configuration, plugin, book_metadata, on
         section_action.use_reading_progress = false
         section_action.use_response_caching = false
         section_action._section_scope = section_scope  -- Scopes text extraction to section pages
-        -- Inject section scope context into prompt
-        if section_action.prompt then
-            local scope_line = string.format(
-                'This is a section of "{title}"{author_clause}.\nSection: "%s" (%s)\nFocus your summary on this section only.\n\n',
-                section_scope.label, section_scope.page_summary)
-            section_action.prompt = scope_line .. section_action.prompt
-        end
+        -- The prompt a run on one section sends (the one writer, B741)
+        section_action.prompt = Actions.scopedPrompt(section_action,
+            { kind = "section", label = section_scope.label, pages = section_scope.page_summary })
         summary_action = section_action
     end
 
@@ -13909,6 +14073,10 @@ local function launchArtifactChat(user_question, artifact_content, artifact_type
         end
     end
 
+    -- The run option (B345) the bake consumes: a question below re-enters this
+    -- function after the bake, so the pick is put back for that second bake
+    local run_variant = configuration.features._run_variant
+
     -- Build system prompt (standard book chat)
     buildUnifiedRequestConfig(configuration, domain_context, nil, plugin)
 
@@ -13933,6 +14101,7 @@ local function launchArtifactChat(user_question, artifact_content, artifact_type
                 book = nb_book, kinds = { "notebook" }, action_name = _("Chat about this notebook"),
                 amounts = { notebook = _("your notebook for this book") },
             }, function()
+                configuration.features._run_variant = run_variant
                 launchArtifactChat(user_question, artifact_content, artifact_type_name, ui,
                     configuration, plugin, book_metadata, opts)
             end)
@@ -13966,6 +14135,7 @@ local function launchArtifactChat(user_question, artifact_content, artifact_type
                     notebook = T(_("this %1, built with your notebook"), what),
                 },
             }, function()
+                configuration.features._run_variant = run_variant
                 launchArtifactChat(user_question, artifact_content, artifact_type_name, ui,
                     configuration, plugin, book_metadata, opts)
             end)
@@ -14150,6 +14320,10 @@ return {
     resolveQuickPresetModel = resolveQuickPresetModel,
     -- Test seam (tests/unit/test_run_options.lua): the request bake
     _buildUnifiedRequestConfig = buildUnifiedRequestConfig,
+    webSearchPreview = webSearchPreview,  -- the message's web flag before the bake (B588)
+    _markOneShot = markOneShot,  -- test seam: the request that has no later turn (B728)
+    DISPATCH_TRANSIENTS = DISPATCH_TRANSIENTS,  -- the keys a dispatch consumes from its source config
+    dropDispatchTransients = dropDispatchTransients,  -- the funnel's Cancel clears them as a dispatch would
     -- Test seam (tests/unit/test_front_matter_flow.lua): what a headless run hands back
     _headlessResult = headlessResult,
 }

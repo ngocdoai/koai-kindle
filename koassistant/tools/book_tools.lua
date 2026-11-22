@@ -18,12 +18,17 @@ do
             -- Cyrillic, Arabic, CJK...); C2 and E2 start the punctuation English text is
             -- full of (no-break space, curly quotes, dashes, ellipsis), which has no case.
             if not text:find("[\195-\225\227-\244]") then return text:lower() end
+            -- never invalid UTF-8 into utf8proc: it ends the app (a query the
+            -- model wrote with half an escape pair, a damaged text layer)
+            text = require("koassistant.request.scope_resolver").utf8Mask(text)
             local folded_ok, folded = pcall(Utf8Proc.lowercase, text, true)
             if folded_ok and type(folded) == "string" then return folded end
             return text:lower()
         end
     end
 end
+-- the one fold of text and query, for the scenario that feeds it invalid bytes
+BookTools._lowercase = lowercase
 
 local MAX_READ_PAGES = 5
 local MAX_READ_CHARS = 8000
@@ -1183,7 +1188,16 @@ end
 
 function BookTools:getEffectiveToc()
     local document = self.ui and self.ui.document
-    local toc = self.ui and self.ui.toc and self.ui.toc.toc
+    local reader_toc = self.ui and self.ui.toc
+    -- KOReader builds the table of contents on first use (ReaderToc:fillToc):
+    -- a book opened and never asked for its contents had none here, so the
+    -- tools and the X-Ray's outline saw a book without chapters (the sweep
+    -- of 2026-11-06; the other direct readers, main.lua's quiz trigger, the
+    -- scope popup and the X-Ray browser, are filed as open)
+    if reader_toc and reader_toc.toc == nil and type(reader_toc.fillToc) == "function" then
+        pcall(reader_toc.fillToc, reader_toc)
+    end
+    local toc = reader_toc and reader_toc.toc
     if not toc or #toc == 0 then return nil end
 
     if document and document.hasHiddenFlows and document:hasHiddenFlows() then
@@ -1542,7 +1556,10 @@ function BookTools:searchBookAsync(args, on_done, on_tick)
     local cancelled = false
     local chunk_size = 65536
     local chunk = ffi.new("char[?]", chunk_size)
-    local pointer = ffi.cast("void*", chunk)
+    -- The reads below take the buffer itself: a pointer cast from it keeps
+    -- nothing alive, and the poll runs long after this function returned,
+    -- when the buffer's own variable is gone and LuaJIT may have freed it
+    -- (the child's bytes then land in memory that is in use: B769)
     local parts = {}
     local started = os.time()
     local last_tick = 0
@@ -1573,14 +1590,14 @@ function BookTools:searchBookAsync(args, on_done, on_tick)
         while true do
             local available = ffiutil.getNonBlockingReadSize(read_fd) or 0
             if available > 0 then
-                local bytes = tonumber(ffi.C.read(read_fd, pointer, chunk_size))
-                if bytes and bytes > 0 then parts[#parts + 1] = ffi.string(pointer, bytes)
+                local bytes = tonumber(ffi.C.read(read_fd, chunk, chunk_size))
+                if bytes and bytes > 0 then parts[#parts + 1] = ffi.string(chunk, bytes)
                 else finish() return end
             elseif ffiutil.isSubProcessDone(pid) then
                 while true do
-                    local bytes = tonumber(ffi.C.read(read_fd, pointer, chunk_size))
+                    local bytes = tonumber(ffi.C.read(read_fd, chunk, chunk_size))
                     if not bytes or bytes <= 0 then break end
-                    parts[#parts + 1] = ffi.string(pointer, bytes)
+                    parts[#parts + 1] = ffi.string(chunk, bytes)
                 end
                 finish()
                 return

@@ -9,6 +9,9 @@ end
 
 function ChatMarkup.protectImages(text, resolve_local)
     if type(text) ~= "string" then return text, function(value) return value end end
+    if not text:find("![", 1, true) and not (resolve_local and text:find("koassistant-image:", 1, true)) then
+        return text, function(value) return value end
+    end
     local marker = "KOAIMAGEPLACEHOLDER"
     while text:find(marker, 1, true) do marker = marker .. "X" end
     local images, blocks = {}, {}

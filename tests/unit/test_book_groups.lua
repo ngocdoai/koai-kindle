@@ -499,6 +499,25 @@ TestRunner:test("follow-group helpers: a marker of a group that no longer exists
     BookGroups.remove(g.id)
 end)
 
+TestRunner:test("carriedSourceLabeler: Book N in a series, the source title otherwise (B537)", function()
+    local g = BookGroups.create("Label Saga")
+    BookGroups.addBook(g.id, "/saga/one.epub")
+    BookGroups.addBook(g.id, "/saga/two.epub")
+    BookGroups.addBook(g.id, "/saga/three.epub")
+    BookGroups.setKind(g.id, BookGroups.KIND_SERIES)
+    local label = BookGroups.carriedSourceLabeler("/saga/three.epub")
+    local text, short = label({ file = "/saga/two.epub", source = "Two" })
+    TestRunner:assertEqual(text, "Book 2", "the book's place in the series")
+    TestRunner:assertEqual(short, true)
+    text, short = label({ file = "/elsewhere/x.epub", source = "Elsewhere" })
+    TestRunner:assertEqual(text, "Elsewhere", "a book outside the series: its title")
+    TestRunner:assertEqual(short, false)
+    BookGroups.setKind(g.id, BookGroups.KIND_PROJECT)
+    TestRunner:assertEqual(BookGroups.carriedSourceLabeler("/saga/three.epub")({ file = "/saga/two.epub", source = "Two" }),
+        "Two", "a project has no numbers")
+    BookGroups.remove(g.id)
+end)
+
 TestRunner:test("shortName: UTF-8 safe cap with an ellipsis", function()
     TestRunner:assertEqual(BookGroups.shortName("short"), "short", "under the cap untouched")
     TestRunner:assertEqual(BookGroups.shortName("abcdef", 3), "abc\u{2026}", "cut at the cap")
@@ -610,6 +629,49 @@ TestRunner:test("a hub add row's picker stays on that row's source (B407)", func
     for _i, name in ipairs(names) do package.loaded[name] = saved[name] end
     BookGroups.remove(g.id)
     if not ok then error(err, 0) end
+end)
+
+print("")
+print("  [the sweep of 2026-11-06: one write for a batch of books, one for an order]")
+
+TestRunner:test("addBooks: fifty books, one save, one notify; setOrder: one save", function()
+    local saves = 0
+    BookGroups._setStoreForTests({
+        readSetting = function(_self, key) return mem[key] end,
+        saveSetting = function(_self, key, value) mem[key] = value; saves = saves + 1 end,
+        flush = function() end,
+    })
+    local changes = 0
+    BookGroups.on_change = function() changes = changes + 1 end
+    local g = BookGroups.create("Batch Series")
+    saves, changes = 0, 0
+    local paths = {}
+    for i = 1, 50 do paths[i] = "/books/batch/v" .. i .. ".epub" end
+    paths[#paths + 1] = paths[1]  -- a duplicate in the list
+    local added = BookGroups.addBooks(g.id, paths)
+    TestRunner:assertEqual(#added, 50, "fifty added, the duplicate skipped")
+    TestRunner:assertEqual(saves, 1, "one save")
+    TestRunner:assertEqual(changes, 1, "one notify")
+    TestRunner:assertEqual(#BookGroups.byId(g.id).books, 50)
+    TestRunner:assertEqual(#BookGroups.addBooks(g.id, { paths[3], paths[4] }), 0, "already there: nothing added")
+    TestRunner:assertEqual(saves, 1, "and nothing written")
+    saves, changes = 0, 0
+    TestRunner:assertTrue(BookGroups.setOrder(g.id, { paths[50], paths[49], "/books/elsewhere.epub" }), "reordered")
+    local books = BookGroups.byId(g.id).books
+    TestRunner:assertEqual(books[1], paths[50])
+    TestRunner:assertEqual(books[2], paths[49])
+    TestRunner:assertEqual(books[3], paths[1], "the unlisted keep their order after the listed")
+    TestRunner:assertEqual(#books, 50, "a path not in the group is ignored")
+    TestRunner:assertEqual(saves, 1, "one save for the order")
+    TestRunner:assertFalse(BookGroups.setOrder(g.id, { paths[50], paths[49] }), "the same order: no write")
+    TestRunner:assertEqual(saves, 1)
+    BookGroups.on_change = nil
+    BookGroups.remove(g.id)
+    BookGroups._setStoreForTests({
+        readSetting = function(_self, key) return mem[key] end,
+        saveSetting = function(_self, key, value) mem[key] = value end,
+        flush = function() end,
+    })
 end)
 
 local ok = TestRunner:summary()

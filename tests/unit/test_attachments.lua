@@ -124,6 +124,26 @@ function T:runAll()
             "clear should empty the staging list")
     end)
 
+    self:test("skippedBy: artifact writers and the dictionary and translate family take none (D12)", function()
+        for _idx, flag in ipairs({ "use_response_caching", "cache_as_xray", "cache_as_analyze",
+                "cache_as_summary", "dictionary_view", "translate_view", "compact_view" }) do
+            self:assert(Attachments.skippedBy({ [flag] = true }), flag)
+        end
+        self:assert(not Attachments.skippedBy({ id = "explain" }), "a plain action takes them")
+        self:assert(not Attachments.skippedBy(nil), "no action (a freeform Send) takes them")
+    end)
+
+    self:test("dropFor (B525): an action that skips them drops them, a plain one keeps them", function()
+        Attachments.clear()
+        Attachments.add({ type = "note", label = "a", text = "a" })
+        Attachments.add({ type = "note", label = "b", text = "b" })
+        self:assertEquals(Attachments.dropFor({ id = "explain" }), 0, "a plain action")
+        self:assertEquals(Attachments.count(), 2, "kept for it")
+        self:assertEquals(Attachments.dropFor({ use_response_caching = true }), 2, "an artifact action")
+        self:assertEquals(Attachments.count(), 0, "dropped: nothing rides the result chat's first reply")
+        self:assertEquals(Attachments.dropFor({ use_response_caching = true }), 0, "nothing left to drop")
+    end)
+
     self:test("isTrustedProvider matches the configured list", function()
         local features = { trusted_providers = { "ollama", "anthropic" } }
         self:assert(Attachments.isTrustedProvider(features, "anthropic"))
@@ -239,6 +259,30 @@ function T:runAll()
         os.remove(path)
         local none, err = Attachments.makeFile(path)
         self:assert(none == nil and err ~= nil, "missing file should refuse")
+    end)
+
+    self:test("makeFile: text only; a byte order mark is dropped", function()
+        local function file_with(bytes)
+            local path = os.tmpname()
+            local f = io.open(path, "wb")
+            f:write(bytes)
+            f:close()
+            return path
+        end
+        local latin1 = file_with("caf\233 au lait\n")
+        local none, err = Attachments.makeFile(latin1)
+        os.remove(latin1)
+        self:assert(none == nil and err and err:find("UTF-8", 1, true), "a Latin-1 file is refused")
+        local utf16 = file_with("\255\254h\0i\0\n\0")
+        none, err = Attachments.makeFile(utf16)
+        os.remove(utf16)
+        self:assert(none == nil and err and err:find("UTF-8", 1, true), "a UTF-16 file is refused")
+        local bom = file_with("\239\187\191caf\195\169 au lait\n")
+        local entry = Attachments.makeFile(bom)
+        os.remove(bom)
+        self:assert(entry, "UTF-8 with a BOM is attached")
+        self:assertEquals(entry.text:sub(1, 3), "caf", "without the mark")
+        self:assert(entry.text:find("caf\195\169", 1, true), "its text as written")
     end)
 
     self:test("makeFile: partial read reports the real file size", function()

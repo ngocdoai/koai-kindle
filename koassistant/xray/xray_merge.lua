@@ -647,7 +647,10 @@ end
 --- Case-insensitive alias union, first list's order first; nil when empty.
 local function unionAliases(a, b)
     local out, seen = {}, {}
-    for _idx, list in ipairs({ a, b }) do
+    -- two explicit passes: ipairs over { a, b } stopped at a nil a, so a
+    -- stub seeded without aliases never gained the source's later ones
+    -- (the sweep of 2026-11-06)
+    local function addAll(list)
         for _i, alias in ipairs(type(list) == "table" and list or {}) do
             if type(alias) == "string" and alias ~= "" and not seen[alias:lower()] then
                 seen[alias:lower()] = true
@@ -655,6 +658,8 @@ local function unionAliases(a, b)
             end
         end
     end
+    addAll(a)
+    addAll(b)
     return #out > 0 and out or nil
 end
 
@@ -691,25 +696,37 @@ function XrayMerge.populateDormant(base_parsed, delta, source_parsed, source_tit
         return bg
     end
     -- Everything the target can already match: its actives + the delta's
-    -- arriving entities (they become actives in the merge right after this)
-    local present = buildEntityLookup(base_parsed)
+    -- arriving entities (they become actives in the merge right after this),
+    -- by family, the wake-pass's rule (round 26): a source entry is already
+    -- here only as an entry of its family, so the character "the Warden"
+    -- (alias "Warden") is carried beside the term "Warden"
+    local present = {}
+    local function learn(key, name, entry)
+        if type(name) ~= "string" or name == "" then return end
+        local family = XrayParser.CATEGORY_FAMILY[key] or key
+        present[family] = present[family] or {}
+        if present[family][name:lower()] == nil then present[family][name:lower()] = entry end
+    end
+    for _idx, cat in ipairs(XrayParser.getCategories(base_parsed)) do
+        if not PROTECTED_CATEGORIES[cat.key] and type(cat.items) == "table" then
+            for _idx2, item in ipairs(cat.items) do
+                if type(item) == "table" then
+                    learn(cat.key, XrayParser.getItemName(item, cat.key), item)
+                    for _idx3, alias in ipairs(type(item.aliases) == "table" and item.aliases or {}) do
+                        learn(cat.key, alias, item)
+                    end
+                end
+            end
+        end
+    end
     if type(delta) == "table" then
         for key, arr in pairs(delta) do
             if not PROTECTED_CATEGORIES[key] and type(arr) == "table" then
                 for _idx, entry in ipairs(arr) do
                     if type(entry) == "table" then
-                        local name = entry.name or entry.term
-                        if type(name) == "string" and name ~= ""
-                            and present[name:lower()] == nil then
-                            present[name:lower()] = entry
-                        end
-                        if type(entry.aliases) == "table" then
-                            for _idx2, alias in ipairs(entry.aliases) do
-                                if type(alias) == "string" and alias ~= ""
-                                    and present[alias:lower()] == nil then
-                                    present[alias:lower()] = entry
-                                end
-                            end
+                        learn(key, entry.name or entry.term, entry)
+                        for _idx2, alias in ipairs(type(entry.aliases) == "table" and entry.aliases or {}) do
+                            learn(key, alias, entry)
                         end
                     end
                 end
@@ -802,6 +819,8 @@ function XrayMerge.populateDormant(base_parsed, delta, source_parsed, source_tit
             end
             stub.aliases = unionAliases(old.aliases, stub.aliases)
             stub.role = stub.role or old.role
+            -- B536: a row the reader carried by hand stays theirs
+            stub.by_hand = stub.by_hand or old.by_hand
             if stub.description ~= old.description or stub.role ~= old.role
                 or #(stub.aliases or {}) ~= #(old.aliases or {})
                 or #(stub.background or {}) ~= #(old.background or {}) then
@@ -814,11 +833,13 @@ function XrayMerge.populateDormant(base_parsed, delta, source_parsed, source_tit
             added = added + 1
         end
     end
-    local function isPresent(name, aliases)
-        if type(name) == "string" and name ~= "" and present[name:lower()] then return true end
+    local function isPresent(name, aliases, key)
+        local here = present[XrayParser.CATEGORY_FAMILY[key] or key]
+        if not here then return false end
+        if type(name) == "string" and name ~= "" and here[name:lower()] then return true end
         if type(aliases) == "table" then
             for _idx, a in ipairs(aliases) do
-                if type(a) == "string" and a ~= "" and present[a:lower()] then return true end
+                if type(a) == "string" and a ~= "" and here[a:lower()] then return true end
             end
         end
         return false
@@ -862,7 +883,7 @@ function XrayMerge.populateDormant(base_parsed, delta, source_parsed, source_tit
                             -- Only cleanly attributable carried lines ride along
                             background = stubLines(item.background),
                         }
-                        if not isPresent(name, item.aliases) then
+                        if not isPresent(name, item.aliases, cat.key) then
                             stash(stub)
                         elseif enrich then
                             present_stubs[#present_stubs + 1] = stub
@@ -1042,6 +1063,7 @@ function XrayMerge.unionLedger(prev_parsed, parsed, skip)
                     description = stub.description or old.description,
                     role = stub.role or old.role,
                     background = XrayParser.mergeBackground(old.background, stub.background),
+                    by_hand = stub.by_hand or old.by_hand,
                 }
                 -- Aliases: the outgoing list first (the reader's edits live
                 -- there), then whatever the rung's copy had that it lacks
@@ -1374,50 +1396,29 @@ local reseed_archived = {}
 --- Zero tokens. A member is written only when the seed actually adds or
 --- changes something (dry run on a throwaway parse first), through
 --- editLiveXray (pre-op version archived once per session). Removed entries
---- stay removed (tombstones). Idempotent.
+--- stay removed (tombstones). Idempotent. B536: each member's share is made
+--- current first (XrayMerge.refreshCarried: what its groups no longer give
+--- goes), and after a change of the group itself a plain group's members are
+--- refreshed too, so a group that stops carrying drops what it held.
 --- @param group table The group record
 --- @param features table Settings features (consent)
 --- @param provider string|nil Active provider id (trusted-provider consent)
 --- @param ui table|nil
+--- @param opts table|nil { changed = the group itself changed (members,
+---   order, kind), memo / done = one run's shared reads and refreshed books }
 --- @return number written, number checked
-function XrayMerge.reseedGroup(group, features, provider, ui)
+function XrayMerge.reseedGroup(group, features, provider, ui, opts)
     if type(group) ~= "table" or type(group.books) ~= "table" then return 0, 0 end
+    opts = opts or {}
     local BookGroups = require("koassistant.books.book_groups")
-    if not BookGroups.sharesKnowledge(group) then return 0, 0 end
-    local ActionCache = require("koassistant.artifacts.action_cache")
-    local XrayParser = require("koassistant.xray.xray_parser")
-    local WriteBack = require("koassistant.xray.artifact_writeback")
+    if not BookGroups.sharesKnowledge(group) and not opts.changed then return 0, 0 end
+    local memo, done = opts.memo or {}, opts.done or {}
     local written, checked = 0, 0
     for _idx, file in ipairs(group.books) do
-        local entry = ActionCache.getXrayCache(file)
-        if entry and entry.result and entry.source_mode ~= "ai_knowledge"
-                and XrayParser.isJSON(entry.result) then
-            local sources = XrayMerge.seedSources(file, features, provider, ui)
-            if #sources > 0 then
-                checked = checked + 1
-                local skip = removedStubsFor(file)
-                local function seed(data)
-                    local added, refreshed = 0, 0
-                    for _s, src in ipairs(sources) do
-                        local a, r = XrayMerge.populateDormant(data, nil, src.parsed,
-                            src.title, src.file, nil, file, skip, true)
-                        added, refreshed = added + a, refreshed + (r or 0)
-                    end
-                    return added > 0 or refreshed > 0
-                end
-                local probe = XrayParser.parse(entry.result)
-                if probe and not probe.error and seed(probe) then
-                    local ok = WriteBack.editLiveXray(file, seed, {
-                        features = features,
-                        limit = reseed_archived[file] and 0 or nil,
-                    })
-                    if ok then
-                        written = written + 1
-                        reseed_archived[file] = true
-                    end
-                end
-            end
-        end
+        local wrote, looked = XrayMerge.refreshCarried(file, features, provider, ui,
+            { memo = memo, done = done, explicit = opts.changed })
+        if looked then checked = checked + 1 end
+        if wrote then written = written + 1 end
     end
     return written, checked
 end
@@ -1482,6 +1483,9 @@ function XrayMerge.carryOne(parsed, item, category_key, prov)
         source = prov and prov.source or nil,
         file = prov and prov.file or nil,
         background = background,
+        -- B536: the reader's pick, not the group's carry: it stays when the
+        -- book it came from leaves the group (XrayMerge.pruneCarried)
+        by_hand = true,
     }
     local key = name:lower()
     for i, s in ipairs(ledger) do
@@ -3112,12 +3116,24 @@ end
 --- which the caller injects whatever the answer), and the dialog says so.
 --- When the previous book has no X-Ray, no dialog — the post-create gap note
 --- covers that case. Cancel aborts the create.
+---
+--- SWITCHED OFF (B770; the maintainer, 2026-11-21): an AI merge between books
+--- is experimental until its name links are measured, so the app no longer
+--- offers one by itself. With ASK_BEFORE_CREATE false no dialog applies: a
+--- fresh X-Ray of a later book in a series is built as "Just this book" was
+--- (the free carry and the naming canon, nothing else sent), and the paid
+--- merges stay in the X-Ray's own "Link and merge…" group. Whether the
+--- question returns, as it was or as a standing answer per group, is decided
+--- with the merge model; the unit test turns the switch on to keep the dialog
+--- covered until then.
 --- @param opts table { file, ui, configuration }
 --- @param proceed function(mode) mode = "single"|"chain"|nil (declined) |
 ---   "cancel" (round 28: abort the create — the caller must NOT send)
 --- @return boolean asked False when no dialog applies (proceed NOT called —
 ---   the caller continues synchronously)
+XrayMerge.ASK_BEFORE_CREATE = false
 function XrayMerge.preCreateFoldAsk(opts, proceed)
+    if not XrayMerge.ASK_BEFORE_CREATE then return false end
     local BookGroups = require("koassistant.books.book_groups")
     local preds, group = BookGroups.predecessorsOf(opts.file)
     if #preds == 0 then return false end
@@ -4225,5 +4241,359 @@ end
 
 -- Tests drive the sweep without the scheduler
 XrayMerge._sweepMoves = sweepMoves
+
+-- ── Carried entries follow the groups (B536) ────────────────────────────────
+-- The free carry is mechanical, so what a book holds of it is decided by its
+-- groups as they are NOW: a carried row or a history line from a book it no
+-- longer takes from goes, at every change of its groups, when it leaves one,
+-- when one is deleted, and after every write of its X-Ray (a checkpoint built
+-- while the group was different cannot bring it back). What an AI merge
+-- brought stays, and so do the reader's own decisions: a row carried by hand,
+-- an entry added by hand from the carried list, the removed-carried record.
+
+-- Normalized title variants a label may carry for a book (the labels were
+-- written from the display title, the doc_props title or the AI override,
+-- and from the file name when a book had no title)
+local function titleNorms(path, ui)
+    local out = {}
+    local function add(t)
+        local n = normTitle(t)
+        if n and n ~= "" then out[#out + 1] = n end
+    end
+    local ok_ds, ds = pcall(function() return SafeDocSettings.resolve(path, ui) end)
+    if ok_ds and ds then
+        local props = SafeDocSettings.overlayCustomProps(ds:readSetting("doc_props"), path) or {}
+        add(props.title)
+        add(props.display_title)
+    end
+    local ok_t, title = pcall(function()
+        return require("koassistant.books.book_groups").displayTitle(path, ui)
+    end)
+    if ok_t then add(title) end
+    add(path:match("([^/]+)%.[^.]+$"))
+    return out
+end
+
+-- Each book's AI-merge record, read again only when its cache file changed:
+-- the rule reaches every book of a long series on each run
+local record_memo = {}
+local function mergeRecordsOf(path)
+    local ActionCache = require("koassistant.artifacts.action_cache")
+    local cp = ActionCache.getPath(path)
+    local a = cp and require("libs/libkoreader-lfs").attributes(cp)
+    local stamp = a and (tostring(a.modification) .. ":" .. tostring(a.size)) or "-"
+    local m = record_memo[path]
+    if m and m.stamp == stamp then return m.ledger end
+    local led = XrayMerge.ledgerOf(a and ActionCache.getXrayCache(path) or nil)
+    record_memo[path] = { stamp = stamp, ledger = led }
+    return led
+end
+
+--- What a book may hold of the free carry now (B536), as a predicate over a
+--- carried row or history line's book. Allowed: what its groups give (a
+--- series' earlier books, a project's other members, a plain group nothing),
+--- what was AI merged into it, and the same of every book reached that way (a
+--- source's own carried list rides on), never a book that comes after it in
+--- one of its series unless it AI merged that book itself. A book in several
+--- groups keeps what any of them gives. A path this device does not have (a
+--- copy synced from another device, a book gone from disk) cannot be judged
+--- and is kept; a line from before files were recorded is judged by its
+--- book's title, and kept when the title names no book a group here holds.
+--- @param file string The book
+--- @param opts table|nil { ui, memo = one run's shared reads ({ titles,
+---   exists }), own = this book's merge record when already read, own_extra =
+---   more records of its own (its archived versions'), exists =
+---   function(path) (tests), entry_of = function(path) -> cache entry (tests) }
+--- @return function keep(row_file, row_source) -> boolean
+function XrayMerge.carryRule(file, opts)
+    opts = opts or {}
+    local BookGroups = require("koassistant.books.book_groups")
+    local memo = opts.memo or {}
+    memo.titles = memo.titles or {}
+    memo.exists = memo.exists or {}
+    local exists_fn = opts.exists or BookGroups.fileExists
+    local function current(p)
+        return movedPath(pending_moves, p) or p
+    end
+    local function ledgerFor(p)
+        if p == file and opts.own then return opts.own end
+        if opts.entry_of then
+            local ok, entry = pcall(opts.entry_of, p)
+            return XrayMerge.ledgerOf(ok and entry or nil)
+        end
+        local ok, led = pcall(mergeRecordsOf, p)
+        return ok and led or {}
+    end
+    local function norm(s)
+        local n = normTitle(s)
+        if n == nil or n == "" or n == "?" then return nil end
+        return n
+    end
+    local function titlesOf(p)
+        local list = memo.titles[p]
+        if not list then
+            list = titleNorms(p, opts.ui)
+            memo.titles[p] = list
+        end
+        return list
+    end
+    -- In a series nothing comes from a later book
+    local later = {}
+    for _idx, g in ipairs(BookGroups.groupsFor(file)) do
+        if BookGroups.isOrdered(g) then
+            local past = false
+            for _j, p in ipairs(g.books or {}) do
+                if past then later[p] = true elseif p == file then past = true end
+            end
+        end
+    end
+    -- What this book AI merged itself stays, a later book included
+    local own_files, own_titles = {}, {}
+    local function addOwn(list)
+        for _idx, rec in ipairs(list or {}) do
+            if rec.file then own_files[current(rec.file)] = true end
+            local n = norm(rec.title)
+            if n then own_titles[n] = true end
+        end
+    end
+    addOwn(ledgerFor(file))
+    addOwn(opts.own_extra)
+    local files, merged_titles = {}, {}
+    local seen, queue, head = { [file] = true }, { file }, 1
+    local function reach(p)
+        if type(p) ~= "string" or p == "" or p == file or later[p] then return end
+        files[p] = true
+        if not seen[p] then
+            seen[p] = true
+            queue[#queue + 1] = p
+        end
+    end
+    while head <= #queue do
+        local book = queue[head]
+        head = head + 1
+        for _idx, g in ipairs(BookGroups.groupsFor(book)) do
+            if BookGroups.isOrdered(g) then
+                for _j, p in ipairs(g.books or {}) do
+                    if p == book then break end
+                    reach(p)
+                end
+            elseif BookGroups.sharesKnowledge(g) then
+                for _j, p in ipairs(g.books or {}) do
+                    if p ~= book then reach(p) end
+                end
+            end
+        end
+        for _idx, rec in ipairs(ledgerFor(book)) do
+            local n = norm(rec.title)
+            if n then merged_titles[n] = true end
+            if rec.file then reach(current(rec.file)) end
+        end
+    end
+    local allowed_titles, known_titles
+    local function allowedTitles()
+        if allowed_titles then return allowed_titles end
+        allowed_titles = {}
+        for p in pairs(files) do
+            for _idx, n in ipairs(titlesOf(p)) do allowed_titles[n] = true end
+        end
+        return allowed_titles
+    end
+    -- The titles of the books the groups here hold: a line from before files
+    -- were recorded is refused only when it names one of them
+    local function knownTitles()
+        if known_titles then return known_titles end
+        known_titles = {}
+        for _idx, g in ipairs(BookGroups.all()) do
+            for _j, p in ipairs(g.books or {}) do
+                for _k, n in ipairs(titlesOf(p)) do known_titles[n] = true end
+            end
+        end
+        return known_titles
+    end
+    local function exists(p)
+        local e = memo.exists[p]
+        if e == nil then
+            local ok, r = pcall(exists_fn, p)
+            e = not ok or r == true
+            memo.exists[p] = e
+        end
+        return e
+    end
+    return function(row_file, row_source)
+        local n = norm(row_source)
+        if type(row_file) == "string" and row_file ~= "" then
+            local f = current(row_file)
+            if own_files[f] or (n and own_titles[n]) then return true end
+            if f == file or later[f] then return false end
+            if files[f] or (n and merged_titles[n]) then return true end
+            return not exists(f)
+        end
+        if not n then return true end -- unattributable: kept, as the reconcile keeps it
+        if own_titles[n] or merged_titles[n] or allowedTitles()[n] then return true end
+        return not knownTitles()[n]
+    end
+end
+
+--- Drop what `keep` refuses from a parsed X-Ray (B536): carried rows and the
+--- history lines on entries and rows. The book's own entries are never
+--- removed, only lines on them; an entry added by hand from the carried list
+--- keeps all of its lines, and a row carried by hand stays. A row whose own
+--- book is refused but which holds lines from books still allowed (an AI
+--- merge's among them) stays with those lines, filed under the first of them,
+--- without what the refused book said. Pure.
+--- @param data table Parsed X-Ray (mutated)
+--- @param keep function(file, source) -> boolean (carryRule)
+--- @param hand table|nil Lowercased name -> spelling: the entries added by
+---   hand from the carried list (ActionCache.getPromotedStubs)
+--- @param opts table|nil { source_copy = a seed source's copy: its own
+---   hand-carried rows are not the target's }
+--- @return number removed Rows and lines dropped (a row re-filed counts one)
+function XrayMerge.pruneCarried(data, keep, hand, opts)
+    if type(data) ~= "table" or type(keep) ~= "function" then return 0 end
+    local XrayParser = require("koassistant.xray.xray_parser")
+    local mine = not (opts and opts.source_copy)
+    local removed = 0
+    local function isHand(name, aliases)
+        if type(hand) ~= "table" then return false end
+        if type(name) == "string" and hand[name:lower()] then return true end
+        for _idx, a in ipairs(type(aliases) == "table" and aliases or {}) do
+            if type(a) == "string" and hand[a:lower()] then return true end
+        end
+        return false
+    end
+    local function keptLines(bg)
+        if type(bg) ~= "table" then return bg end
+        local out = {}
+        for _idx, b in ipairs(bg) do
+            if type(b) ~= "table" or keep(b.file, b.source) then
+                out[#out + 1] = b
+            else
+                removed = removed + 1
+            end
+        end
+        if #out == #bg then return bg end
+        return #out > 0 and out or nil
+    end
+    for _idx, cat in ipairs(XrayParser.getCategories(data)) do
+        if type(cat.items) == "table" then
+            for _idx2, item in ipairs(cat.items) do
+                if type(item) == "table" and type(item.background) == "table"
+                        and not isHand(XrayParser.getItemName(item, cat.key), item.aliases) then
+                    item.background = keptLines(item.background)
+                end
+            end
+        end
+    end
+    local DK = XrayParser.DORMANT_KEY
+    local ledger = data[DK]
+    if type(ledger) == "table" then
+        local out = {}
+        for _idx, stub in ipairs(ledger) do
+            if type(stub) ~= "table" or (mine and (stub.by_hand or isHand(stub.name, stub.aliases))) then
+                out[#out + 1] = stub
+            elseif keep(stub.file, stub.source) then
+                stub.background = keptLines(stub.background)
+                out[#out + 1] = stub
+            else
+                removed = removed + 1
+                local lines = keptLines(stub.background)
+                if type(lines) == "table" and #lines > 0 then
+                    stub.background = lines
+                    stub.file, stub.source = lines[1].file, lines[1].source
+                    stub.description, stub.role = nil, nil
+                    out[#out + 1] = stub
+                end
+            end
+        end
+        if #out ~= #ledger or removed > 0 then data[DK] = #out > 0 and out or nil end
+    end
+    return removed
+end
+
+--- One book's share of the free carry made current (B536): what it may no
+--- longer hold goes, then the seed adds what its sources give, their copies
+--- pruned by the same rule first and a source the rule refuses skipped, so
+--- nothing it may not hold comes back in through a source that has not caught
+--- up yet. Before anything goes, the AI merges an earlier update dropped from
+--- the record are read back from the book's archived versions and
+--- checkpoints. Zero tokens. Writes only when something changed, through
+--- editLiveXray (the version before archived once per session, like every
+--- automatic seed).
+--- @param file string
+--- @param features table Settings features (the seed's consent)
+--- @param provider string|nil
+--- @param ui table|nil
+--- @param opts table|nil { memo (one run's shared reads), done (set: books
+---   already refreshed in this run, skipped and marked), explicit = a group
+---   change, a leave or a delete asked (after a mere write, a device that
+---   keeps no groups prunes nothing: its books may be another device's) }
+--- @return boolean written, boolean looked (the book has a carry to look at)
+function XrayMerge.refreshCarried(file, features, provider, ui, opts)
+    opts = opts or {}
+    if type(file) ~= "string" or file == "" then return false, false end
+    if opts.done then
+        if opts.done[file] then return false, false end
+        opts.done[file] = true
+    end
+    local ActionCache = require("koassistant.artifacts.action_cache")
+    local XrayParser = require("koassistant.xray.xray_parser")
+    local entry = ActionCache.getXrayCache(file)
+    if not (entry and entry.result and entry.source_mode ~= "ai_knowledge"
+            and XrayParser.isJSON(entry.result)) then
+        return false, false
+    end
+    local prune = opts.explicit or #require("koassistant.books.book_groups").all() > 0
+    local sources = XrayMerge.seedSources(file, features, provider, ui)
+    -- Nothing to seed from, and nothing carried or nothing to prune: nothing to read
+    if #sources == 0 and (not prune or (not entry.result:find('"__dormant"', 1, true)
+            and not entry.result:find('"background"', 1, true))) then
+        return false, false
+    end
+    local memo = opts.memo or {}
+    local own = XrayMerge.ledgerOf(entry)
+    local keep = XrayMerge.carryRule(file, { ui = ui, memo = memo, own = own })
+    local ok_h, hand = pcall(ActionCache.getPromotedStubs, file)
+    if not ok_h then hand = nil end
+    if prune then
+        local probe = XrayParser.parse(entry.result)
+        if probe and not probe.error and XrayMerge.pruneCarried(probe, keep, hand) > 0 then
+            local extra = {}
+            for _idx, getter in ipairs({ ActionCache.getXrayCheckpoints, ActionCache.getXrayLadder }) do
+                local ok_v, versions = pcall(getter, file)
+                for _j, v in ipairs(ok_v and type(versions) == "table" and versions or {}) do
+                    for _k, rec in ipairs(XrayMerge.ledgerOf(v)) do extra[#extra + 1] = rec end
+                end
+            end
+            if #extra > 0 then
+                keep = XrayMerge.carryRule(file, { ui = ui, memo = memo, own = own, own_extra = extra })
+            end
+        end
+    end
+    local usable = {}
+    for _idx, src in ipairs(sources) do
+        if keep(src.file, src.title) then
+            XrayMerge.pruneCarried(src.parsed, keep, nil, { source_copy = true })
+            usable[#usable + 1] = src
+        end
+    end
+    local skip = removedStubsFor(file)
+    local function apply(data)
+        local changed = prune and XrayMerge.pruneCarried(data, keep, hand) > 0 or false
+        for _idx, src in ipairs(usable) do
+            local added, refreshed = XrayMerge.populateDormant(data, nil, src.parsed,
+                src.title, src.file, nil, file, skip, true)
+            if added > 0 or (refreshed or 0) > 0 then changed = true end
+        end
+        return changed
+    end
+    local probe = XrayParser.parse(entry.result)
+    if not (probe and not probe.error and apply(probe)) then return false, true end
+    local ok = require("koassistant.xray.artifact_writeback").editLiveXray(file, apply, {
+        features = features,
+        limit = reseed_archived[file] and 0 or nil,
+    })
+    if ok then reseed_archived[file] = true end
+    return ok == true, true
+end
 
 return XrayMerge

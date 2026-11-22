@@ -10,13 +10,13 @@ end
 
 T:test("empty cells keep their positions and short rows keep their column count", function()
     local html = render("| A | B | C |\n| --- | :---: | ---: |\n| One || Three |\n| Only |", 32)
-    T:assertTrue(html:find('<td align="left">One</td><td align="center"></td><td align="right">Three</td>', 1, true) ~= nil)
-    T:assertTrue(html:find('<td align="left">Only</td><td align="center"></td><td align="right"></td>', 1, true) ~= nil)
+    T:assertTrue(html:find('<td style="text-align:left">One</td><td style="text-align:center"></td><td style="text-align:right">Three</td>', 1, true) ~= nil)
+    T:assertTrue(html:find('<td style="text-align:left">Only</td><td style="text-align:center"></td><td style="text-align:right"></td>', 1, true) ~= nil)
 end)
 
 T:test("escaped pipes and code spans stay in their own cells", function()
     local html = render("| A | B |\n| --- | --- |\n| a\\|b | `c|d` |", 32)
-    T:assertTrue(html:find('<td align="left">a|b</td><td align="left">`c|d`</td>', 1, true) ~= nil)
+    T:assertTrue(html:find('<td style="text-align:left">a|b</td><td style="text-align:left">`c|d`</td>', 1, true) ~= nil)
 end)
 
 T:test("layout adapts to viewport width and long tokens", function()
@@ -38,7 +38,7 @@ end)
 
 T:test("header-only tables and the paragraph after a table stay visible", function()
     local html = render("| A | B |\n| --- | --- |\n\nAfter the table.", 10)
-    T:assertTrue(html:find("<p>A</p><p>B</p>", 1, true) ~= nil)
+    T:assertTrue(html:find('<p class="koa-table-cell">A</p><p class="koa-table-cell">B</p>', 1, true) ~= nil)
     T:assertTrue(html:find("After the table.", 1, true) ~= nil)
 end)
 

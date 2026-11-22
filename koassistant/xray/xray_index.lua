@@ -17,10 +17,16 @@ book read on two devices brings the other device's layouts by sync, B505).
 
 File <sidecar>/koassistant_xray_index.lua:
   { version = VERSION, layouts = { { stamp = "<rendering hash>:<pages>:<size>",
-    forms = { [form] = "<page delta>:<offset>.<offset>,..." } }, ... } }
+    forms = { [form] = "<page delta>:<offset>.<offset>m<caps>us,..." } }, ... } }
 Offsets are byte starts in that page's normalized text, so an entity's
 occurrences (union of its forms, minus containment) are exact at query time,
-the same rule as XrayParser.occurrencesIn.
+the same rule as XrayParser.occurrencesIn. "m<caps>" after an offset is that
+occurrence's XrayParser.capsMask (which of its words start with a capital),
+written only when not every word does, so a name set to capitals only
+(B533 S2) is counted at query time without a new pass; "u" marks an
+occurrence written in capitals and "s" one that starts a sentence, so the
+automatic capitals (S3: autoCaps) read how the book writes a name with no
+new pass either.
 ]]
 
 local UIManager = require("ui/uimanager")
@@ -33,8 +39,12 @@ local XrayIndex = {}
 
 XrayIndex.FILE = "koassistant_xray_index.lua"
 -- Bumped whenever the matcher finds different spans for the same form, so
--- a stored index is found again (2: Arabic matches start a word, B339)
-local VERSION = 2
+-- a stored index is found again (2: Arabic matches start a word, B339;
+-- 3: each occurrence's capitals, B533 S2; 4: written in capitals, a
+-- sentence start, B533 S3; 5: typeset apostrophes and hyphens folded to
+-- the typed ones, B596; 6: the word boundary applies to Vietnamese, the
+-- Indic scripts and Hebrew, the sweep of 2026-11-06)
+local VERSION = 6
 local MAX_LAYOUTS = 4
 -- A background request waits this long (debounced) before its pass starts:
 -- the book's own opening work and the first page turns go first
@@ -141,6 +151,41 @@ function XrayIndex.layout(file, stamp)
     return nil
 end
 
+--- The stored layouts of the book file as it is now: a stamp ends with the
+--- file's size (XrayIndex.stamp), and every layout of that file reads the
+--- same text; one from an earlier version of the file (replaced, generated
+--- again) reads another text and is left out.
+function XrayIndex.currentLayouts(file)
+    local out = {}
+    local data = XrayIndex.load(file)
+    local size = data and lfs.attributes(file, "size")
+    if not size then return out end
+    local tail = ":" .. tostring(size)
+    for _i, l in ipairs(data.layouts) do
+        if type(l.stamp) == "string" and type(l.forms) == "table" and l.stamp:sub(-#tail) == tail then
+            out[#out + 1] = l
+        end
+    end
+    return out
+end
+
+--- Among `layouts` (one layout, or a list newest first as currentLayouts
+--- gives them) the first holding every form of `forms`, or nil. New forms
+--- are stored in the layout in use only, so a name indexed after a font or
+--- orientation change is held by the newest layout alone: each name is
+--- judged on a layout that has it, never on the one with the most forms
+--- (B597).
+function XrayIndex.layoutHolding(layouts, forms)
+    if type(layouts) ~= "table" then return nil end
+    if type(layouts.forms) == "table" then layouts = { layouts } end
+    for _i, layout in ipairs(layouts) do
+        if type(layout) == "table" and type(layout.forms) == "table" and #XrayIndex.missing(layout, forms) == 0 then
+            return layout
+        end
+    end
+    return nil
+end
+
 --- Forms of `forms` (array or set) the layout does not hold.
 function XrayIndex.missing(layout, forms)
     local out = {}
@@ -241,6 +286,36 @@ local function formKey(form)
     return best
 end
 
+--- Where each paragraph of a page starts in its normalized text (B533 S3):
+--- crengine separates paragraphs with "\n", which matchNormalize folds into
+--- a space, so each line is normalized on its own and the lengths added up
+--- the way the whole text folds (a run of spaces across a break is one
+--- space). nil when the sum misses the whole: that page's paragraphs are
+--- then unknown. Pure.
+--- @param text string the page's text
+--- @param norm_len number #XrayParser.matchNormalize(text)
+--- @return table|nil ascending byte offsets
+function XrayIndex.paragraphStarts(text, norm_len)
+    local starts, len, space, first = {}, 0, false, true
+    for line in (text .. "\n"):gmatch("([^\n]*)\n") do
+        -- the break itself is a space in the folded text
+        if not first and not space then
+            len = len + 1
+            space = true
+        end
+        first = false
+        local n = XrayParser.matchNormalize(line)
+        if space and n:sub(1, 1) == " " then n = n:sub(2) end
+        if n ~= "" then
+            starts[#starts + 1] = len + 1
+            len = len + #n
+            space = n:sub(-1) == " "
+        end
+    end
+    if len ~= norm_len then return nil end
+    return starts
+end
+
 --- One pass over pages [first, last]: each page's text, normalized once,
 --- every form's occurrences recorded. Pure against the document (runs in the
 --- background child, in a Trapper subprocess, or in process for a span).
@@ -259,9 +334,43 @@ function XrayIndex.scan(document, forms, first, last)
         unkeyed = forms
     end
     local enc, lastp = {}, {}
+    -- The page's text with its capitals, and where its paragraphs start, read
+    -- once a form is found on it
+    local text, norm, keep, starts
+    local all_caps = {}
+    local function initial(s)
+        if starts == nil then starts = XrayIndex.paragraphStarts(text, #norm) or false end
+        local from = 1
+        for _i, st in ipairs(starts or {}) do
+            if st > s then break end
+            from = st
+        end
+        -- the words before it in its paragraph (the last few are enough)
+        return XrayParser.startsSentence(keep:sub(math.max(from, s - 64), s - 1))
+    end
+    local function capsSuffix(f, sp)
+        keep = keep or XrayParser.alignedKeepCase(text, norm)
+        local seg = keep:sub(sp[1], sp[2])
+        local out = ""
+        -- Bytes the fold changed in length: unreadable, counted capitalized
+        if XrayParser.foldCase(seg) == norm:sub(sp[1], sp[2]) then
+            local m = XrayParser.capsMask(seg)
+            local full = all_caps[f]
+            if not full then
+                local n = 0
+                for _w in f:gmatch("[^ ]+") do n = n + 1 end
+                full = 2 ^ n - 1
+                all_caps[f] = full
+            end
+            if m ~= full then out = "m" .. m end
+            if XrayParser.allCaps(seg) then out = out .. "u" end
+        end
+        if initial(sp[1]) then out = out .. "s" end
+        return out
+    end
     local function record(f, p, spans)
         local offs = {}
-        for k, sp in ipairs(spans) do offs[k] = sp[1] end
+        for k, sp in ipairs(spans) do offs[k] = sp[1] .. capsSuffix(f, sp) end
         local list = enc[f]
         if not list then
             list = {}
@@ -278,10 +387,11 @@ function XrayIndex.scan(document, forms, first, last)
         else
             nxp = require("koassistant.request.context_extractor").documentEndXPointer(document, total)
         end
-        local text = (xp and nxp) and document:getTextFromXPointers(xp, nxp) or ""
+        text = (xp and nxp) and document:getTextFromXPointers(xp, nxp) or ""
+        keep, starts = nil, nil
         xp = nxp
         if text ~= "" then
-            local norm = XrayParser.matchNormalize(text)
+            norm = XrayParser.matchNormalize(text)
             if #keyed > 0 then
                 local words = {}
                 for w in norm:gmatch("%w+") do words[w] = true end
@@ -307,8 +417,11 @@ end
 
 -- ── Queries ──────────────────────────────────────────────────────────────
 
---- A form's stored occurrences: { pages = ascending, offs = { [page] = {...} } }
---- (memoized on the layout), or nil when the form is not indexed.
+--- A form's stored occurrences: { pages = ascending, offs = { [page] = {...} },
+--- caps = { [page] = { [k] = capsMask } } for the occurrences not every word
+--- of which starts with a capital, flags = { [page] = { [k] = "u"|"s"|"us" } }
+--- (written in capitals, a sentence start) } (memoized on the layout), or
+--- nil when the form is not indexed.
 function XrayIndex.decode(layout, form)
     local memo = layout._decoded
     if not memo then
@@ -319,16 +432,29 @@ function XrayIndex.decode(layout, form)
     if hit then return hit end
     local enc = layout.forms[form]
     if type(enc) ~= "string" then return nil end
-    local pages, offs = {}, {}
+    local pages, offs, caps, flags = {}, {}, {}, {}
     local page = 0
-    for d, list in enc:gmatch("(%d+):([%d%.]+)") do
+    for d, list in enc:gmatch("(%d+):([%d%.msu]+)") do
         page = page + tonumber(d)
         pages[#pages + 1] = page
         local o = {}
-        for n in list:gmatch("%d+") do o[#o + 1] = tonumber(n) end
+        for entry in list:gmatch("[^%.]+") do
+            local n, m, f = entry:match("^(%d+)m?(%d*)([us]*)$")
+            if n then
+                o[#o + 1] = tonumber(n)
+                if m ~= "" then
+                    caps[page] = caps[page] or {}
+                    caps[page][#o] = tonumber(m)
+                end
+                if f ~= "" then
+                    flags[page] = flags[page] or {}
+                    flags[page][#o] = f
+                end
+            end
+        end
         offs[page] = o
     end
-    hit = { pages = pages, offs = offs }
+    hit = { pages = pages, offs = offs, caps = caps, flags = flags }
     memo[form] = hit
     return hit
 end
@@ -346,14 +472,22 @@ function XrayIndex.covers(layout, set, handles)
 end
 
 -- Occurrence count of one entity on one page from stored offsets: the union
--- and containment rule of XrayParser.occurrencesIn
+-- and containment rule of XrayParser.occurrencesIn, and a form of a name set
+-- to capitals only counted where the occurrence has its capitals (B533 S2)
 local function countOnPage(layout, set, handles, p)
     local spans = {}
     for _i, f in ipairs(set.all) do
         local d = XrayIndex.decode(layout, f)
         local list = d and d.offs[p]
         if list then
-            for _k, o in ipairs(list) do spans[#spans + 1] = { o, o + #f - 1, f } end
+            local req = set.caps and set.caps[f]
+            local masks = req and d.caps[p]
+            for k, o in ipairs(list) do
+                local m = masks and masks[k]
+                if not m or XrayParser.capsPass(m, req) then
+                    spans[#spans + 1] = { o, o + #f - 1, f }
+                end
+            end
         end
     end
     if #spans == 0 then return 0 end
@@ -407,6 +541,42 @@ function XrayIndex.entityPages(layout, set, handles, first, last)
     return counts, total
 end
 
+--- The first and the last page one entity is written on within [first, last]
+--- (both optional): what an entry page's "First appears" and "Last seen" read
+--- (B748). The candidate pages are walked from both ends, so a name on
+--- hundreds of pages costs two page counts, not hundreds.
+--- @return number|nil first_page, number|nil last_page, boolean indexed
+---   (false: a form is not in this layout; true with nil pages: never written
+---   in that range)
+function XrayIndex.firstLast(layout, set, handles, first, last)
+    if not XrayIndex.covers(layout, set, handles) then return nil, nil, false end
+    local seen, pages = {}, {}
+    for _i, f in ipairs(set.all) do
+        for _k, p in ipairs(XrayIndex.decode(layout, f).pages) do
+            if (not first or p >= first) and (not last or p <= last) and not seen[p] then
+                seen[p] = true
+                pages[#pages + 1] = p
+            end
+        end
+    end
+    table.sort(pages)
+    local lo, hi
+    for i = 1, #pages do
+        if countOnPage(layout, set, handles, pages[i]) > 0 then
+            lo = pages[i]
+            break
+        end
+    end
+    if not lo then return nil, nil, true end
+    for i = #pages, 1, -1 do
+        if countOnPage(layout, set, handles, pages[i]) > 0 then
+            hi = pages[i]
+            break
+        end
+    end
+    return lo, hi, true
+end
+
 --- The entity's nearest page before `before` with an occurrence: a page
 --- number, nil when there is none, false when a form is not indexed.
 function XrayIndex.prevPage(layout, set, handles, before)
@@ -439,6 +609,141 @@ function XrayIndex.prevPage(layout, set, handles, before)
             while ptr[i] > 0 and pages[ptr[i]] >= best do ptr[i] = ptr[i] - 1 end
         end
     end
+end
+
+--- How the book writes one name (B533 S3): P, the occurrences mid-sentence
+--- with every capital the name requires, and L, those with none of them
+--- (XrayParser.capsEvidence: a sentence start and text in capitals prove
+--- nothing). Each occurrence once (the name's forms overlapping are one, the
+--- widest read), none inside another entry's longer name. nil when a form is
+--- not indexed.
+--- @param set table XrayParser.matchTermSet of the name, every form with the
+---   capitals it requires (set.caps)
+--- @param handles table|nil containing forms (XrayParser.containingMatchHandles)
+--- @return number|nil P, number L
+function XrayIndex.capsEvidence(layout, set, handles)
+    if not (set and set.caps) or not XrayIndex.covers(layout, set, handles) then return nil end
+    local words = {}
+    for _i, f in ipairs(set.all) do
+        local n = 0
+        for _w in f:gmatch("[^ ]+") do n = n + 1 end
+        words[f] = n
+    end
+    local pages = {}
+    for _i, f in ipairs(set.all) do
+        for _k, p in ipairs(XrayIndex.decode(layout, f).pages) do pages[p] = true end
+    end
+    local P, L = 0, 0
+    for p in pairs(pages) do
+        local spans = {}
+        for _i, f in ipairs(set.all) do
+            local d = XrayIndex.decode(layout, f)
+            local list = d.offs[p]
+            if list then
+                local masks, flags = d.caps[p], d.flags[p]
+                for k, o in ipairs(list) do
+                    spans[#spans + 1] = { o, o + #f - 1, f, masks and masks[k], flags and flags[k] or "" }
+                end
+            end
+        end
+        if handles and #handles > 0 then
+            local ex = {}
+            for _i, h in ipairs(handles) do
+                local list = XrayIndex.decode(layout, h).offs[p]
+                for _k, o in ipairs(list or {}) do ex[#ex + 1] = { o, o + #h - 1 } end
+            end
+            if #ex > 0 then
+                local kept = {}
+                for _i, sp in ipairs(spans) do
+                    local inside = false
+                    for _k, x in ipairs(ex) do
+                        if sp[1] >= x[1] and sp[2] <= x[2] then
+                            inside = true
+                            break
+                        end
+                    end
+                    if not inside then kept[#kept + 1] = sp end
+                end
+                spans = kept
+            end
+        end
+        -- widest first at each start; a span inside the last one read is that one
+        table.sort(spans, function(a, b)
+            if a[1] ~= b[1] then return a[1] < b[1] end
+            return a[2] > b[2]
+        end)
+        local reach = 0
+        for _i, sp in ipairs(spans) do
+            if sp[1] > reach then
+                local req = set.caps[sp[3]]
+                local mask = sp[4] or (2 ^ words[sp[3]] - 1)
+                local ev = req and XrayParser.capsEvidence(req, mask, sp[5]:find("s", 1, true) ~= nil,
+                    sp[5]:find("u", 1, true) ~= nil)
+                if ev == "P" then P = P + 1 elseif ev == "L" then L = L + 1 end
+            end
+            if sp[2] > reach then reach = sp[2] end
+        end
+    end
+    return P, L
+end
+
+--- The names this book's own usage sets to capitals only (B533 S3, the
+--- automatic default): each name and alias of the matchable entries and of
+--- the carried rows, judged on its own (its forms requiring its capitals,
+--- the containing names of the X-Ray's entries left out, as the counts
+--- do) and set when XrayParser.autoCapsSwitch holds. A name of two
+--- characters or fewer, one with no capital, one never written without one
+--- and one a form of which is not indexed yet are not judged; a main name
+--- the reader set to not matched neither. Pure against the layouts.
+--- @param layouts table a stored layout ({ forms }), or a list of them newest
+---   first (currentLayouts): each name is judged on the first holding all its
+---   forms (layoutHolding, B597)
+--- @param data table parsed X-Ray, the reader's names merged (mergeUserAliases)
+--- @param judged table|nil the names (lowered) judged already, skipped here and
+---   added to: one judgement per name across the live X-Ray and the next
+---   checkpoint (ActionCache.autoCaps)
+--- @return table { [name lowered] = true }
+function XrayIndex.autoCaps(layouts, data, judged)
+    local out = {}
+    judged = judged or {}
+    if type(layouts) == "table" and type(layouts.forms) == "table" then layouts = { layouts } end
+    if not (type(layouts) == "table" and #layouts > 0 and type(data) == "table") then return out end
+    local function judge(name, entry)
+        if type(name) ~= "string" or #name <= 2 then return end
+        local low = name:lower()
+        if judged[low] then return end
+        judged[low] = true
+        local set = XrayParser.matchTermSet({ name = name, _caps = { [low] = true } })
+        if not (set and set.caps) then return end
+        -- the layout that holds every form of this name (B597)
+        local layout = XrayIndex.layoutHolding(layouts, set.all)
+        if not layout then return end
+        -- written with every capital everywhere: nothing to learn (most names)
+        local lower_seen = false
+        for _i, f in ipairs(set.all) do
+            if next(XrayIndex.decode(layout, f).caps) then lower_seen = true end
+        end
+        if not lower_seen then return end
+        local p, l = XrayIndex.capsEvidence(layout, set, XrayParser.containingMatchHandles(data, entry))
+        if p and XrayParser.autoCapsSwitch(p, l) then out[low] = true end
+    end
+    for _idx, cat in ipairs(XrayParser.getCategories(data) or {}) do
+        if not XrayParser.TEXT_MATCH_EXCLUDED[cat.key] then
+            for _j, item in ipairs(cat.items or {}) do
+                if type(item) == "table" then
+                    if not item._name_off then judge(XrayParser.getItemName(item, cat.key), item) end
+                    for _k, a in ipairs(type(item.aliases) == "table" and item.aliases or {}) do judge(a, item) end
+                end
+            end
+        end
+    end
+    for _idx, stub in ipairs(type(data[XrayParser.DORMANT_KEY]) == "table" and data[XrayParser.DORMANT_KEY] or {}) do
+        if type(stub) == "table" then
+            judge(stub.name, stub)
+            for _k, a in ipairs(type(stub.aliases) == "table" and stub.aliases or {}) do judge(a, stub) end
+        end
+    end
+    return out
 end
 
 -- ── Background and foreground passes ────────────────────────────────────
@@ -558,7 +863,10 @@ startPass = function()
     logger.dbg("KOAssistant XrayIndex: background pass for", #missing, "forms")
     local chunk_size = 65536
     local chunk = ffi.new("char[?]", chunk_size)
-    local pointer = ffi.cast("void*", chunk)
+    -- The reads below take the buffer itself: a pointer cast from it keeps
+    -- nothing alive, and the poll runs long after this function returned,
+    -- when the buffer's own variable is gone and LuaJIT may have freed it
+    -- (the child's bytes then land in memory that is in use: B769)
     local parts = {}
     local function finish()
         ffi.C.close(read_fd)
@@ -593,18 +901,18 @@ startPass = function()
         while true do
             local available = ffiutil.getNonBlockingReadSize(read_fd) or 0
             if available > 0 then
-                local bytes = tonumber(ffi.C.read(read_fd, pointer, chunk_size))
+                local bytes = tonumber(ffi.C.read(read_fd, chunk, chunk_size))
                 if bytes and bytes > 0 then
-                    parts[#parts + 1] = ffi.string(pointer, bytes)
+                    parts[#parts + 1] = ffi.string(chunk, bytes)
                 else
                     finish()
                     return
                 end
             elseif ffiutil.isSubProcessDone(pid) then
                 while true do
-                    local bytes = tonumber(ffi.C.read(read_fd, pointer, chunk_size))
+                    local bytes = tonumber(ffi.C.read(read_fd, chunk, chunk_size))
                     if not bytes or bytes <= 0 then break end
-                    parts[#parts + 1] = ffi.string(pointer, bytes)
+                    parts[#parts + 1] = ffi.string(chunk, bytes)
                 end
                 finish()
                 return
@@ -689,8 +997,7 @@ function XrayIndex.buildNow(ui, forms, opts)
             return { stamp = stamp, forms = XrayIndex.scan(doc, forms, span[1], span[2]), span = span }
         end
         local Trapper = require("ui/trapper")
-        local InfoMessage = require("ui/widget/infomessage")
-        local info = InfoMessage:new{ text = _("Finding the X-Ray names in this section… (tap to cancel)") }
+        local info = require("koassistant.ui.waiting").message{ text = _("Finding the X-Ray names in this section… (tap to cancel)") }
         UIManager:show(info)
         UIManager:forceRePaint()
         UIManager:unschedule(startPass)
@@ -716,8 +1023,7 @@ function XrayIndex.buildNow(ui, forms, opts)
     if running and running.file == file then XrayIndex.stop() end
     UIManager:unschedule(startPass)
     local Trapper = require("ui/trapper")
-    local InfoMessage = require("ui/widget/infomessage")
-    local info = InfoMessage:new{ text = _("Finding the X-Ray names in the book… (tap to cancel)") }
+    local info = require("koassistant.ui.waiting").message{ text = _("Finding the X-Ray names in the book… (tap to cancel)") }
     UIManager:show(info)
     UIManager:forceRePaint()
     local started = os.time()

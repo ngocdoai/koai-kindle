@@ -145,6 +145,10 @@ local function diskStamps(ActionCache, file)
   local lpath = ActionCache.getXrayLadderPath and ActionCache.getXrayLadderPath(file)
   local lattr = lpath and lfs.attributes(lpath)
   parts[#parts + 1] = lattr and (tostring(lattr.modification) .. ":" .. tostring(lattr.size)) or "-"
+  -- the names the book's usage sets to capitals only (B533 S3), which change
+  -- when the name index learns the book
+  local _auto, auto_sig = ActionCache.autoCaps(file)
+  parts[#parts + 1] = auto_sig
   return table.concat(parts, "|")
 end
 
@@ -172,11 +176,15 @@ local function onNameIndexReady()
   if not st then return end
   st.index_rev = (st.index_rev or 0) + 1
   st.page_memo, st.page_memo_order = nil, nil
-  -- The spacing may now hide marks already drawn: repaint the whole page
+  -- The spacing may now hide marks already drawn, and what the index learned
+  -- may set names to capitals only (B533 S3), at any spacing: repaint the
+  -- whole page
   st.full_refresh = true
   local plugin = st.plugin
   local ui = plugin and plugin.ui
-  if st.spacing and st.spacing > 1 and ui and ui.document then
+  local _auto, auto_sig = require("koassistant.artifacts.action_cache").autoCaps(st.file)
+  local caps_changed = auto_sig ~= st.auto_sig
+  if ((st.spacing and st.spacing > 1) or caps_changed) and ui and ui.document then
     local okp, pg = pcall(ui.document.getCurrentPage, ui.document)
     if okp and pg then XrayMarks.onPageTurn(plugin, pg) end
   end
@@ -184,6 +192,118 @@ end
 
 --- Reload disk state on stamp change, re-pick the artifacts, rebuild the
 --- entity index when the pick changed. Cheap when nothing moved.
+-- The word runs of a form: every substring from a word's start to a word's
+-- end (the matcher's word test, XrayParser._isWordCharAt), shorter than the
+-- form; a term equal to one of them sits in the form at word boundaries.
+local function wordRuns(form, XrayParser)
+  local starts, ends = {}, {}
+  local i, n = 1, #form
+  local in_word = false
+  while i <= n do
+    local b = form:byte(i)
+    local len = (b < 0x80 and 1) or (b >= 0xF0 and 4) or (b >= 0xE0 and 3) or (b >= 0xC0 and 2) or 1
+    if XrayParser._isWordCharAt(form, i, false) then
+      if not in_word then
+        starts[#starts + 1] = i
+        in_word = true
+      end
+      ends[#starts] = math.min(i + len - 1, n)
+    else
+      in_word = false
+    end
+    i = i + len
+  end
+  local runs = {}
+  for a = 1, #starts do
+    for e = a, #starts do
+      if not (a == 1 and e == #starts) then
+        runs[#runs + 1] = form:sub(starts[a], ends[e])
+      end
+    end
+  end
+  return runs
+end
+
+-- Whether a term starts and ends with a word character (its match in a
+-- form then starts at a word's start and ends at a word's end)
+local function wordEdged(term, XrayParser)
+  if term == "" or not XrayParser._isWordCharAt(term, 1, false) then return false end
+  local last = #term
+  while last > 1 and term:byte(last) >= 0x80 and term:byte(last) < 0xC0 do last = last - 1 end
+  return XrayParser._isWordCharAt(term, last, false)
+end
+
+-- Cross-entity containment (B266), hashed (the sweep of 2026-11-06): every
+-- word run of every form maps to the entities holding it, so a term looks
+-- up its candidates instead of meeting every other entity's every form
+-- (2,000 entities: 215 ms became 5 ms on the bench; the pass runs at every
+-- rebuild of the index, on the UI thread). A term of a script the matcher
+-- reads without word boundaries (CJK, Thai, Arabic) or one not edged by
+-- word characters keeps the substring walk over every form; the test of a
+-- candidate is the pairwise pass's own. Writes `longer` (the entities whose
+-- forms contain one of this entity's minimal terms, ascending) and
+-- `handles` (those forms, sorted) on each entity.
+local function containment(ents, XrayParser)
+  local map = {}
+  for j, b in ipairs(ents) do
+    if b.set then
+      for _tb, tb in ipairs(b.set.all) do
+        for _r, run in ipairs(wordRuns(tb, XrayParser)) do
+          local list = map[run]
+          if not list then
+            list = {}
+            map[run] = list
+          end
+          list[#list + 1] = { j, tb }
+        end
+      end
+    end
+  end
+  for i, a in ipairs(ents) do
+    local longer, handles, seen_j, seen_h
+    if a.set then
+      for _ta, ta in ipairs(a.set.minimal) do
+        local candidates
+        if XrayParser._skipBoundaryCheck(ta) or not wordEdged(ta, XrayParser) then
+          candidates = nil  -- every form
+        else
+          candidates = map[ta] or {}
+        end
+        local function consider(j, tb)
+          if j ~= i and #tb > #ta and tb:find(ta, 1, true)
+              and XrayParser.handleContainsWord(tb, ta) then
+            if not (seen_j and seen_j[j]) then
+              seen_j = seen_j or {}
+              seen_j[j] = true
+              longer = longer or {}
+              longer[#longer + 1] = j
+            end
+            if not (seen_h and seen_h[tb]) then
+              seen_h = seen_h or {}
+              seen_h[tb] = true
+              handles = handles or {}
+              handles[#handles + 1] = tb
+            end
+          end
+        end
+        if candidates then
+          for _c, c in ipairs(candidates) do consider(c[1], c[2]) end
+        else
+          for j, b in ipairs(ents) do
+            if j ~= i and b.set then
+              for _tb, tb in ipairs(b.set.all) do consider(j, tb) end
+            end
+          end
+        end
+      end
+    end
+    if longer then table.sort(longer) end
+    if handles then table.sort(handles) end
+    a.longer = longer
+    a.handles = handles
+  end
+end
+
 local function ensureIndex(plugin, pageno)
   local ActionCache = require("koassistant.artifacts.action_cache")
   -- The page count joins the stamps: a font, margin or rotation change moves
@@ -213,7 +333,7 @@ local function ensureIndex(plugin, pageno)
     -- Point-4 identification peek: the newest built checkpoint AHEAD of the
     -- live artifact joins the index, so entities that first appear past the
     -- installed coverage get marked (and card-identified) when the reader
-    -- meets them. Full entries stay position-gated in the card router.
+    -- meets them. Full entries wait behind the card's confirm (the card router).
     -- P5: the Upcoming Entities setting stands the peek down (default on);
     -- with it off the key drops its "|ahead:" part, so a flip rebuilds the
     -- index on the next sync/scan by itself. Round 3: book override > global
@@ -277,7 +397,9 @@ local function ensureIndex(plugin, pageno)
   key = key .. "|group:" .. group_stamp
   if st.artifact_key == key and st.entities then return end
   local XrayParser = require("koassistant.xray.xray_parser")
-  local user_aliases = ActionCache.getUserAliases(st.file)
+  -- the reader's names and the automatic capitals (B533 S3); a group book's
+  -- entities keep their own book's (ActionCache.parsedXrayFor)
+  local user_aliases = ActionCache.matchOverlay(st.file)
   local ents = {}
   local seen_names, seen_terms = {}, {}
   -- First writer wins by IDENTITY within a family, not by name alone (#90
@@ -367,39 +489,12 @@ local function ensureIndex(plugin, pageno)
   -- theirs) and the containing forms (`handles`: the name index applies the
   -- same rule to the spacing). Index-time only, so the per-turn scan pays
   -- nothing for it.
-  for i, a in ipairs(ents) do
-    local longer, handles, seen_h
-    if a.set then
-      for j, b in ipairs(ents) do
-        if i ~= j and b.set then
-          local hit = false
-          for _tb, tb in ipairs(b.set.all) do
-            for _ta, ta in ipairs(a.set.minimal) do
-              if #tb > #ta and tb:find(ta, 1, true)
-                  and XrayParser.handleContainsWord(tb, ta) then
-                hit = true
-                seen_h = seen_h or {}
-                if not seen_h[tb] then
-                  seen_h[tb] = true
-                  handles = handles or {}
-                  handles[#handles + 1] = tb
-                end
-                break
-              end
-            end
-          end
-          if hit then
-            longer = longer or {}
-            longer[#longer + 1] = j
-          end
-        end
-      end
-    end
-    a.longer = longer
-    a.handles = handles
-  end
+  containment(ents, XrayParser)
   st.entities = #ents > 0 and ents or nil
   st.artifact_key = key
+  -- the automatic capitals these entities were built with (onNameIndexReady)
+  local _auto, auto_sig = ActionCache.autoCaps(st.file)
+  st.auto_sig = auto_sig
   st.page_memo, st.page_memo_order = nil, nil
   -- The per-book name index behind the spacing (and Chapter Appearances):
   -- every form of every marked entity, found in the background
@@ -531,9 +626,20 @@ local function computeMarks(state, ui, pageno, last, stamp, dbg)
   if not pieces or #pieces == 0 then return {} end
   local ranges = {}
   for k, pc in ipairs(pieces) do ranges[k] = pc.range or false end
+  -- The run with its capitals, when a name on it is set to capitals only
+  -- (B533 S2): the walk's pieces again, through the builder's unfolded twin
+  local keep
+  for _k, i in ipairs(candidates) do
+    if state.entities[i].set.caps then
+      local kb = XrayParser.newPieceNormalizer(true)
+      for _q, pc in ipairs(pieces) do kb.add(pc.text) end
+      keep = kb.result()
+      break
+    end
+  end
   local occ_by = {}
   for _k, i in ipairs(candidates) do
-    local occ = XrayParser.occurrencesIn(norm, state.entities[i].set, nil)
+    local occ = XrayParser.occurrencesIn(norm, state.entities[i].set, nil, keep)
     if #occ > 0 then occ_by[i] = occ end
   end
   -- B266: an occurrence strictly inside a longer entity's occurrence is that
@@ -638,6 +744,12 @@ end
 -- Test seam: the headless probes and unit tests drive the page matcher
 -- with a hand-built state (entities, spacing, families, file)
 XrayMarks._computeMarks = computeMarks
+XrayMarks._containment = containment  -- the hashed pass, checked against the pairwise one in tests
+
+-- Test seam: the headless scenarios read the visible page's marks
+function XrayMarks._pageMarks()
+  return st and st.page_marks
+end
 
 --- One deferred scan step: the visible page's marks (memoized for the last
 --- few pages), then ONE partial refresh sized to the strips — a mark-free
@@ -660,7 +772,13 @@ function XrayMarks._scanTick(plugin, pageno, token)
     local time = require("ui/time")
     local t0 = time.now()
     ensureIndex(plugin, pageno)
-    if not st.entities or #st.entities == 0 then return end
+    if not st.entities or #st.entities == 0 then
+      -- Nothing to mark (an X-Ray deleted under the page, refresh): what
+      -- was drawn goes
+      if st.paint_boxes and ui.dialog then UIManager:setDirty(ui.dialog, "ui") end
+      st.page_marks, st.paint_boxes, st.full_refresh = nil, nil, nil
+      return
+    end
     local idx_ms = time.to_ms(time.now() - t0)
     local doc = ui.document
     local total = doc.info and doc.info.number_of_pages or pageno
@@ -694,6 +812,9 @@ function XrayMarks._scanTick(plugin, pageno, token)
     if #marks > 0 then
       st.page_marks = dedupeMarks(marks)
       st.paint_boxes = mergeLineBoxes(st.page_marks)
+    else
+      -- (a refresh keeps the old marks drawn until here)
+      st.page_marks, st.paint_boxes = nil, nil
     end
     -- Timing line (the device-slowness arbiter): dbg level, and COUNTS,
     -- never the entity names (book content stays out of crash.log)
@@ -815,6 +936,29 @@ function XrayMarks.tapTarget(plugin, ges)
   return nil
 end
 
+--- The X-Ray changed under the open page (a name added, renamed or set to
+--- capitals, an entry merged or deleted, a write): the index reloads and the
+--- page scans again, the marks drawn staying until the new ones land (one
+--- repaint, no blink). Nothing while the marks are off: sync's teardown
+--- would stop the name index's background pass, which Mentions and Chapter
+--- Appearances may have queued.
+function XrayMarks.refresh(plugin)
+  local ui = plugin and plugin.ui
+  if not (st and ui and ui.document and ui.rolling and ui.document.file == st.file) then return end
+  st.stamps = nil
+  st.artifact_key = nil
+  st.page_memo, st.page_memo_order = nil, nil
+  st.full_refresh = true
+  local okp, pageno = pcall(ui.document.getCurrentPage, ui.document)
+  if not (okp and pageno) then return end
+  -- (a search session or the scroll view: the tick stands down itself)
+  st.scan_token = (st.scan_token or 0) + 1
+  local token = st.scan_token
+  UIManager:scheduleIn(SCAN_SETTLE_S, function()
+    XrayMarks._scanTick(plugin, pageno, token)
+  end)
+end
+
 --- Install/refresh/remove per settings + book state. Call on reader ready,
 --- setting changes, and whenever a surface wants marks to reflect NOW.
 function XrayMarks.sync(plugin)
@@ -830,7 +974,10 @@ function XrayMarks.sync(plugin)
   local eligible = marking.enabled
       and ui and ui.document and ui.rolling and ui.view
   if not eligible then
-    XrayMarks.teardown(plugin)
+    -- the marks stand down (a search, a settings row): the name index's
+    -- background pass is the book's and goes on, the Mentions and Chapter
+    -- Appearances views read it (the sweep of 2026-11-06)
+    XrayMarks.teardown(plugin, { keep_index = true })
     return
   end
 
@@ -882,12 +1029,15 @@ function XrayMarks.sync(plugin)
   end
 end
 
-function XrayMarks.teardown(plugin)
+function XrayMarks.teardown(plugin, opts)
   local ui = plugin and plugin.ui
   local was_painting = st and st.paint_boxes
   st = nil
-  -- The background name-index pass belongs to the open book's marks
-  require("koassistant.xray.xray_index").stop(true)
+  -- The background name-index pass goes with the book (a close), not with
+  -- the marks alone (opts.keep_index: sync's stand-down)
+  if not (opts and opts.keep_index) then
+    require("koassistant.xray.xray_index").stop(true)
+  end
   if ui and ui.view and ui.view.view_modules
       and ui.view.view_modules[MODULE_NAME] then
     ui.view.view_modules[MODULE_NAME] = nil

@@ -166,6 +166,79 @@ function ScopeResolver.utf8FirstBad(s)
     end
 end
 
+--- A character outside the Basic Multilingual Plane (an emoji, a rare CJK
+--- character, a mathematical letter) that a provider's JSON wrote as an
+--- escape pair (\uD83D\uDD0D) comes out of KOReader's JSON decoder as two
+--- three-byte halves: the decoder (common/json/decode/strings.lua) turns each
+--- \uXXXX into its own sequence and knows no pairs. The result is invalid
+--- UTF-8: six replacement characters on screen, saved so in the chat, and
+--- dropped at the next send. The two halves are joined into the one
+--- four-byte character; a half with no partner stays as it is (the request
+--- encoder drops it). One find for a string that holds none.
+--- @param s any
+--- @return any the string repaired, or the value itself when it is no string
+function ScopeResolver.joinSurrogates(s)
+    if type(s) ~= "string" or not s:find("\237[\160-\175]") then return s end
+    return (s:gsub("\237([\160-\175])([\128-\191])\237([\176-\191])([\128-\191])", function(a, b, c, d)
+        local hi = 0xD000 + (a:byte() - 0x80) * 64 + (b:byte() - 0x80)
+        local lo = 0xD000 + (c:byte() - 0x80) * 64 + (d:byte() - 0x80)
+        local cp = 0x10000 + (hi - 0xD800) * 0x400 + (lo - 0xDC00)
+        return string.char(
+            0xF0 + math.floor(cp / 0x40000),
+            0x80 + math.floor(cp / 0x1000) % 0x40,
+            0x80 + math.floor(cp / 0x40) % 0x40,
+            0x80 + cp % 0x40)
+    end))
+end
+
+-- Where a sentence ends: the ASCII marks followed by a space (or at the end
+-- of the text unless `need_space`), and the marks of scripts that write no
+-- space after them, 。！？ (CJK), । (Devanagari) and ؟ (Arabic), anywhere
+-- (the sweep of 2026-11-06: a sentence cut kept a whole CJK paragraph).
+-- Returns the position of the mark's last byte, or nil.
+local SENTENCE_MARKS = { "。", "！", "？", "।", "؟" }
+local function sentenceEndPos(text, from, need_space)
+    from = from or 1
+    local start, stop
+    local s = text:find("[%.!%?]%s", from)
+    if not s and not need_space then s = text:find("[%.!%?]$", from) end
+    if s then start, stop = s, s end
+    for _idx, mark in ipairs(SENTENCE_MARKS) do
+        local m = text:find(mark, from, true)
+        if m and (not start or m < start) then start, stop = m, m + #mark - 1 end
+    end
+    return stop
+end
+
+--- The string with every byte that is not part of a valid UTF-8 sequence
+--- replaced by "?": the SAME length, so a position found in the result
+--- holds in the original; the string itself when it is clean. For text
+--- handed to KOReader's utf8proc wrapper (ffi/utf8proc.lua): its fold and
+--- its NFC return NULL on invalid UTF-8 and the wrapper passes that to
+--- ffi.string, which ends the app with a segfault no pcall catches. A held
+--- word of a PDF or DjVu text layer, a name in an old X-Ray, a tool's query
+--- can carry such bytes (audit 2026-11-12).
+function ScopeResolver.utf8Mask(s)
+    local first = ScopeResolver.utf8FirstBad(s)
+    if not first then return s end
+    local out, pos, keep_from = {}, first, 1
+    while true do
+        local i = s:find("[\128-\255]", pos)
+        if not i then break end
+        local len = utf8SeqLen(s, i)
+        if len then
+            pos = i + len
+        else
+            out[#out + 1] = s:sub(keep_from, i - 1)
+            out[#out + 1] = "?"
+            pos = i + 1
+            keep_from = pos
+        end
+    end
+    out[#out + 1] = s:sub(keep_from)
+    return table.concat(out)
+end
+
 --- Drop every byte that is not part of a valid UTF-8 sequence.
 function ScopeResolver.utf8Repair(s)
     local out, pos, keep_from = {}, 1, 1
@@ -217,7 +290,11 @@ function ScopeResolver.paragraphWindow(prev, next_text, n, max_per_side)
     -- clean, so snapping those would drop a whole leading sentence. Degrades
     -- to the raw cut when the capped window holds no boundary at all.
     local function snapStartToSentence(text)
-        local _, e = text:find("[%.!%?]%s+")
+        local e = sentenceEndPos(text, 1, true)
+        if e then
+            local _, ws = text:find("^%s*", e + 1)
+            e = ws or e
+        end
         if e and e < #text then return text:sub(e + 1) end
         return text
     end
@@ -225,11 +302,10 @@ function ScopeResolver.paragraphWindow(prev, next_text, n, max_per_side)
         local last
         local pos = 1
         while true do
-            local s = text:find("[%.!%?]", pos)
-            if not s then break end
-            local nxt = text:sub(s + 1, s + 1)
-            if nxt == "" or nxt:match("%s") then last = s end
-            pos = s + 1
+            local e = sentenceEndPos(text, pos)
+            if not e then break end
+            last = e
+            pos = e + 1
         end
         if last and last < #text then return text:sub(1, last) end
         return text
@@ -362,7 +438,7 @@ function ScopeResolver.limitAfter(next_text, after_limit)
     if after_limit == "none" then return "" end
     if after_limit == "sentence" and next_text ~= "" then
         -- Keep only to the end of the sentence the selection sits in
-        local e = next_text:find("[%.!%?]%s") or next_text:find("[%.!%?]$")
+        local e = sentenceEndPos(next_text, 1)
         if e then next_text = next_text:sub(1, e) end
     elseif after_limit == "paragraph" and next_text ~= "" then
         -- Keep only the remainder of the selection's own paragraph
@@ -444,17 +520,18 @@ function ScopeResolver.trimContext(prev, next_text, highlighted_text, mode, opts
             local starts = {}
             local pos = 1
             while true do
-                local s, e = text:find("[%.!%?]%s+", pos)
-                if not s then break end
-                starts[#starts + 1] = e + 1
-                pos = e + 1
+                local e = sentenceEndPos(text, pos, true)
+                if not e then break end
+                local _, ws = text:find("^%s*", e + 1)
+                starts[#starts + 1] = (ws or e) + 1
+                pos = (ws or e) + 1
             end
             local from = starts[#starts - 1] or 1
             return text:sub(from)
         end
         local function findSentenceEnd(text)
-            -- Search forwards for sentence end (.!?)
-            local end_pos = text:find("[%.!%?]%s") or text:find("[%.!%?]$")
+            -- Search forwards for the sentence's end
+            local end_pos = sentenceEndPos(text, 1)
             if end_pos then
                 return text:sub(1, end_pos)
             end

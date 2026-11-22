@@ -899,6 +899,123 @@ TestRunner:test("abnormalStop: normal reasons and non-strings are nil", function
     TestRunner:assertEqual(ResponseParser.abnormalStop("SAFETY"), "SAFETY", "abnormal passes through")
 end)
 
+-- The sweep of 2026-11-06: a JSON null is a function sentinel in KOReader's
+-- json and must never ride out as reasoning or content; a cut answer on every
+-- chat-completions wire carries the truncation notice.
+local NULL = function() end
+local OPENAI_WIRE = { "groq", "mistral", "xai", "openrouter", "requesty", "qwen", "kimi",
+    "together", "fireworks", "sambanova", "doubao", "zai", "nvidia", "deepseek" }
+TestRunner:test("null reasoning and content never escape the OpenAI-wire parsers", function()
+    for _idx, key in ipairs(OPENAI_WIRE) do
+        local ok, content, reasoning = ResponseParser:parseResponse({ choices = { {
+            message = { content = "Hello.", reasoning = NULL, reasoning_content = NULL },
+            finish_reason = "stop" } } }, key)
+        TestRunner:assertTrue(ok, key .. ": parses")
+        TestRunner:assertTrue(type(content) == "string" and content:find("Hello", 1, true) ~= nil, key .. ": the text")
+        TestRunner:assertTrue(type(reasoning) ~= "function", key .. ": no function sentinel as reasoning")
+        local ok2, content2 = ResponseParser:parseResponse({ choices = { {
+            message = { content = NULL }, finish_reason = "stop" } } }, key)
+        TestRunner:assertTrue(ok2 and type(content2) ~= "function", key .. ": a null content is not a function")
+    end
+end)
+TestRunner:test("a cut answer carries the truncation notice on every OpenAI-wire parser", function()
+    for _idx, key in ipairs(OPENAI_WIRE) do
+        local reason = key == "mistral" and "model_length" or "length"
+        local ok, content = ResponseParser:parseResponse({ choices = { {
+            message = { content = "Hello." }, finish_reason = reason } } }, key)
+        TestRunner:assertTrue(ok, key .. ": parses")
+        TestRunner:assertTrue(ResponseParser.isIncomplete(content), key .. ": incomplete on " .. reason)
+        local ok3, whole = ResponseParser:parseResponse({ choices = { {
+            message = { content = "Hello." }, finish_reason = "stop" } } }, key)
+        TestRunner:assertTrue(ok3 and not ResponseParser.isIncomplete(whole), key .. ": whole on stop")
+    end
+    local ok, c = ResponseParser:parseResponse({ message = { content = { { type = "text", text = "Hello." } } },
+        finish_reason = "MAX_TOKENS" }, "cohere")
+    TestRunner:assertTrue(ok and ResponseParser.isIncomplete(c), "cohere MAX_TOKENS")
+    local ok2, c2 = ResponseParser:parseResponse({ message = { content = "Hello." }, done_reason = "length" }, "ollama")
+    TestRunner:assertTrue(ok2 and ResponseParser.isIncomplete(c2), "ollama done_reason length")
+    local ok4, c4 = ResponseParser:parseResponse({ message = { content = "Hello." }, done_reason = "stop" }, "ollama")
+    TestRunner:assertTrue(ok4 and not ResponseParser.isIncomplete(c4), "ollama whole on stop")
+end)
+
+-- Audit 2026-11-12: "model_length" (Mistral: the model's context ran out)
+-- became a normal stop on 2026-11-06 while the stream's cut check and the
+-- generic OpenAI wire still knew only "length": a cut answer streamed from
+-- Mistral, or from a custom provider pointed at it, was saved as whole. One
+-- rule now serves the whole answers and the stream.
+TestRunner:test("model_length is a cut on every wire that can carry it, whole or streamed", function()
+    TestRunner:assertTrue(ResponseParser.isCutReason("length"), "length is a cut")
+    TestRunner:assertTrue(ResponseParser.isCutReason("model_length"), "model_length is a cut")
+    TestRunner:assertTrue(not ResponseParser.isCutReason("stop"), "stop is not")
+    TestRunner:assertTrue(not ResponseParser.isCutReason(nil), "a missing reason is not")
+    TestRunner:assertTrue(not ResponseParser.isCutReason(NULL), "a null reason is not")
+    for _idx, key in ipairs({ "openai", "deepseek", "mistral", "openrouter", "requesty" }) do
+        local ok, content = ResponseParser:parseResponse({ choices = { {
+            message = { content = "Hello." }, finish_reason = "model_length" } } }, key)
+        TestRunner:assertTrue(ok and ResponseParser.isIncomplete(content), key .. ": a whole answer cut at model_length")
+    end
+    local StreamHandler = require("koassistant.request.stream_handler")
+    TestRunner:assertTrue(StreamHandler:checkIfTruncated({ choices = { { delta = {}, finish_reason = "model_length" } } }),
+        "the stream reads model_length as a cut")
+    TestRunner:assertTrue(StreamHandler:checkIfTruncated({ choices = { { delta = {}, finish_reason = "length" } } }),
+        "the stream reads length as a cut")
+    TestRunner:assertTrue(not StreamHandler:checkIfTruncated({ choices = { { delta = {}, finish_reason = "stop" } } }),
+        "the stream reads stop as whole")
+    TestRunner:assertTrue(not StreamHandler:checkIfTruncated({ choices = { { delta = {}, finish_reason = NULL } } }),
+        "a null finish reason on a middle chunk is not a cut")
+    -- and it is still not an abnormal stop: one notice, never two
+    TestRunner:assertTrue(StreamHandler:abnormalStopReason(
+        { choices = { { delta = {}, finish_reason = "model_length" } } }) == nil,
+        "model_length is not also reported as an abnormal stop")
+end)
+
+-- Audit 2026-11-12: a server that ends a normal answer with "eos_token" or
+-- "eos" (the model wrote its end-of-sequence token) had every whole answer
+-- marked as stopped early: nothing built from it was ever saved.
+TestRunner:test("eos and eos_token are natural stops; a filter's stop is still named", function()
+    for _idx, reason in ipairs({ "eos", "eos_token", "stop", "stop_sequence", "end_turn" }) do
+        TestRunner:assertTrue(ResponseParser.abnormalStop(reason) == nil, reason .. " is a normal stop")
+        local ok, content = ResponseParser:parseResponse({ choices = { {
+            message = { content = "A whole answer." }, finish_reason = reason } } }, "openai")
+        TestRunner:assertTrue(ok and not ResponseParser.isIncomplete(content), reason .. ": the answer is whole")
+    end
+    for _idx, reason in ipairs({ "content_filter", "error", "abort", "insufficient_system_resource" }) do
+        TestRunner:assertTrue(ResponseParser.abnormalStop(reason) == reason, reason .. " is still named")
+    end
+    local StreamHandler = require("koassistant.request.stream_handler")
+    TestRunner:assertTrue(StreamHandler:abnormalStopReason(
+        { choices = { { delta = {}, finish_reason = "eos_token" } } }) == nil, "the stream agrees")
+end)
+
+-- Audit 2026-11-12: KOReader's JSON decoder turns each \uXXXX into its own
+-- sequence and knows no pairs, so an emoji sent as \uD83D\uDD0D arrives as
+-- two three-byte halves. The one exit of every whole answer joins them.
+TestRunner:test("an emoji that arrives as two surrogate halves is one character in a whole answer", function()
+    local HI, LO, EMOJI = "\237\160\189", "\237\180\141", "\240\159\148\141"
+    local SR = require("koassistant.request.scope_resolver")
+    TestRunner:assertEqual(SR.joinSurrogates("a " .. HI .. LO .. " b"), "a " .. EMOJI .. " b", "the pair")
+    TestRunner:assertEqual(SR.joinSurrogates(HI .. LO .. HI .. LO), EMOJI .. EMOJI, "two pairs in a row")
+    TestRunner:assertEqual(SR.joinSurrogates("a " .. HI .. " b"), "a " .. HI .. " b", "a half with no partner is left for the request encoder")
+    TestRunner:assertEqual(SR.joinSurrogates(LO .. HI), LO .. HI, "the halves in the wrong order are no pair")
+    TestRunner:assertEqual(SR.joinSurrogates("caf\195\169 \228\184\173 " .. EMOJI), "caf\195\169 \228\184\173 " .. EMOJI, "valid text is untouched")
+    local t = {}
+    TestRunner:assertTrue(SR.joinSurrogates(t) == t and SR.joinSurrogates(nil) == nil, "a value that is no string passes through")
+    for _idx, key in ipairs({ "openai", "anthropic", "gemini", "mistral", "ollama" }) do
+        local response
+        if key == "anthropic" then
+            response = { content = { { type = "text", text = "look " .. HI .. LO } }, stop_reason = "end_turn" }
+        elseif key == "gemini" then
+            response = { candidates = { { content = { parts = { { text = "look " .. HI .. LO } } }, finishReason = "STOP" } } }
+        elseif key == "ollama" then
+            response = { message = { content = "look " .. HI .. LO }, done_reason = "stop" }
+        else
+            response = { choices = { { message = { content = "look " .. HI .. LO }, finish_reason = "stop" } } }
+        end
+        local ok, content = ResponseParser:parseResponse(response, key)
+        TestRunner:assertTrue(ok and content == "look " .. EMOJI, key .. ": the answer holds the emoji, not its halves")
+    end
+end)
+
 -- Summary
 local success = TestRunner:summary()
 return success

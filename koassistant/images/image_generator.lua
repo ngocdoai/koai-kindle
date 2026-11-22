@@ -161,42 +161,141 @@ function ImageGenerator.offered()
     return true
 end
 
---- "Generate with a note…" (S5, D9): the reader's note for one picture, asked
---- after the selection was taken. on_ok(text), or on_ok(nil) when the note
---- was left empty (the picture goes ahead without one); Cancel does nothing.
---- opts.optional (Illustrate… from X-Ray): the title says the note is
---- optional and the keyboard waits for a tap. opts.confirm_text names the
---- button.
+-- The Kindle build has one drawing provider. The shared popup entry points
+-- can proceed directly; the sign-in is checked before the draw starts.
+function ImageGenerator.providerFirst(_plugin, on_ready)
+    on_ready()
+end
+
+--- The note for one picture (S5, D9; the picture popup's Add a note…, B537):
+--- a box the size of the chat's, its example as the gray hint inside it.
+--- on_ok(text), or on_ok(nil) when the note was left empty (the picture goes
+--- without one); Cancel does nothing. opts.confirm_text names the button.
 function ImageGenerator.askNote(prefill, on_ok, opts)
     opts = opts or {}
     local UIManager = require("ui/uimanager")
     local InputDialog = require("ui/widget/inputdialog")
+    local Screen = require("device").screen
     local dialog
+    local buttons = { {
+        {
+            text = _("Cancel"),
+            id = "close",
+            callback = function() UIManager:close(dialog) end,
+        },
+        {
+            text = opts.confirm_text or _("OK"),
+            is_enter_default = true,
+            callback = function()
+                local text = dialog:getInputText()
+                UIManager:close(dialog)
+                on_ok((type(text) == "string" and text:match("%S")) and text or nil)
+            end,
+        },
+    } }
     dialog = InputDialog:new{
-        title = opts.optional and _("Note for the picture (optional)") or _("Note for the picture"),
-        description = _("What the picture should show, or how. The prompt writer follows it; with the writer off, it is added to the prompt."),
+        title = _("Note for the picture"),
         input = prefill or "",
+        input_hint = _("The setting or context, details for the picture (at night, close up, in the rain), what to include, or other instructions"),
         allow_newline = true,
-        keyboard_visible = not opts.optional,
-        buttons = { {
-            {
-                text = _("Cancel"),
-                id = "close",
-                callback = function() UIManager:close(dialog) end,
-            },
-            {
-                text = opts.confirm_text or _("Generate"),
-                is_enter_default = true,
-                callback = function()
-                    local text = dialog:getInputText()
-                    UIManager:close(dialog)
-                    on_ok((type(text) == "string" and text:match("%S")) and text or nil)
-                end,
-            },
-        } },
+        text_height = Screen:scaleBySize(96),
+        buttons = buttons,
     }
     UIManager:show(dialog)
-    if not opts.optional then dialog:onShowKeyboard() end
+    dialog:onShowKeyboard()
+end
+
+--- The X-Ray entries the prompt writer reads for a passage picture (B535,
+--- B537): the reader's list, five at most. The ones picked first (at first
+--- those the passage and the note name), then the suggested ones, then every
+--- other entry under its category, with a name search; a tap marks or clears
+--- one, and the rows keep the places they opened in. Closing it (the X, Back)
+--- hands the list back in the order picked: there is no Done to find.
+--- @param tiers table PromptWriter.pickerTiers(...)
+--- @param picks table names picked so far
+--- @param on_done function(names)
+function ImageGenerator.pickEntries(tiers, picks, on_done)
+    local UIManager = require("ui/uimanager")
+    local Menu = require("ui/widget/menu")
+    local InfoMessage = require("ui/widget/infomessage")
+    local Screen = require("device").screen
+    local max = require("koassistant.images.prompt_writer").ENTRIES_MAX
+    local chosen, order = {}, {}
+    for _idx, n in ipairs(picks or {}) do
+        if type(n) == "string" and not chosen[n:lower()] then
+            chosen[n:lower()] = true
+            order[#order + 1] = n
+        end
+    end
+    local filter, menu
+    local function title()
+        return T(_("Pick X-Ray entries (%1 of %2)"), #order, max)
+    end
+    local items
+    local function toggle(row)
+        local low = row.name:lower()
+        if chosen[low] then
+            chosen[low] = nil
+            for i = #order, 1, -1 do
+                if order[i]:lower() == low then table.remove(order, i) end
+            end
+        elseif #order >= max then
+            UIManager:show(InfoMessage:new{
+                text = T(_("The prompt writer reads %1 entries at most."), max),
+                timeout = 3,
+            })
+            return
+        else
+            chosen[low] = true
+            order[#order + 1] = row.name
+        end
+        menu:switchItemTable(title(), items(), -1)
+    end
+    items = function()
+        local out = {}
+        local function add(label, rows)
+            local shown = {}
+            for _idx, row in ipairs(rows or {}) do
+                if not filter or row.name:lower():find(filter, 1, true) then shown[#shown + 1] = row end
+            end
+            if #shown == 0 then return end
+            if label then out[#out + 1] = { text = label, bold = true, callback = function() end } end
+            for _idx, row in ipairs(shown) do
+                local r = row
+                -- a carried entry names its book, as the X-Ray's category
+                -- pages do ("Innkeeper · Book 2")
+                out[#out + 1] = {
+                    text = (chosen[r.name:lower()] and "\u{2611} " or "\u{2610} ") .. r.name
+                        .. (r.role and (" \u{00B7} " .. r.role) or "")
+                        .. (r.from and (" \u{00B7} " .. r.from) or ""),
+                    callback = function() toggle(r) end,
+                }
+            end
+        end
+        add(nil, tiers.picked)
+        add(_("Suggested"), tiers.suggested)
+        for _idx, g in ipairs(tiers.groups or {}) do add(g.label, g.rows) end
+        return out
+    end
+    menu = Menu:new{
+        title = title(),
+        item_table = items(),
+        is_borderless = true,
+        is_popout = false,
+        width = Screen:getWidth(),
+        height = Screen:getHeight(),
+        onMenuSelect = function(_self_menu, item)
+            if item and item.callback then item.callback() end
+            return true
+        end,
+        close_callback = function() on_done(order) end,
+        search_callback = function(search_string)
+            filter = (type(search_string) == "string" and search_string ~= "") and search_string:lower() or nil
+            menu:switchItemTable(title(), items(), 1)
+        end,
+    }
+    UIManager:show(menu)
+    return menu
 end
 
 --- Resolve the image model: explicit per-provider setting (a retired id sent
@@ -331,9 +430,74 @@ function ImageGenerator.recordImage(filename, book_info, prompt, provenance, met
         kinds = meta.kinds,
         style = type(meta.style) == "string" and meta.style or nil,
         written = type(meta.written) == "boolean" and meta.written or nil,
+        -- B486: the X-Ray entries the picture shows, by name (the entry drawn,
+        -- or the ones the passage, the note and the reader's picks name)
+        entries = type(meta.entries) == "table" and #meta.entries > 0 and meta.entries or nil,
         created = os.time(),
     }
     writeIndex(index)
+end
+
+--- The pictures of one X-Ray entry (B486), newest first: the book's pictures
+--- whose recorded entries name it. Matched by name, so a rename or a merge
+--- (the old name stays among the entry's names) keeps them: the entry's own
+--- name always, one of its other names only when no other entry is called
+--- that. Pictures gone from disk are left out.
+--- @param book_file string
+--- @param names table lowercased name -> true (the entry's name and aliases)
+--- @param others table|nil lowercased name -> true (the other entries' names)
+--- @param main string|nil the entry's own name, lowercased
+--- @param index table|nil the images index (read when nil)
+--- @return table { filename, ... }
+function ImageGenerator.picturesOf(book_file, names, others, main, index)
+    local out = {}
+    if type(book_file) ~= "string" or type(names) ~= "table" then return out end
+    index = index or ImageGenerator.readIndex()
+    local lfs = require("libs/libkoreader-lfs")
+    local dir = ImageGenerator.getImagesDir()
+    local hits = {}
+    for filename, rec in pairs(index) do
+        if type(rec) == "table" and rec.book_file == book_file and type(rec.entries) == "table" then
+            for _idx, n in ipairs(rec.entries) do
+                local low = type(n) == "string" and n:lower()
+                if low and names[low] and (low == main or not (others and others[low])) then
+                    if lfs.attributes(dir .. "/" .. filename, "mode") == "file" then
+                        hits[#hits + 1] = { name = filename, created = tonumber(rec.created) or 0 }
+                    end
+                    break
+                end
+            end
+        end
+    end
+    table.sort(hits, function(a, b)
+        if a.created ~= b.created then return a.created > b.created end
+        return a.name > b.name
+    end)
+    for _idx, h in ipairs(hits) do out[#out + 1] = h.name end
+    return out
+end
+
+--- The name sets picturesOf takes for an entry of a parsed X-Ray: its own
+--- name and other names, the other entries' names, its own name. Pure.
+--- @return table names, table others, string|nil main
+function ImageGenerator.entryNames(data, item, category_key)
+    local XrayParser = require("koassistant.xray.xray_parser")
+    local names, others = {}, {}
+    local main = XrayParser.getItemName(item, category_key)
+    main = type(main) == "string" and main:lower() or nil
+    if main then names[main] = true end
+    for _idx, a in ipairs(type(item) == "table" and type(item.aliases) == "table" and item.aliases or {}) do
+        if type(a) == "string" and a ~= "" then names[a:lower()] = true end
+    end
+    for _idx, cat in ipairs(XrayParser.getCategories(data) or {}) do
+        for _j, other in ipairs(cat.items or {}) do
+            if other ~= item then
+                local n = XrayParser.getItemName(other, cat.key)
+                if type(n) == "string" and n ~= "" then others[n:lower()] = true end
+            end
+        end
+    end
+    return names, others, main
 end
 
 -- The frame's label for the text around the passage (buildPrompt), and the
@@ -850,14 +1014,23 @@ end
 --- O_NONBLOCK constants differ between Linux and macOS).
 local function pollSubprocess(pid, parent_read_fd, on_done)
     local UIManager = require("ui/uimanager")
+    local time = require("ui/time")
     local chunksize = 1024 * 64
     local buf = ffi.new("char[?]", chunksize)
-    local buf_ptr = ffi.cast("void*", buf)
+    -- The reads below take the buffer itself: a pointer cast from it keeps
+    -- nothing alive, and the poll runs long after this function returned,
+    -- when the buffer's own variable is gone and LuaJIT may have freed it
+    -- (the child's bytes then land in memory that is in use: B769)
     local response_parts = {}
     local poll_task
+    local first_at -- when the answer started coming through the pipe
 
     local function finish()
         ffi.C.close(parent_read_fd)
+        local size = 0
+        for _idx, part in ipairs(response_parts) do size = size + #part end
+        logger.dbg("KOAssistant: image subprocess answer:", size, "bytes, through the pipe in",
+            first_at and time.to_ms(time.now() - first_at) or 0, "ms")
         -- Reap the child so it doesn't linger as a zombie (EOF can arrive a
         -- moment before the process is collectable)
         if not ffiutil.isSubProcessDone(pid) then
@@ -876,9 +1049,10 @@ local function pollSubprocess(pid, parent_read_fd, on_done)
         while true do
             local readsize = ffiutil.getNonBlockingReadSize(parent_read_fd) or 0
             if readsize > 0 then
-                local bytes = tonumber(ffi.C.read(parent_read_fd, buf_ptr, chunksize))
+                local bytes = tonumber(ffi.C.read(parent_read_fd, buf, chunksize))
                 if bytes and bytes > 0 then
-                    table.insert(response_parts, ffi.string(buf_ptr, bytes))
+                    first_at = first_at or time.now()
+                    table.insert(response_parts, ffi.string(buf, bytes))
                 else
                     finish()  -- 0 = EOF, negative = read error
                     return
@@ -887,9 +1061,9 @@ local function pollSubprocess(pid, parent_read_fd, on_done)
                 -- Child exited (and is now reaped); its pipe end is closed, so
                 -- blocking reads drain the remainder and then return 0
                 while true do
-                    local bytes = tonumber(ffi.C.read(parent_read_fd, buf_ptr, chunksize))
+                    local bytes = tonumber(ffi.C.read(parent_read_fd, buf, chunksize))
                     if bytes and bytes > 0 then
-                        table.insert(response_parts, ffi.string(buf_ptr, bytes))
+                        table.insert(response_parts, ffi.string(buf, bytes))
                     else
                         break
                     end
@@ -897,7 +1071,12 @@ local function pollSubprocess(pid, parent_read_fd, on_done)
                 finish()
                 return
             else
-                UIManager:scheduleIn(0.15, poll_task)
+                -- Once the answer is flowing, drain it quickly: the child
+                -- holds it whole and waits on a full pipe (64 KB) until we
+                -- read. A picture's answer runs to megabytes, and on a
+                -- one-core reader each poll moved one pipe-full: half a
+                -- minute for 10 MB.
+                UIManager:scheduleIn(#response_parts > 0 and 0.01 or 0.15, poll_task)
                 return
             end
         end
@@ -1116,7 +1295,7 @@ function ImageGenerator.promptTemplateText(features, purpose, language)
         style = (PromptWriter.styleText(features)),
         shape = PromptWriter.shapeLine(features.image_gen_shape or "fit", 3 / 4, true),
     })
-    return T(_("Write the prompt with AI is on: your chat provider's fast model reads the material below and writes the prompt the image model receives (with \"The picture contains no text, letters, titles or captions.\" added). Its instructions:\n\n%1\n\nThe material (each block only when there is something for it):\n\n%2\n\nIf the writer fails, this prompt is sent instead:\n\n%3"),
+    return T(_("Write the prompt with AI is on: the prompt writer (your chat model, or its fast model if Prompt writer says so) reads the material below and writes the prompt the image model receives (with \"The picture contains no text, letters, titles or captions.\" added). Its instructions:\n\n%1\n\nThe material (each block only when there is something for it):\n\n%2\n\nIf the writer fails, this prompt is sent instead:\n\n%3"),
         PromptWriter.systemText({}), material, plain)
 end
 
@@ -1611,7 +1790,7 @@ end
 --- provider in the questions and refreshes the settings after an answer.
 --- The provider that draws (Kindle build: Codex, once signed in), then
 --- run_fn(provider); without a sign-in, a notice. No question is asked.
-local function withImageProvider(config_table, settings, opts, retry, run_fn)
+local function withImageProvider(config_table, settings, run_fn)
     local features = (config_table and config_table.features) or {}
     local main_provider = config_table and config_table.provider
     local provider = ImageGenerator.effectiveProvider(features, main_provider, settings)
@@ -1623,9 +1802,7 @@ local function withImageProvider(config_table, settings, opts, retry, run_fn)
 end
 
 function ImageGenerator._generateImpl(word, config_table, settings, book_info, opts)
-    withImageProvider(config_table, settings, opts, function()
-        ImageGenerator.generate(word, config_table, settings, book_info, opts)
-    end, function(provider)
+    withImageProvider(config_table, settings, function(provider)
         -- The subject: the selection, or (Illustrate from X-Ray, S8) an entry
         -- of the book's X-Ray
         opts = opts or {}
@@ -1675,9 +1852,7 @@ function ImageGenerator._regenerateImpl(spec, config_table, settings)
         local old = spec.name
         opts.on_saved = function() ImageGenerator.deleteImages({ old }) end
     end
-    withImageProvider(config_table, settings, opts, function()
-        ImageGenerator.regenerate(spec, config_table, settings)
-    end, function(provider)
+    withImageProvider(config_table, settings, function(provider)
         local PromptWriter = require("koassistant.images.prompt_writer")
         local features = (config_table and config_table.features) or {}
         local entry = type(spec.entry) == "table" and spec.entry or {}
@@ -1725,6 +1900,7 @@ function ImageGenerator._regenerateImpl(spec, config_table, settings)
             restyle = writer_provider and { provider = writer_provider, model = writer_model,
                 style = style_text, default = style_default } or nil,
             kinds = kinds,
+            about = type(entry.entries) == "table" and entry.entries or nil,
         }
         if #kinds == 0 then
             ImageGenerator._run(st)
@@ -1756,6 +1932,30 @@ function ImageGenerator._regenerateImpl(spec, config_table, settings)
     end)
 end
 
+--- The X-Ray a passage picture's entries come from (B537): the book's own
+--- installed X-Ray with its carried entries among its own entries
+--- (PromptWriter.withCarried, each carried row naming its book), minus the
+--- rows carried from a book whose text is Never for a provider the material
+--- reaches (the entity index's rule: XrayMerge.neverSourceFiles). Returns
+--- that data and ActionCache.parsedXrayFor's answer; nil without an X-Ray.
+--- @param path string|nil the book
+--- @param features table
+--- @param providers table the providers the material reaches
+--- @param ui table|nil
+function ImageGenerator.pictureXray(path, features, providers, ui)
+    local xray = path and require("koassistant.artifacts.action_cache").parsedXrayFor(path) or nil
+    if not xray then return nil end
+    local XrayMerge = require("koassistant.xray.xray_merge")
+    local skip = {}
+    for _idx, p in ipairs(providers or {}) do
+        for file in pairs(XrayMerge.neverSourceFiles(xray.data, features or {}, p, ui)) do skip[file] = true end
+    end
+    return require("koassistant.images.prompt_writer").withCarried(xray.data, {
+        skip = skip,
+        from = require("koassistant.books.book_groups").carriedSourceLabeler(path),
+    }), xray
+end
+
 --- What a run sends and to whom, the question for it, then the run (S5, D12):
 --- with the prompt writer on, the text around the passage and the X-Ray
 --- descriptions reach two providers (the writer's, which reads them, and the
@@ -1778,14 +1978,28 @@ function ImageGenerator._askAndRun(provider, description, config_table, settings
     local recipients = { provider }
     if writer_on and writer_provider ~= provider then recipients = { writer_provider, provider } end
     local path = book_info and book_info.file
-    -- The book's own installed X-Ray: the entries the passage names (the
-    -- writer reads them, D10), or the entry to draw; stored material, judged
-    -- by the kinds it was built from
-    local xray = path and (opts.entry or writer_on)
-        and require("koassistant.artifacts.action_cache").parsedXrayFor(path) or nil
+    -- The book's own installed X-Ray: the entries the passage or the reader's
+    -- note names (the writer reads them, D10; B535: "this is X" brings X), or
+    -- the reader's list from the picture popup (B537), or the entry to draw;
+    -- stored material, judged by the kinds it was built from. Its carried
+    -- entries count too, but none from a book whose text is Never for a
+    -- provider here (a pick made before the provider changed included)
+    local picture_data, xray = ImageGenerator.pictureXray(path, features, recipients, opts.ui)
     local entries = {}
     if writer_on and not opts.entry and xray then
-        entries = PromptWriter.entriesFor(description, xray.data)
+        entries = PromptWriter.entriesFor(description, picture_data, nil, opts.note, opts.picked)
+    end
+    -- B486: what the picture shows, recorded with it (the entry drawn, or the
+    -- entries the writer read; with the writer off, the ones the passage and
+    -- the note name: a record on this device, nothing sent)
+    local about
+    if opts.entry then
+        about = { opts.entry.name }
+    elseif xray then
+        about = {}
+        local list = writer_on and entries
+            or PromptWriter.entriesFor(description, picture_data, nil, opts.note)
+        for _idx, e in ipairs(list) do about[#about + 1] = e.name end
     end
     local stored = (#entries > 0) and xray.entry or nil
     if opts.entry then
@@ -1816,9 +2030,15 @@ function ImageGenerator._askAndRun(provider, description, config_table, settings
         if opts.entry then
             amounts.book_text = _("this entry's description from the book's X-Ray (made from its text)")
         else
-            local names = {}
-            for _idx, e in ipairs(entries) do names[#names + 1] = e.name end
-            amounts.book_text = T(_("the X-Ray descriptions of %1 (made from the book's text)"), table.concat(names, ", "))
+            local names, carried = {}, false
+            for _idx, e in ipairs(entries) do
+                names[#names + 1] = e.name
+                carried = carried or e.carried == true
+            end
+            amounts.book_text = carried
+                and T(_("the X-Ray descriptions of %1 (made from the text of this book and of the books they are carried from)"),
+                    table.concat(names, ", "))
+                or T(_("the X-Ray descriptions of %1 (made from the book's text)"), table.concat(names, ", "))
         end
         amounts.highlights = _("X-Ray descriptions made with your highlights")
         amounts.annotations = _("X-Ray descriptions made with your notes on highlights")
@@ -1831,7 +2051,7 @@ function ImageGenerator._askAndRun(provider, description, config_table, settings
         provider = provider, description = description, config_table = config_table, settings = settings,
         book_info = book_info, opts = opts, features = run_features, writer_on = writer_on,
         writer_provider = writer_provider, writer_model = writer_model, recipients = recipients,
-        entries = entries, stored = stored, window = window, path = path,
+        entries = entries, stored = stored, window = window, path = path, about = about,
     }
     if #kinds == 0 then
         ImageGenerator._run(st)
@@ -1958,21 +2178,22 @@ function ImageGenerator._run(st)
     local writer_cancel  -- the writer request's cancel, while it runs
     local start_ts = os.time()
     local phase_text = ""
-    local status, tick
-    local ticking = false
+    local status, stop_tick
+    -- The waiting line at the chat window's pace (koassistant/ui/waiting.lua):
+    -- an Onyx Boox stopped waking KOReader about 10 s into a picture while
+    -- this window redrew every 5 s (frozen until a tap, the picture waiting in
+    -- the pipe); the chat and quiz windows, redrawn every 0.4 s, never froze
+    -- (B709, #126: such a device sleeps about 5 s after a screen update)
+    local Waiting = require("koassistant.ui.waiting")
+    local dots = Waiting.dots()
     local function statusText()
-        return phase_text .. "\n\n" .. T(_("Elapsed: %1 s"), os.time() - start_ts)
+        return phase_text .. "\n\n" .. Waiting.line(os.time() - start_ts, dots.getNextFrame())
     end
     local function stopTicker()
-        if ticking then
-            UIManager:unschedule(tick)
-            ticking = false
+        if stop_tick then
+            stop_tick()
+            stop_tick = nil
         end
-    end
-    tick = function()
-        if not ticking then return end
-        status.setText(statusText())
-        UIManager:scheduleIn(5, tick)
     end
     local function cancelRequest()
         cancelled = true
@@ -1995,8 +2216,7 @@ function ImageGenerator._run(st)
             initial_text = statusText(),
             on_stop = cancelRequest,
         })
-        ticking = true
-        UIManager:scheduleIn(5, tick)
+        stop_tick = Waiting.tick(function() status.setText(statusText()) end)
     end
 
     -- pollSubprocess callbacks run from the UI task queue, outside generate()'s
@@ -2043,7 +2263,21 @@ function ImageGenerator._run(st)
             end))
             return
         end
-        local meta = { provider = provider, model = resolved_model, kinds = kinds, written = written, style = style }
+        local meta = { provider = provider, model = resolved_model, kinds = kinds, written = written, style = style,
+            entries = st.about }
+        -- The answer in hand: the picture is decoded, saved and shown on the UI
+        -- thread, a few seconds on a slow reader while the clock cannot tick,
+        -- so the window says so first
+        local function saveAndShow(bytes)
+            stopTicker()
+            setPhase(_("Saving the picture…"))
+            UIManager:forceRePaint()
+            local time = require("ui/time")
+            local t0 = time.now()
+            status.close()
+            showImage(bytes, description, opts.on_viewer_close, book_info, final_prompt, provenance, meta, opts.on_saved)
+            logger.dbg("KOAssistant: image saved and shown in", time.to_ms(time.now() - t0), "ms")
+        end
         local request = ImageGenerator.buildRequest(provider, resolved_model, final_prompt, features, screen)
         if codex_auth then request.headers["ChatGPT-Account-ID"] = codex_auth.chatgpt_account_id end
         local request_body_str = BaseHandler.encodeBody(request.body)
@@ -2082,9 +2316,7 @@ function ImageGenerator._run(st)
                 return
             end
             if result.bytes then
-                stopTicker()
-                status.close()
-                showImage(result.bytes, description, opts.on_viewer_close, book_info, final_prompt, provenance, meta, opts.on_saved)
+                saveAndShow(result.bytes)
                 return
             end
             -- Download phase: same window, same elapsed clock
@@ -2106,9 +2338,7 @@ function ImageGenerator._run(st)
                     return
                 end
                 -- "OK:" prefix + binary
-                stopTicker()
-                status.close()
-                showImage(dl_raw:sub(4), description, opts.on_viewer_close, book_info, final_prompt, provenance, meta, opts.on_saved)
+                saveAndShow(dl_raw:sub(4))
             end))
         end))
     end

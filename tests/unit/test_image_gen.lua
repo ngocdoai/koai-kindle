@@ -24,6 +24,12 @@ package.loaded["mime"] = {
     b64 = function(s) return s end,
     unb64 = function(s) return s end,
 }
+-- The suite runs every file in one process, and a file that ran before this one
+-- may have loaded the image generator with luasocket's own mime (found when
+-- luarocks is on the path, as the model audit needs it): three tests here then
+-- decoded their stand-in bytes for real and failed. Load a fresh copy, so the
+-- stub above is the one it holds.
+package.loaded["koassistant.images.image_generator"] = nil
 
 local ModelLists = require("koassistant.request.model_lists")
 local BaseHandler = require("koassistant.api.base")
@@ -356,15 +362,16 @@ local function runAll()
 
     print("  [Image models: defaults and retired picks]")
     TestRunner:test("resolveImageModel: default, retired, explicit", function()
-        TestRunner:assertEquals(ModelLists.resolveImageModel("openai", nil), "gpt-image-2.5-flare")
-        TestRunner:assertEquals(ModelLists.resolveImageModel("openai", "default"), "gpt-image-2.5-flare")
+        TestRunner:assertEquals(ModelLists.resolveImageModel("openai", nil), "gpt-image-2.6-flare")
+        TestRunner:assertEquals(ModelLists.resolveImageModel("openai", "default"), "gpt-image-2.6-flare")
         TestRunner:assertEquals(ModelLists.resolveImageModel("gemini", ""), "gemini-nano-banana-2.1")
         TestRunner:assertEquals(ModelLists.resolveImageModel("xai", "grok-imagine-image-quality"),
             "grok-imagine-image-2.0", "xAI serves the retired id with 2.0")
         TestRunner:assertEquals(ModelLists.resolveImageModel("xai", "grok-imagine-image-pro"), "grok-imagine-image-2.0")
         TestRunner:assertEquals(ModelLists.resolveImageModel("gemini", "gemini-3.1-flash-image"),
             "gemini-3.1-flash-image", "a pick that only left the picker is kept")
-        TestRunner:assertEquals(ModelLists.resolveImageModel("openai", "gpt-image-1"), "gpt-image-1")
+        TestRunner:assertEquals(ModelLists.resolveImageModel("openai", "gpt-image-1"), "gpt-image-2.5-flare", "shut down 2026-10-23: the 2.5 pair replaces it")
+        TestRunner:assertEquals(ModelLists.resolveImageModel("openai", "gpt-image-2"), "gpt-image-2", "a pick that only left the default slot is kept")
     end)
     TestRunner:test("_image_retired is skipped by provider iteration", function()
         for _idx, p in ipairs(ModelLists.getAllProviders()) do
@@ -675,6 +682,21 @@ local function runAll()
         p = ImageGenerator.buildPrompt("sel", { window = window }, {})
         TestRunner:assert(p:find("Next paragraph.", 1, true), "no limit: all of it")
     end)
+    TestRunner:test("the frame keeps about 400 characters a side; the writer reads more of the same window", function()
+        local window = { prev = string.rep("b", 3000), next = string.rep("c", 3000) }
+        -- the mock's util answers nil to everything; ASCII needs no repair
+        local util = require("util")
+        local had = rawget(util, "fixUtf8")
+        util.fixUtf8 = function(s) return s end
+        local p = ImageGenerator.buildPrompt("sel", { window = window }, {})
+        util.fixUtf8 = had
+        TestRunner:assert(p:find("…" .. string.rep("b", 400) .. " […] " .. string.rep("c", 400) .. "…", 1, true)
+            and not p:find(string.rep("b", 401), 1, true), "the frame's slice: " .. #p)
+        local m = require("koassistant.images.prompt_writer").material({ passage = "sel",
+            around = { before = window.prev, after = window.next } })
+        TestRunner:assert(m:find(string.rep("b", 1000), 1, true) and not m:find(string.rep("b", 1001), 1, true),
+            "the writer's block: " .. #m)
+    end)
     TestRunner:test("allowedMaterial: the text around goes only where nearby_text is allowed for every recipient", function()
         local spec = { features = {}, recipients = { "anthropic", "openai" }, window = true }
         TestRunner:assertEquals(ImageGenerator.allowedMaterial(spec).around, true, "Allow by default")
@@ -804,6 +826,9 @@ local function runAll()
             showToolStatusDialog = function(o)
                 cap.status = o
                 return { setText = function(t) cap.status_text = t end, close = function() cap.closed = true end }
+            end,
+            createWaitingAnimation = function()
+                return { getNextFrame = function() return "." end, reset = function() end }
             end,
         }
         UIManager.show = function(_self, w) cap.shown[#cap.shown + 1] = w end
@@ -987,6 +1012,51 @@ local function runAll()
         package.loaded["koassistant.artifacts.action_cache"], Gates.bookOverrides = real_ac, real_overrides
         if not ok then error(err, 0) end
     end)
+    TestRunner:test("carried entries reach the writer too, none from a book whose text is Never (B537)", function()
+        local Gates = require("koassistant.request.privacy_gates")
+        local real_ac, real_overrides = package.loaded["koassistant.artifacts.action_cache"], Gates.bookOverrides
+        package.loaded["koassistant.artifacts.action_cache"] = { parsedXrayFor = function()
+            return { data = { type = "fiction", characters = { { name = "Mara", description = "A red scarf." } },
+                __dormant = {
+                    { name = "Dorrit Hale", category = "characters", description = "Keeps the inn.",
+                      source = "Vol 2", file = "/books/v2.epub" },
+                    { name = "Zeph Umber", category = "characters", description = "A diver.",
+                      source = "Vol 1", file = "/books/never.epub" },
+                } }, entry = { used_book_text = true } }
+        end }
+        Gates.bookOverrides = function(path)
+            if path == "/books/never.epub" then return { book_text = false } end
+            return {}
+        end
+        local passage = "Mara met Dorrit Hale and Zeph Umber."
+        local ok, err = pcall(withApikeys, { openai = "sk-real-key" }, function()
+            withRun("A scene.", function(cap)
+                ImageGenerator._askAndRun("openai", passage, config({ enable_book_text_extraction = true }),
+                    mockSettings({}), { file = "/books/b.epub", title = "B" }, {})
+                local material = cap.writer.messages[#cap.writer.messages].content
+                TestRunner:assert(material:find('<xray_entry name="Dorrit Hale" type="person">Keeps the inn.</xray_entry>', 1, true),
+                    material)
+                TestRunner:assert(not material:find("A diver.", 1, true), "the Never book's entry stays out: " .. material)
+            end)
+            withRun("A scene.", function(cap)
+                -- a pick made in the popup: the run judges it again
+                ImageGenerator._askAndRun("openai", passage, config({ enable_book_text_extraction = true }),
+                    mockSettings({}), { file = "/books/b.epub", title = "B" }, { picked = { "Zeph Umber", "Dorrit Hale" } })
+                local material = cap.writer.messages[#cap.writer.messages].content
+                TestRunner:assert(not material:find("A diver.", 1, true), material)
+                TestRunner:assert(material:find("Keeps the inn.", 1, true), material)
+            end)
+            withRun("A scene.", function(cap)
+                ImageGenerator._askAndRun("openai", passage, config({}),
+                    mockSettings({}), { file = "/books/b.epub", title = "B" }, {})
+                TestRunner:assert(cap.shown[1] and cap.shown[1].title:find("the books they are carried from", 1, true),
+                    "the question says where carried descriptions come from: "
+                    .. tostring(cap.shown[1] and cap.shown[1].title))
+            end)
+        end)
+        package.loaded["koassistant.artifacts.action_cache"], Gates.bookOverrides = real_ac, real_overrides
+        if not ok then error(err, 0) end
+    end)
 
     print("  [The gallery: thumbnails, the index, Regenerate (S7)]")
     local function list(t) return table.concat(t or {}, ",") end
@@ -999,6 +1069,31 @@ local function runAll()
         TestRunner:assertEquals(w .. "x" .. h, "421x281", "the same box held sideways")
         w, h = ImageGenerator.thumbnailSize(300, 200, 1264, 1680)
         TestRunner:assertEquals(w .. "x" .. h, "300x200", "a small picture is not enlarged")
+    end)
+    TestRunner:test("picturesOf: an entry's pictures by its names, newest first (B486)", function()
+        withImageIndex(function()
+            local data = { type = "fiction", characters = {
+                { name = "Gil Rook", aliases = { "the grafter", "Jory" } },
+                { name = "Jory", description = "The carter." },
+            } }
+            for _idx, n in ipairs({ "a.png", "b.png", "c.png", "d.png" }) do touchFile(n) end
+            ImageGenerator.recordImage("a.png", { file = "/b/one.epub", title = "One" }, "p", nil, { entries = { "Gil Rook" } })
+            ImageGenerator.recordImage("b.png", { file = "/b/one.epub", title = "One" }, "p", nil, { entries = { "the grafter", "Mara" } })
+            ImageGenerator.recordImage("c.png", { file = "/b/one.epub", title = "One" }, "p", nil, { entries = { "Jory" } })
+            ImageGenerator.recordImage("d.png", { file = "/b/two.epub", title = "Two" }, "p", nil, { entries = { "Gil Rook" } })
+            ImageGenerator.recordImage("gone.png", { file = "/b/one.epub", title = "One" }, "p", nil, { entries = { "Gil Rook" } })
+            local index = ImageGenerator.readIndex()
+            index["a.png"].created, index["b.png"].created = 100, 200
+            local names, others, main = ImageGenerator.entryNames(data, data.characters[1], "characters")
+            local list = ImageGenerator.picturesOf("/b/one.epub", names, others, main, index)
+            TestRunner:assertEquals(table.concat(list, "|"), "b.png|a.png",
+                "by its name and its other names, newest first; another book's and a deleted file left out")
+            names, others, main = ImageGenerator.entryNames(data, data.characters[2], "characters")
+            list = ImageGenerator.picturesOf("/b/one.epub", names, others, main, index)
+            TestRunner:assertEquals(table.concat(list, "|"), "c.png",
+                "a name that is another entry's own name belongs to that entry")
+            TestRunner:assertEquals(#ImageGenerator.picturesOf(nil, names), 0)
+        end)
     end)
     TestRunner:test("thumbnailPath and subjectFromName", function()
         TestRunner:assertEquals(ImageGenerator.thumbnailPath("x.png"), IMAGES_DIR .. "/thumbnails/x.png.jpg")
@@ -1403,73 +1498,222 @@ local function runAll()
         TestRunner:assertEquals(B.holdText({ prompt = "P" }), "P", "before S7: the prompt alone")
     end)
 
-    print("  [The image settings panel (S9)]")
+    print("  [The picture popup (S9, B537)]")
     local ImageOptions = require("koassistant.images.image_options")
-    TestRunner:test("rowIds: Provider, the drawing provider's model, Style, Shape, Detail; the writer row on request", function()
-        TestRunner:assertEquals(table.concat(ImageOptions.rowIds("openai", true), ","),
-            "image_gen_provider,image_gen_model_openai,image_gen_style,image_gen_shape,image_gen_detail,image_gen_writer")
-        TestRunner:assertEquals(table.concat(ImageOptions.rowIds(nil, false), ","),
-            "image_gen_provider,image_gen_style,image_gen_shape,image_gen_detail", "nothing draws: no model row")
+    TestRunner:test("popupItems: a computed label reaches the quick-settings popup", function()
         local items = ImageOptions.popupItems({ { text_func = function() return "Custom…" end, callback = function() end } })
-        TestRunner:assertEquals(items[1].text, "Custom…", "a computed label reaches the popup")
-        local SettingsSchema = require("koassistant.ui.settings_schema")
-        for _idx, id in ipairs(ImageOptions.rowIds("openrouter", true)) do
-            TestRunner:assert(SettingsSchema:getItemById(id), "a Settings row: " .. id)
-        end
-        for _idx, p in ipairs({ "openai", "xai", "gemini" }) do
-            TestRunner:assert(SettingsSchema:getItemById(ImageOptions.rowIds(p, false)[2]), "a model row: " .. p)
-        end
+        TestRunner:assertEquals(items[1].text, "Custom…")
     end)
-    TestRunner:test("the panel: the settings' own rows and values, a picker that comes back, the action", function()
-        local UIManager = require("ui/uimanager")
-        local shown, popup = {}, nil
-        local real_show = UIManager.show
-        UIManager.show = function(_self, w) shown[#shown + 1] = w end
+    TestRunner:test("the picture popup's labels: the note and the picks, cut on one line", function()
+        TestRunner:assertEquals(ImageOptions.noteLabel(nil), "Add a note…")
+        TestRunner:assertEquals(ImageOptions.noteLabel("  "), "Add a note…", "a blank note is no note")
+        TestRunner:assertEquals(ImageOptions.noteLabel("at dusk,\n one lit window"), "Note: at dusk, one lit window")
+        local long = ImageOptions.noteLabel(string.rep("a", 50))
+        TestRunner:assertEquals(long, "Note: " .. string.rep("a", 40) .. "…", "a long note is cut")
+        TestRunner:assertEquals(ImageOptions.picksLabel({}), "X-Ray entries: none ▾")
+        TestRunner:assertEquals(ImageOptions.picksLabel({ "Gil Rook", "Hollowmere" }), "X-Ray entries: Gil Rook, Hollowmere ▾")
+    end)
+    TestRunner:test("addNoteEntries: a note's entries first, the earlier note's go, room made by the passage's (B537)", function()
+        local xray = { type = "fiction", characters = {
+            { name = "Gil Rook" }, { name = "Mara" }, { name = "Tam" }, { name = "Orrin" }, { name = "Hester" },
+            { name = "Cass" }, { name = "Jory" },
+        } }
+        local function list(st) return table.concat(st.picked, "|") end
+        local st = { picked = { "Gil Rook" } }
+        local left = ImageOptions.addNoteEntries(st, xray, "Mara holds the lamp", "Gil Rook waited.")
+        TestRunner:assertEquals(list(st), "Mara|Gil Rook", "the note's first")
+        TestRunner:assertEquals(#left, 0)
+        ImageOptions.addNoteEntries(st, xray, "Mara again", "Gil Rook waited.")
+        TestRunner:assertEquals(list(st), "Mara|Gil Rook", "never twice")
+        ImageOptions.addNoteEntries(st, xray, "Tam at dusk", "Gil Rook waited.")
+        TestRunner:assertEquals(list(st), "Tam|Gil Rook", "the earlier note's Mara goes with it")
+        ImageOptions.addNoteEntries(st, xray, nil, "Gil Rook waited.")
+        TestRunner:assertEquals(list(st), "Gil Rook", "a cleared note takes its entries along")
+        st = { picked = {} }
+        ImageOptions.addNoteEntries(st, xray, "at dusk", "Nobody here.")
+        TestRunner:assertEquals(list(st), "", "a note that names nobody adds nobody")
+        -- the passage named five: the note's entry takes a passage entry's place
+        local passage = "Gil Rook, Mara, Tam, Orrin and Hester."
+        st = { picked = { "Gil Rook", "Mara", "Tam", "Orrin", "Hester" } }
+        left = ImageOptions.addNoteEntries(st, xray, "and Cass", passage)
+        TestRunner:assertEquals(list(st), "Cass|Gil Rook|Mara|Tam|Orrin", "five at most, the passage's last gives way")
+        TestRunner:assertEquals(#left, 0)
+        -- five picked by hand: nothing gives way, the note's entry is reported
+        st = { picked = { "Gil Rook", "Mara", "Tam", "Orrin", "Hester" } }
+        left = ImageOptions.addNoteEntries(st, xray, "and Jory", "Nobody here.")
+        TestRunner:assertEquals(list(st), "Gil Rook|Mara|Tam|Orrin|Hester", "hand picks stay")
+        TestRunner:assertEquals(table.concat(left, "|"), "Jory", "left out, for the notice")
+    end)
+    TestRunner:test("the picture popup's rows (B537): this picture, then each setting by name and value, a pick saved", function()
         local features = { image_gen_provider = "openai", image_gen_style = "ink" }
+        local popup
         local plugin = {
-            settings = { data = { features = features }, readSetting = function(_self, k) return k == "features" and features or nil end },
+            settings = { data = { features = features }, flush = function() end,
+                readSetting = function(_self, k) return k == "features" and features or nil end },
             updateConfigFromSettings = function() end,
-            imageStyleItems = function(_self, after) return { { text = "Watercolor", callback = function() end, after = after } } end,
+            imageStyleItems = function(_self, _after)
+                return {
+                    { text = "Book illustration", checked_func = function() return features.image_gen_style == "illustration" end,
+                      callback = function() features.image_gen_style = "illustration" end },
+                    { text = "Ink drawing", checked_func = function() return features.image_gen_style == "ink" end,
+                      callback = function() features.image_gen_style = "ink" end },
+                    { text_func = function() return "Custom…" end, opens_dialog = true,
+                      checked_func = function() return false end, callback = function() popup = "custom" end },
+                }
+            end,
             showQuickSettingsPopup = function(_self, title, items, _close, on_close)
                 popup = { title = title, items = items, on_close = on_close }
             end,
         }
-        local function texts(d)
-            local out = {}
-            for _i, row in ipairs(d.buttons) do for _j, b in ipairs(row) do out[#out + 1] = b.text end end
-            return table.concat(out, " | ")
-        end
-        local function tap(d, pattern)
-            for _i, row in ipairs(d.buttons) do
-                for _j, b in ipairs(row) do if b.text:find(pattern) then b.callback(); return true end end
+        local function pick(text)
+            for _idx, it in ipairs(popup.items) do
+                if it.text == text then
+                    it.callback()
+                    popup.on_close()
+                    return
+                end
             end
-            return false
+            error("no item " .. text)
         end
+        withApikeys({ openai = "sk-real-key" }, function()
+            local rebuilt = 0
+            local function rebuild() rebuilt = rebuilt + 1 end
+            local state = {}
+            local xray = { type = "fiction", characters = { { name = "Gil Rook" } } }
+            local spec = { writer = true, note = true, xray = xray, passage = "Gil came in.", state = state }
+            local rows = ImageOptions.rows(plugin, spec, rebuild)
+            local ids, by = {}, {}
+            for _idx, r in ipairs(rows) do ids[#ids + 1] = r.id; by[r.id] = r end
+            TestRunner:assertEquals(table.concat(ids, ","), "picture,style,look,drawn")
+            TestRunner:assert(by.picture.gap == nil and by.style.gap == true and by.look.gap == nil,
+                "the picture's own buttons, then the settings as one table below a space")
+            TestRunner:assertEquals(by.picture.items[1].text, "Add a note…")
+            TestRunner:assertEquals(by.picture.items[2].text, "X-Ray entries: none ▾")
+            TestRunner:assert(by.picture.items[2].enabled, "the picks button is live with the writer on")
+            TestRunner:assertEquals(by.style.items[1].text, "Prompt: Written by AI ▾",
+                "Write the prompt with AI as a dial, on by default")
+            TestRunner:assertEquals(by.style.items[2].text, "Style: Ink drawing ▾", "the creation form's dials: name, value, arrow")
+            TestRunner:assertEquals(by.look.items[1].text, "Shape: Fit my screen ▾", "Shape on its default")
+            TestRunner:assertEquals(by.look.items[2].text, "Detail: Draft ▾", "Detail on its default")
+            TestRunner:assertEquals(by.drawn.items[1].text, "Provider: OpenAI ▾")
+            TestRunner:assertEquals(by.drawn.items[2].text, "Model: gpt-image-2.6-flare ▾", "the model that draws, by its id")
+            -- a value opens its list; a pick is the setting, then the popup rebuilds
+            by.look.items[1].callback()
+            TestRunner:assertEquals(popup.title, "Shape: Fit my screen", "titled as Settings titles the row")
+            TestRunner:assert(popup.on_close == rebuild, "the list comes back to the popup")
+            pick("Portrait")
+            TestRunner:assertEquals(features.image_gen_shape, "portrait")
+            TestRunner:assertEquals(rebuilt, 1)
+            rows = ImageOptions.rows(plugin, spec, rebuild)
+            for _idx, r in ipairs(rows) do by[r.id] = r end
+            TestRunner:assertEquals(by.look.items[1].text, "Shape: Portrait ▾", "the rebuilt row shows the pick")
+            by.style.items[2].callback()
+            pick("Book illustration")
+            TestRunner:assertEquals(features.image_gen_style, "illustration")
+            by.style.items[2].callback()
+            TestRunner:assertEquals(popup.items[3].text, "Custom…", "a computed label")
+            popup.items[3].callback()
+            TestRunner:assertEquals(popup, "custom", "Custom… opens its own box (it rebuilds the popup itself)")
+            -- the provider's picker, titled as Settings titles the row
+            by.drawn.items[1].callback()
+            TestRunner:assertEquals(popup.title, "Provider: OpenAI")
+            TestRunner:assert(popup.on_close == rebuild, "the picker comes back to the popup")
+            -- the writer off, picked in the Prompt list: nothing reads the picks
+            by.style.items[1].callback()
+            TestRunner:assertEquals(popup.title, "Prompt")
+            TestRunner:assert(popup.items[1].checked_func() and not popup.items[2].checked_func(),
+                "the list stands on Written by AI")
+            pick("Written by AI, from the passage, the entries and your note")
+            TestRunner:assert(features.image_gen_writer ~= false, "picking the value it has changes nothing")
+            pick("The passage as is, with your note and the style")
+            TestRunner:assertEquals(features.image_gen_writer, false)
+            rows = ImageOptions.rows(plugin, spec, rebuild)
+            for _idx, r in ipairs(rows) do by[r.id] = r end
+            TestRunner:assert(by.picture.items[2].enabled == false, "the picks button grays with the writer off")
+            TestRunner:assertEquals(by.style.items[1].text, "Prompt: Passage as is ▾")
+            -- the picture's own state on the buttons
+            state.note, state.picked = "at dusk", { "Gil Rook" }
+            rows = ImageOptions.rows(plugin, spec, rebuild)
+            TestRunner:assertEquals(rows[1].items[1].text, "Note: at dusk")
+            TestRunner:assertEquals(rows[1].items[2].text, "X-Ray entries: Gil Rook ▾")
+            -- no X-Ray entries to pick: no picks button
+            rows = ImageOptions.rows(plugin, { writer = true, note = true, xray = { type = "fiction" }, state = {} }, rebuild)
+            TestRunner:assertEquals(#rows[1].items, 1, "the note alone")
+            -- the gallery's: settings only, the Style alone on its row
+            rows = ImageOptions.rows(plugin, {}, rebuild)
+            ids = {}
+            for _idx, r in ipairs(rows) do ids[#ids + 1] = r.id end
+            TestRunner:assertEquals(table.concat(ids, ","), "style,look,drawn")
+            TestRunner:assert(rows[1].gap == nil, "no space over the first table")
+            TestRunner:assertEquals(#rows[1].items, 1, "no Prompt button where no prompt is written")
+            -- a retired id shows as the model that draws (the request's resolver)
+            features.image_gen_provider = "xai"
+            features.image_gen_model_xai = "grok-imagine-image-pro"
+            withApikeys({ xai = "xai-real-key" }, function()
+                rows = ImageOptions.rows(plugin, {}, rebuild)
+                for _idx, r in ipairs(rows) do by[r.id] = r end
+                TestRunner:assertEquals(by.drawn.items[2].text, "Model: grok-imagine-image-2.0 ▾")
+            end)
+            -- a long typed style is cut on its button
+            features.image_gen_provider = "openai"
+            local long = string.rep("a 1920s travel poster ", 8)
+            plugin.imageStyleItems = function(_self, _after)
+                return { { text_func = function() return "Custom (" .. long .. ")" end,
+                    checked_func = function() return true end, callback = function() end, opens_dialog = true } }
+            end
+            rows = ImageOptions.rows(plugin, {}, rebuild)
+            TestRunner:assert(#rows[1].items[1].text <= 56 and rows[1].items[1].text:find("… ▾$") ~= nil,
+                "cut: " .. rows[1].items[1].text)
+            -- a chat provider that cannot draw: no model
+            features.image_gen_provider = "auto"
+            features.provider = "anthropic"
+            rows = ImageOptions.rows(plugin, {}, rebuild)
+            for _idx, r in ipairs(rows) do by[r.id] = r end
+            TestRunner:assertEquals(#by.drawn.items, 1, "no model button")
+            TestRunner:assertEquals(by.drawn.items[1].text, "Provider: Follow main provider ▾")
+        end)
+    end)
+
+    TestRunner:test("providerFirst: the question before the popup only when the chat provider cannot draw", function()
+        local saved_ask = ImageGenerator.askProvider
+        local asked, picked_cb
+        ImageGenerator.askProvider = function(main, keyed, _plugin, on_pick)
+            asked = { main = main, keyed = table.concat(keyed, ",") }
+            picked_cb = on_pick
+        end
+        local features = {}
+        local plugin = {
+            settings = { data = { features = features }, flush = function() end,
+                readSetting = function(_self, k) return k == "features" and features or nil end,
+                saveSetting = function(_self, k, v) if k == "features" then features = v end end },
+            updateConfigFromSettings = function() end,
+        }
         local ok, err = pcall(function()
             withApikeys({ openai = "sk-real-key" }, function()
-                local drew = false
-                ImageOptions.show(plugin, { writer = true, actions = { { text = "Generate", callback = function() drew = true end } } })
-                local all = texts(shown[#shown])
-                TestRunner:assert(all:find("OpenAI model: Default (gpt-image-2.5-flare)", 1, true), all)
-                TestRunner:assert(all:find("Style: Ink drawing", 1, true), all)
-                TestRunner:assert(all:find("Write the prompt with AI: On", 1, true), all)
-                TestRunner:assert(all:find("Generate", 1, true) and all:find("Close", 1, true), all)
-                TestRunner:assert(tap(shown[#shown], "^Style:"), "the Style row")
-                TestRunner:assert(popup and popup.items[1].text == "Watercolor", "the Style picker")
-                TestRunner:assert(popup.items[1].after ~= nil, "handed the panel's reopen")
-                local before = #shown
-                popup.on_close()
-                TestRunner:assert(#shown == before + 1, "the panel comes back after the pick")
-                TestRunner:assert(tap(shown[#shown], "^Generate$"), "the action button")
-                TestRunner:assert(drew, "the action ran")
+                local ready = 0
+                features.image_gen_provider = "openai"
+                ImageGenerator.providerFirst(plugin, function() ready = ready + 1 end)
+                TestRunner:assertEquals(ready, 1, "a provider that draws: the popup at once")
+                TestRunner:assert(asked == nil, "no question")
                 features.image_gen_provider = "auto"
                 features.provider = "anthropic"
-                ImageOptions.show(plugin, {})
-                TestRunner:assert(not texts(shown[#shown]):find("model:", 1, true),
-                    "a chat provider that cannot draw: no model row")
+                ImageGenerator.providerFirst(plugin, function() ready = ready + 1 end)
+                TestRunner:assertEquals(ready, 1, "the question first")
+                TestRunner:assertEquals(asked.main, "anthropic")
+                TestRunner:assertEquals(asked.keyed, "openai", "the keyed image providers")
+                picked_cb("openai")
+                TestRunner:assertEquals(features.image_gen_provider, "openai", "the answer saved as Provider")
+                TestRunner:assertEquals(ready, 2, "then the popup")
+            end)
+            withApikeys({}, function()
+                asked = nil
+                local ready = 0
+                features.image_gen_provider = "auto"
+                ImageGenerator.providerFirst(plugin, function() ready = ready + 1 end)
+                TestRunner:assert(ready == 1 and asked == nil, "no key at all: nothing to ask, the generator's notice says it")
             end)
         end)
-        UIManager.show = real_show
+        ImageGenerator.askProvider = saved_ask
         if not ok then error(err, 0) end
     end)
 

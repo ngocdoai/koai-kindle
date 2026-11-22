@@ -46,6 +46,14 @@ local function store()
     return settings
 end
 
+--- The groups file was replaced on disk (a restore): drop the session's
+--- handle, so the next read opens the file as it is now. Kept, the handle
+--- still held the groups from before the restore and the next group change
+--- wrote those back over the restored file (audit 2026-11-12).
+function BookGroups.reload()
+    settings = nil
+end
+
 --- Test seam: inject a fake LuaSettings-like handle (readSetting/saveSetting/flush).
 function BookGroups._setStoreForTests(s)
     settings = s
@@ -369,6 +377,62 @@ function BookGroups.addBook(id, path)
     return false
 end
 
+--- Add several books in one write (the sweep of 2026-11-06: the add flows
+--- saved and notified once per book, a whole folder of fifty rewriting the
+--- file fifty times). Books already in the group are skipped.
+--- @return table the paths added, in order
+function BookGroups.addBooks(id, paths)
+    local added = {}
+    if type(paths) ~= "table" then return added end
+    local data = load()
+    for _idx, group in ipairs(data.groups) do
+        if group.id == id then
+            for _p, path in ipairs(paths) do
+                if type(path) == "string" and path ~= "" and not indexOf(group, path) then
+                    group.books[#group.books + 1] = path
+                    added[#added + 1] = path
+                end
+            end
+            if #added > 0 then save(data); notify(id) end
+            return added
+        end
+    end
+    return added
+end
+
+--- Put the group's books in this order, in one write: the listed paths
+--- first, in the list's order, then the unlisted ones as they were.
+--- @return boolean changed
+function BookGroups.setOrder(id, ordered_paths)
+    if type(ordered_paths) ~= "table" then return false end
+    local data = load()
+    for _idx, group in ipairs(data.groups) do
+        if group.id == id then
+            local present, placed = {}, {}
+            for _b, p in ipairs(group.books) do present[p] = true end
+            local books = {}
+            for _p, path in ipairs(ordered_paths) do
+                if present[path] and not placed[path] then
+                    placed[path] = true
+                    books[#books + 1] = path
+                end
+            end
+            for _b, p in ipairs(group.books) do
+                if not placed[p] then books[#books + 1] = p end
+            end
+            local changed = false
+            for i = 1, #books do
+                if books[i] ~= group.books[i] then changed = true end
+            end
+            if not changed then return false end
+            group.books = books
+            save(data); notify(id)
+            return true
+        end
+    end
+    return false
+end
+
 function BookGroups.removeBook(id, path)
     local data = load()
     for _idx, group in ipairs(data.groups) do
@@ -438,6 +502,30 @@ end
 
 function BookGroups.positionOf(group, path)
     return indexOf(group, path)
+end
+
+--- The words a carried row gives the book it comes from (#116, B393): in a
+--- series the book's number ("Book 3"), short enough to sit whole beside a
+--- role; otherwise the source title. The X-Ray browser's carried rows and
+--- the picture popup's entry list (B537) share it.
+--- @param book_file string|nil the book holding the carried rows
+--- @return function label(stub) -> string text, boolean short
+function BookGroups.carriedSourceLabeler(book_file)
+    local _ = require("koassistant.core.gettext")
+    local T = require("ffi/util").template
+    local pos = {}
+    for _idx, g in ipairs(BookGroups.groupsFor(book_file or "")) do
+        if BookGroups.kindOf(g) == BookGroups.KIND_SERIES then
+            for i, p in ipairs(g.books or {}) do
+                if pos[p] == nil then pos[p] = i end
+            end
+        end
+    end
+    return function(stub)
+        local n = type(stub.file) == "string" and pos[stub.file]
+        if n then return T(_("Book %1"), n), true end
+        return type(stub.source) == "string" and stub.source or "", false
+    end
 end
 
 --- Ordered neighbors of a book in its FIRST containing group (a book in

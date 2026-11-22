@@ -70,8 +70,27 @@ local NORMAL_STOPS = {
     end_turn = true, max_tokens = true, stop_sequence = true, tool_use = true,  -- Anthropic
     pause_turn = true,
     STOP = true, MAX_TOKENS = true,                                            -- Gemini
+    model_length = true,                                                       -- Mistral's "length"
+    -- "The model wrote its end-of-sequence token": a natural stop by its
+    -- meaning, as text-generation-inference servers spell it. Unknown to this
+    -- list, it marked every whole answer of such a server as stopped early,
+    -- and no X-Ray or other saved result was ever kept there ("X-Ray not
+    -- saved: the answer stopped before it finished", seen with the stub
+    -- provider in the real app, audit 2026-11-12).
+    eos = true, eos_token = true,
 }
 ResponseParser.STOP_PREFIX = ResponseParser.NOTICE_PREFIX .. " stopped early by the provider: "
+
+--- Whether a chat-completions finish reason means the answer was cut at a
+--- length limit: "length" everywhere, "model_length" on Mistral (the model's
+--- context ran out). ONE rule for the whole answers and for the stream: a
+--- reason that is normal in NORMAL_STOPS and unknown to the stream's cut check
+--- passed a cut answer as whole (audit 2026-11-12).
+--- @param reason any
+--- @return boolean
+function ResponseParser.isCutReason(reason)
+    return reason == "length" or reason == "model_length"
+end
 
 --- The finish reason when it is abnormal, else nil (nil/non-string = the json
 --- null sentinel or a missing field, never a reason).
@@ -99,6 +118,29 @@ function ResponseParser.withStopNotice(content, reason)
         return content .. ResponseParser.stopNotice(ab)
     end
     return content
+end
+
+-- A JSON null decodes to a function sentinel in KOReader's json, so a field
+-- read off a provider's message is a non-empty string or nothing: a null
+-- reasoning stored on a message made the saved chats file unloadable
+-- (sweep 2026-11-06).
+local function str(v)
+    if type(v) == "string" and v ~= "" then return v end
+    return nil
+end
+
+-- The tail every chat-completions transformer shares: a cut-off answer
+-- carries the truncation notice (finish_reason "length"; Mistral says
+-- "model_length") and an abnormal stop its notice, so the cache and the
+-- X-Ray writes read ResponseParser.isIncomplete. Until 2026-11-06 only the
+-- OpenAI, DeepSeek, NVIDIA and Z.AI transformers did this; the others saved
+-- a cut answer as whole.
+local function finishChat(content, choice)
+    local reason = type(choice) == "table" and choice.finish_reason or nil
+    if type(content) == "string" and content ~= "" and ResponseParser.isCutReason(reason) then
+        content = content .. ResponseParser.TRUNCATION_NOTICE
+    end
+    return ResponseParser.withStopNotice(content, reason)
 end
 
 -- Inline marker inserted where a web search ran mid-answer (report 3(b) decision,
@@ -394,6 +436,59 @@ end
 -- Response format transformers for each provider
 -- Returns: success, content, reasoning (reasoning is optional third return value)
 local RESPONSE_TRANSFORMERS = {
+    -- Amazon Bedrock Converse (PR #113): output.message.content blocks (text,
+    -- toolUse, reasoningContent); an error body is a bare message.
+    bedrock = function(response)
+        if response.error then
+            return false, response.error.message or response.error.type or "Unknown error"
+        end
+        if type(response.message) == "string" and not response.output then
+            return false, response.message
+        end
+        local message = response.output and response.output.message
+        if not message or type(message.content) ~= "table" then
+            return false, "Unexpected response format"
+        end
+        local tool_uses = {}
+        for _idx, block in ipairs(message.content) do
+            local tool_use = type(block) == "table" and block.toolUse
+            if type(tool_use) == "table" and type(tool_use.name) == "string" then
+                table.insert(tool_uses, {
+                    id = tool_use.toolUseId,
+                    name = tool_use.name,
+                    args = type(tool_use.input) == "table" and tool_use.input or {},
+                })
+            end
+        end
+        if #tool_uses > 0 then
+            return true, {
+                _tool_calls = true,
+                calls = tool_uses,
+                raw_assistant_turn = {
+                    role = message.role or "assistant",
+                    content = message.content,
+                },
+            }
+        end
+        local text, reasoning = {}, {}
+        for _idx, block in ipairs(message.content) do
+            if type(block.text) == "string" then
+                text[#text + 1] = block.text
+            elseif block.reasoningContent and block.reasoningContent.reasoningText
+                    and type(block.reasoningContent.reasoningText.text) == "string" then
+                reasoning[#reasoning + 1] = block.reasoningContent.reasoningText.text
+            end
+        end
+        local content = table.concat(text)
+        if content == "" then return false, "Unexpected response format" end
+        if response.stopReason == "max_tokens" then
+            content = content .. ResponseParser.TRUNCATION_NOTICE
+        else
+            content = ResponseParser.withStopNotice(content, response.stopReason)
+        end
+        return true, content, #reasoning > 0 and table.concat(reasoning) or nil
+    end,
+
     anthropic = function(response)
         if response.type == "error" and response.error then
             return false, response.error.message
@@ -531,7 +626,7 @@ local RESPONSE_TRANSFORMERS = {
             end
             -- Check for truncation (finish_reason: "length" means max tokens hit)
             local finish_reason = response.choices[1].finish_reason
-            if content and content ~= "" and finish_reason == "length" then
+            if content and content ~= "" and ResponseParser.isCutReason(finish_reason) then
                 content = content .. ResponseParser.TRUNCATION_NOTICE
             end
             content = ResponseParser.withStopNotice(content, finish_reason)
@@ -833,7 +928,7 @@ local RESPONSE_TRANSFORMERS = {
             local content = message.content
             -- Tool-call messages carry content:null → luajson's truthy function sentinel
             if type(content) ~= "string" then content = nil end
-            local reasoning = message.reasoning_content  -- DeepSeek reasoner returns this
+            local reasoning = str(message.reasoning_content)  -- DeepSeek reasoner returns this
 
             -- Book-tool function calls → neutral shape for the tool runner.
             -- raw_assistant_turn keeps message.reasoning_content: DeepSeek V3.2+
@@ -850,7 +945,7 @@ local RESPONSE_TRANSFORMERS = {
 
             -- Check for truncation
             local finish_reason = response.choices[1].finish_reason
-            if content and content ~= "" and finish_reason == "length" then
+            if content and content ~= "" and ResponseParser.isCutReason(finish_reason) then
                 content = content .. ResponseParser.TRUNCATION_NOTICE
             end
             content = ResponseParser.withStopNotice(content, finish_reason)
@@ -902,6 +997,10 @@ local RESPONSE_TRANSFORMERS = {
                     and response.message.thinking ~= "" then
                 reasoning = response.message.thinking
             end
+            if type(clean_content) == "string" and clean_content ~= ""
+                    and response.done_reason == "length" then
+                clean_content = clean_content .. ResponseParser.TRUNCATION_NOTICE
+            end
             return true, clean_content, reasoning
         end
         return false, "Unexpected response format"
@@ -930,7 +1029,7 @@ local RESPONSE_TRANSFORMERS = {
 
             -- Extract <think> tags from R1 models
             local clean_content, reasoning = extractThinkTags(content)
-            return true, clean_content, reasoning
+            return true, finishChat(clean_content, response.choices[1]), reasoning
         end
         return false, "Unexpected response format"
     end,
@@ -971,11 +1070,11 @@ local RESPONSE_TRANSFORMERS = {
                 end
                 local text = table.concat(text_parts, "\n")
                 local thinking = #think_parts > 0 and table.concat(think_parts, "\n") or nil
-                return true, text, thinking
+                return true, finishChat(text, response.choices[1]), thinking
             end
             -- Non-Magistral models return a string (null sentinel normalized)
             if type(content) ~= "string" then content = nil end
-            return true, content
+            return true, finishChat(content, response.choices[1])
         end
         return false, "Unexpected response format"
     end,
@@ -1005,7 +1104,7 @@ local RESPONSE_TRANSFORMERS = {
             end
 
             -- xAI returns reasoning_content for grok reasoning models
-            local reasoning = message.reasoning_content
+            local reasoning = str(message.reasoning_content)
 
             -- Book-tool function calls → neutral shape for the tool runner
             -- (chat wire only — xai.lua never routes tool sessions to Responses)
@@ -1018,7 +1117,7 @@ local RESPONSE_TRANSFORMERS = {
                 }, reasoning, web_search_used
             end
 
-            return true, content, reasoning, web_search_used
+            return true, finishChat(content, response.choices[1]), reasoning, web_search_used
         end
         return false, "Unexpected response format"
     end,
@@ -1050,7 +1149,7 @@ local RESPONSE_TRANSFORMERS = {
             end
 
             -- OpenRouter normalizes reasoning to message.reasoning field
-            local reasoning = message.reasoning
+            local reasoning = str(message.reasoning)
 
             -- Book-tool function calls → neutral shape (OpenAI wire: arguments is a JSON string;
             -- type check, not truthiness: an explicit tool_calls:null is the luajson sentinel)
@@ -1076,7 +1175,7 @@ local RESPONSE_TRANSFORMERS = {
                 end
             end
 
-            return true, content, reasoning, web_search_used
+            return true, finishChat(content, response.choices[1]), reasoning, web_search_used
         end
         return false, "Unexpected response format"
     end,
@@ -1091,8 +1190,8 @@ local RESPONSE_TRANSFORMERS = {
 
             -- Requesty normalizes reasoning to message.reasoning (like OpenRouter);
             -- fall back to reasoning_content used by some backends.
-            local reasoning = message.reasoning or message.reasoning_content
-            return true, content, reasoning
+            local reasoning = str(message.reasoning) or str(message.reasoning_content)
+            return true, finishChat(str(content), response.choices[1]), reasoning
         end
         return false, "Unexpected response format"
     end,
@@ -1120,7 +1219,7 @@ local RESPONSE_TRANSFORMERS = {
             -- Passive extraction: Qwen thinking models return reasoning_content
             local reasoning = type(message.reasoning_content) == "string"
                 and message.reasoning_content or nil
-            return true, content, reasoning
+            return true, finishChat(content, response.choices[1]), reasoning
         end
         return false, "Unexpected response format"
     end,
@@ -1149,7 +1248,7 @@ local RESPONSE_TRANSFORMERS = {
             -- Passive extraction: Kimi thinking models return reasoning_content
             local reasoning = type(message.reasoning_content) == "string"
                 and message.reasoning_content or nil
-            return true, content, reasoning
+            return true, finishChat(content, response.choices[1]), reasoning
         end
         return false, "Unexpected response format"
     end,
@@ -1179,7 +1278,7 @@ local RESPONSE_TRANSFORMERS = {
             local reasoning = type(message.reasoning_content) == "string"
                 and message.reasoning_content or nil
             local clean_content, think_reasoning = extractThinkTags(content)
-            return true, clean_content, reasoning or think_reasoning
+            return true, finishChat(clean_content, response.choices[1]), reasoning or think_reasoning
         end
         return false, "Unexpected response format"
     end,
@@ -1212,7 +1311,7 @@ local RESPONSE_TRANSFORMERS = {
             local reasoning = type(message.reasoning_content) == "string"
                 and message.reasoning_content or nil
             local clean_content, think_reasoning = extractThinkTags(content)
-            return true, clean_content, reasoning or think_reasoning
+            return true, finishChat(clean_content, response.choices[1]), reasoning or think_reasoning
         end
         return false, "Unexpected response format"
     end,
@@ -1261,19 +1360,14 @@ local RESPONSE_TRANSFORMERS = {
                 end
             end
 
-            local finish_reason = response.choices[1].finish_reason
             if not content or content == "" then
                 -- Reasoning ran to the token ceiling without producing an answer.
                 return true, ResponseParser.interruptedNotice(
                     "the model returned only its reasoning"), reasoning
             end
-            if finish_reason == "length" then
-                content = content .. ResponseParser.TRUNCATION_NOTICE
-            end
-            content = ResponseParser.withStopNotice(content, finish_reason)
 
             local clean_content, think_reasoning = extractThinkTags(content)
-            return true, clean_content, reasoning or think_reasoning
+            return true, finishChat(clean_content, response.choices[1]), reasoning or think_reasoning
         end
         return false, "Unexpected response format"
     end,
@@ -1283,10 +1377,10 @@ local RESPONSE_TRANSFORMERS = {
             return false, response.error.message or response.error.type or "Unknown error"
         end
         if response.choices and response.choices[1] and response.choices[1].message then
-            local content = response.choices[1].message.content
+            local content = str(response.choices[1].message.content)
             -- Extract <think> tags from R1 models
             local clean_content, reasoning = extractThinkTags(content)
-            return true, clean_content, reasoning
+            return true, finishChat(clean_content, response.choices[1]), reasoning
         end
         return false, "Unexpected response format"
     end,
@@ -1317,9 +1411,16 @@ local RESPONSE_TRANSFORMERS = {
                 end
                 if #texts > 0 or #thinks > 0 then
                     local reasoning = #thinks > 0 and table.concat(thinks, "\n") or nil
-                    return true, table.concat(texts, ""), reasoning
+                    local text = table.concat(texts, "")
+                    if text ~= "" and response.finish_reason == "MAX_TOKENS" then
+                        text = text .. ResponseParser.TRUNCATION_NOTICE
+                    end
+                    return true, text, reasoning
                 end
             elseif type(content) == "string" then
+                if content ~= "" and response.finish_reason == "MAX_TOKENS" then
+                    content = content .. ResponseParser.TRUNCATION_NOTICE
+                end
                 return true, content
             end
         end
@@ -1333,8 +1434,8 @@ local RESPONSE_TRANSFORMERS = {
         if response.choices and response.choices[1] and response.choices[1].message then
             local message = response.choices[1].message
             -- Passive extraction: Doubao thinking models return reasoning_content
-            local reasoning = message.reasoning_content
-            return true, message.content, reasoning
+            local reasoning = str(message.reasoning_content)
+            return true, finishChat(str(message.content), response.choices[1]), reasoning
         end
         return false, "Unexpected response format"
     end,
@@ -1345,13 +1446,9 @@ local RESPONSE_TRANSFORMERS = {
         end
         if response.choices and response.choices[1] and response.choices[1].message then
             local message = response.choices[1].message
-            local content = message.content
-            local reasoning = message.reasoning_content  -- GLM-4.5+ returns this
+            local content = finishChat(str(message.content), response.choices[1])
+            local reasoning = str(message.reasoning_content)  -- GLM-4.5+ returns this
             -- Check for truncation
-            local finish_reason = response.choices[1].finish_reason
-            if content and content ~= "" and finish_reason == "length" then
-                content = content .. ResponseParser.TRUNCATION_NOTICE
-            end
             -- Check for web search usage (top-level array in Z.AI responses)
             local web_search_used = nil
             if type(response.web_search) == "table" and #response.web_search > 0 then
@@ -1459,7 +1556,11 @@ function ResponseParser:parseResponse(response, provider)
                                    provider, response_str)
     end
 
-    return success, result, reasoning, web_search_used
+    -- An emoji a provider wrote as an escape pair leaves KOReader's JSON
+    -- decoder as two invalid halves: joined here, the one exit of every
+    -- whole answer (audit 2026-11-12; the stream joins its own pieces)
+    local joinSurrogates = require("koassistant.request.scope_resolver").joinSurrogates
+    return success, joinSurrogates(result), joinSurrogates(reasoning), web_search_used
 end
 
 -- Expose citation formatter for stream handler

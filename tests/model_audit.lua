@@ -147,6 +147,7 @@ ModelAudit.NOISE = {
     qwen = {
         "asr", "tts", "livetranslate", "realtime", "omni", "qwen-mt", "character",
         "s2s", "tingwu", "captioner", "wan2", "z-image", "-vl-", "qvq",
+        "pre-mock",  -- Model Studio's gateway test entries (pre-mock_ptu_auth_v2_*, 2026-11-06)
     },
     together = { "lora", "-base" },  -- LoRA adapters and base (non-instruct) weights
 }
@@ -174,6 +175,7 @@ ModelAudit.DELIBERATE_SKIPS = {
         ["claude-opus-4-7"] = "superseded by opus-5-5 (custom-add if wanted)",
         ["claude-opus-4-8"] = "left the picker 2026-10-11: one previous version per line (opus-5)",
         ["claude-sonnet-4-6"] = "left the picker 2026-10-11: one previous version per line (sonnet-5)",
+        ["claude-fable-5"] = "left the picker 2026-11-18: one previous version per line (fable-5-1)",
     },
     gemini = {
         ["gemini-3-flash-preview"] = "3.0 preview, superseded by 3.1+ stable",
@@ -186,14 +188,15 @@ ModelAudit.DELIBERATE_SKIPS = {
         ["gemini-2.0-flash-001"] = "old generation",
         ["gemini-2.0-flash-lite"] = "old generation",
         ["gemini-2.0-flash-lite-001"] = "old generation",
-        ["gemini-2.5-flash"] = "left the picker 2026-10-14: served only to accounts that used 2.5 before",
-        ["gemini-2.5-pro"] = "left the picker 2026-10-14: served only to accounts that used 2.5 before",
+        -- gemini-2.5-flash and -pro are in _retired since 2026-11-07 (rerouted 2026-12-01)
         ["gemini-2.5-flash-lite"] = "left the picker 2026-10-14: served only to accounts that used 2.5 before",
+        ["gemini-3.1-pro-preview"] = "left the picker 2026-11-18: one previous frontier per line (argon)",
     },
     openai = {
         ["chat-latest"] = "ChatGPT-tuned rolling alias",
         ["gpt-5.3-chat-latest"] = "ChatGPT-tuned rolling alias",
         ["gpt-5.6-sol"] = "left the picker 2026-10-11: one previous sol per line (6-sol)",
+        ["gpt-6-sol"] = "left the picker 2026-11-18: one previous sol per line (6.1-sol)",
         ["gpt-5.5"] = "left the picker 2026-10-11: previous flagship, pricier than 6.1-sol",
         ["gpt-5.4"] = "left the picker 2026-10-11: the 5.4 line ended, 6-luna is cheaper",
         ["gpt-5.4-mini"] = "left the picker 2026-10-11: the 5.4 line ended, 6-luna is cheaper",
@@ -242,7 +245,19 @@ ModelAudit.DELIBERATE_SKIPS = {
         ["command-r-plus-08-2024"] = "older generation",
         ["command-a-vision-07-2025"] = "vision model",
         ["c4ai-aya-vision-32b"] = "vision model",
-        ["north-mini-code-1-0"] = "coding model",
+        ["north-mini-code-1.0"] = "coding model",
+        -- 2026-11-06: specialised endpoints (translation, Arabic, the tiny Aya set)
+        ["command-a-translate-08-2025"] = "translation model",
+        ["north-small-translate-1.0"] = "translation model",
+        ["command-r7b-arabic-02-2025"] = "regional variant of the curated r7b",
+        ["c4ai-aya-expanse-32b"] = "older multilingual generation",
+        ["tiny-aya-earth"] = "tiny regional model",
+        ["tiny-aya-fire"] = "tiny regional model",
+        ["tiny-aya-global"] = "tiny regional model",
+        ["tiny-aya-water"] = "tiny regional model",
+    },
+    zai = {
+        ["glm-5.3-flashx-legal"] = "legal-domain variant of the curated flashx (2026-11-06)",
     },
 }
 
@@ -312,6 +327,8 @@ ModelAudit.REVIEWED = {
             "writer/palmyra-creative-122b", "writer/palmyra-fin-70b-32k",
             "writer/palmyra-med-70b", "writer/palmyra-med-70b-32k", "z-ai/glm-5.3",
             "z-ai/glm-5.3-flash", "zyphra/zamba2-7b-instruct",
+            -- 2026-11-18: read timeouts on the first request (m3.1-flash on 2026-11-06 too)
+            "minimaxai/minimax-m3.1-flash", "moonshotai/kimi-k3.1-pro",
     } },
     -- The whole /v1/models catalog probed through the handler 2026-09-28
     -- (docs/perplexity_agent_plan.md, round 2); exceptions live in
@@ -353,6 +370,13 @@ ModelAudit.REVIEWED = {
             "perplexity/nemotron-3-ultra-550b-a55b", "xai/grok-4.20-multi-agent",
             "xai/grok-4.20-non-reasoning", "xai/grok-4.20-reasoning", "xai/grok-4.3",
             "xai/grok-4.5", "xai/grok-4.6",
+            -- 2026-11-18: fable-5-2 and gpt-6.2-astra searched and cited with the handler's
+            -- default body (not listed: no frontier id is, here); gemini-4-carbon searched
+            -- and cited, its stream leg cut by the account's quota, gemini-4-hydrogen and
+            -- the nemotron id not probed for the same reason; gpt-6-sol left the picker
+            "anthropic/claude-fable-5-2", "openai/gpt-6.2-astra", "openai/gpt-6-sol",
+            "google/gemini-4-carbon", "google/gemini-4-hydrogen",
+            "perplexity/nemotron-3.5-super-120b-a12b",
     } },
 }
 
@@ -4082,6 +4106,35 @@ ModelAudit.WRITER_BENCH = {
     { id = "note", passage = "A small cottage at the edge of the moor.", note = "make it night, with one lit window" },
     { id = "spoiler", passage = "She opened the letter.", spoiler = true,
       around = { before = "The postman had come late, soaked through.", after = " Her hands shook." } },
+    -- The moment's setting only further back than the frame's 400 a side,
+    -- past the end of an earlier scene in another place (a kitchen)
+    { id = "setting-far", passage = "Tom coughed into his sleeve, a long, tearing cough that bent him double, and when he straightened his eyes were wet.",
+      around = { before = table.concat({
+          'Her mother set the kettle on the stove and wiped her hands on her apron. "Don\'t be late," she said, and turned back to the window over the sink, where the geraniums were dying in their pots.',
+          "The night bus was nearly empty. Ilse took the back seat, the one over the engine, and Tom dropped in beside her with his collar still turned up against the rain. The windows were fogged, and the streetlights slid past as orange smears.",
+          '"You didn\'t tell her," Tom said.',
+          '"Tell her what?"',
+          '"Where we\'re going."',
+          'Ilse shrugged. "She\'d only worry. She worries about everything. Last week it was the boiler, the week before that my cousin\'s wedding, and before that the neighbour\'s dog."',
+          '"And this week?"',
+          '"This week it\'s me. Same as every week, really. She just finds new reasons." She picked at a loose thread on her sleeve until it came away in her fingers. "We could still go back, you know. Nobody would know we\'d left."',
+          '"We could," Tom said, but he did not move, and neither did she.',
+      }, "\n"),
+          after = ' "It\'s nothing," he said before she could ask. "It\'s the cold, that\'s all." She unwound her scarf and wrapped it round his neck anyway, and he let her, and for a long while neither of them said anything at all.' } },
+    -- Nothing says where the moment happens; the entry names where he lives
+    { id = "setting-none", passage = "Ned laughed so hard he had to sit down, and then he laughed some more, wiping his eyes with the back of his hand.",
+      around = { before = '"And then," Priya said, "he tried to apologise, and knocked the whole tray over. Again."',
+          after = ' "Stop," he managed. "Stop, I can\'t breathe."' },
+      entries = { { name = "Ned", type = "person",
+          description = "A student in his twenties, lanky, with a shock of red hair and a frayed green jumper; lives in the shared house on Mill Lane with three others and works nights at the bakery." } } },
+    -- Who the man is only in the entry and the word "warriors"; his clothes
+    -- say someone else
+    { id = "identity", passage = "A dozen warriors came down the slope on their ponies. Their chief was a tall man in a stolen cavalry officer's coat, a woollen cap and riding boots, a lance across his saddle.",
+      entries = { { name = "Kesh", type = "person",
+          description = "The Comanche war chief who leads the raid on the river settlements; patient, feared, older than most of his warriors." } } },
+    -- A person to draw whose description says nowhere where she is
+    { id = "entry-person", entry = { name = "Agnes Hallam", type = "person", aliases = { "Mrs Hallam" },
+        description = "A retired schoolteacher in her seventies, small and very upright, silver hair in a tight bun, round steel spectacles, always in a grey cardigan; sharp-tongued but kind, and the first to notice when something is wrong." } },
     { id = "entry-place", entry = { name = "the Black Rocks", type = "place",
         description = "Jagged basalt at the mouth of the bay where the lighthouse stands; covered at high tide, black and slick with weed." } },
     { id = "entry-idea", entry = { name = "Solitude", type = "idea",
@@ -4089,7 +4142,7 @@ ModelAudit.WRITER_BENCH = {
       style = "woodcut" },
 }
 
-local function runWriterBench(providers, apikeys)
+local function runWriterBench(providers, apikeys, fast_model)
     local PromptWriter = require("koassistant.images.prompt_writer")
     local ImageGenerator = require("koassistant.images.image_generator")
     local ResponseParser = require("koassistant.api.response_parser")
@@ -4097,8 +4150,11 @@ local function runWriterBench(providers, apikeys)
     local failures = 0
     local saved = {}
     for _i, main in ipairs(providers) do
-        local provider, model = PromptWriter.target({}, main)
-        banner("IMAGE PROMPT WRITER " .. tostring(provider) .. " / " .. tostring(model))
+        -- each provider's chat model (its default), as the plugin's own default;
+        -- --fast-model: its fast model, as Prompt writer's Fast model
+        local provider, model = PromptWriter.target({ image_gen_writer_model = fast_model and "fast" or nil }, main)
+        banner("IMAGE PROMPT WRITER " .. tostring(provider) .. " / " .. tostring(model
+            or require("koassistant.request.model_constraints").dispatchModel({ provider = provider })))
         local key = keyFor(apikeys, provider)
         local hok, Handler = pcall(require, "koassistant.api." .. tostring(provider))
         if not TestConfig.isValidApiKey(key) then
@@ -4247,6 +4303,7 @@ local function main()
     local mode, probe_provider, probe_model = "discover", nil, nil
     local image_shape, image_detail
     local recheck_ceilings = false
+    local writer_fast = false
     local i = 1
     while i <= #arg do
         local a = arg[i]
@@ -4254,7 +4311,7 @@ local function main()
             print("Usage: lua tests/model_audit.lua [providers...] [--probe <provider> <model>] " ..
                   "[--probe-new] [--recheck [--ceilings]] [--pins] [--keys] [--images] " ..
                   "[--image-probe <provider> <model> [--shape fit|portrait|landscape|square|auto] " ..
-                  "[--detail draft|standard|best]] [--image-writer [providers]] [--verbose]")
+                  "[--detail draft|standard|best]] [--image-writer [providers] [--fast-model]] [--verbose]")
             os.exit(0)
         elseif a == "--verbose" or a == "-v" then
             verbose = true
@@ -4280,6 +4337,8 @@ local function main()
             mode = "images"
         elseif a == "--image-writer" then
             mode = "image-writer"
+        elseif a == "--fast-model" then
+            writer_fast = true
         elseif a == "--image-probe" then
             mode = "image-probe"
             probe_provider, probe_model = arg[i + 1], arg[i + 2]
@@ -4332,7 +4391,7 @@ local function main()
 
     if mode == "image-writer" then
         if #providers == 0 then providers = { "anthropic", "gemini" } end
-        finish(runWriterBench(providers, apikeys) > 0 and 1 or 0)
+        finish(runWriterBench(providers, apikeys, writer_fast) > 0 and 1 or 0)
     end
 
     if mode == "image-probe" then

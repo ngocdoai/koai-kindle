@@ -477,6 +477,26 @@ TestRunner:test("queryWith delegates to query_fn when shouldUse is false", funct
     TestRunner:assertEqual(final.answer, "direct answer", "direct path answer propagated")
 end)
 
+TestRunner:test("queryWith sends a chat's first question once (the shown copy stays out)", function()
+    -- The stored chat after its first answer, as the input dialog's Send leaves it
+    local stored = {
+        { role = "user", content = "[User Question]\nhow are you today", is_context = true },
+        { role = "user", content = "how are you today", is_context = false },
+        { role = "assistant", content = "Well, thanks." },
+        { role = "user", content = "and now?", is_context = false },
+    }
+    local sent
+    BookToolRunner.queryWith(function(messages, _cfg, callback)
+        sent = messages
+        callback(true, "fine")
+    end, stored, { provider = "perplexity", features = {} }, function() end, {}, nil)
+    TestRunner:assertEqual(#sent, 3, "three messages go out")
+    TestRunner:assertEqual(sent[1], stored[1], "the context message, which holds the question")
+    TestRunner:assertEqual(sent[2].role, "assistant", "then the answer")
+    TestRunner:assertEqual(sent[3].content, "and now?", "then the reply")
+    TestRunner:assertEqual(#stored, 4, "the stored chat is untouched")
+end)
+
 TestRunner:test("queryWith routes through tool runner when shouldUse is true", function()
     local query_calls = 0
     local function query_fn(_messages, _cfg, callback)
@@ -642,7 +662,7 @@ TestRunner:test("gather: empty bundle note mentions web search when available", 
     -- All lookups fail (unknown tool → ok=false → skipped by the bundle) so the
     -- honest "[Book lookup note]" fires; with web search on it must not read as an
     -- instruction to skip searching.
-    local function run(features_extra)
+    local function run(features_extra, provider)
         local calls = 0
         local gen_messages
         local function query_fn(messages, _config, callback)
@@ -666,7 +686,7 @@ TestRunner:test("gather: empty bundle note mentions web search when available", 
         BookToolRunner.run({
             query_fn = query_fn,
             messages = { { role = "user", content = "who were his parents?" } },
-            config = { provider = "anthropic", features = features },
+            config = { provider = provider or "anthropic", features = features },
             ui = makeUi(),
             on_complete = function() end,
         })
@@ -688,6 +708,14 @@ TestRunner:test("gather: empty bundle note mentions web search when available", 
     TestRunner:assertTrue(without_web ~= nil, "note present with web off")
     TestRunner:assertTrue(without_web:find("Search the web", 1, true) == nil,
         "no web mention when web search is off")
+
+    -- a provider whose web search is per model, on a config with no model set
+    -- (the routine route): the note reads the model the request goes to, the
+    -- provider's default (one model id per request; the sweep of 2026-11-06)
+    local gemini_default = run({ enable_web_search = true }, "gemini")
+    TestRunner:assertTrue(gemini_default ~= nil, "note present")
+    TestRunner:assertTrue(gemini_default:find("Search the web", 1, true) ~= nil,
+        "the default model's web search counts (a bare config.model read as none)")
 end)
 
 TestRunner:test("gather: done alongside lookups in one turn executes the lookups first", function()

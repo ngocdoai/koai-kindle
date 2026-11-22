@@ -524,6 +524,25 @@ end
 -- How strict a state is, for a kind sent to more than one provider
 local STATE_RANK = { allow = 0, ask = 1, never = 2 }
 
+--- What a saved result was built with beyond the book's text, for a run that
+--- continues it (an update sends the result back with the new text): the
+--- kinds as optional entries of an explicit list (needsFor's opts.kinds) and
+--- the question's line for each. `name` = the result's name ("X-Ray").
+--- @return table kinds, table amounts
+function DataAccess.baseKinds(entry, name)
+    local kinds, amounts = {}, {}
+    local k = type(entry) == "table" and Gates.stampedKinds(entry) or {}
+    if k.highlights then
+        kinds[#kinds + 1] = { kind = "highlights", required = false }
+        amounts.highlights = T(_("the saved %1, which was built with your highlights"), name)
+    end
+    if k.annotations then
+        kinds[#kinds + 1] = { kind = "annotations", required = false }
+        amounts.annotations = T(_("the saved %1, which was built with your notes"), name)
+    end
+    return kinds, amounts
+end
+
 --- What a run wants, with each kind's state: the action's declarations for
 --- its book (Gates.needs), a set of picked books (needsForSet), or an
 --- explicit list of kinds (a pick that is not an action). With opts.kinds,
@@ -859,7 +878,12 @@ function DataAccess.carriedKinds(md)
     local set = {}
     if has("book_text") or has("full_document") or has("incremental_book_text") then set.book_text = true end
     if has("highlights") then set.highlights = true end
-    if has("annotations") then set.annotations = true end
+    -- the annotations section holds the reader's notes unless it is the
+    -- highlights-only copy sent when notes were refused (B619: recorded as
+    -- notes, such a chat was refused at resume for notes it never held)
+    if has("annotations") then
+        if md._annotations_degraded == true then set.highlights = true else set.annotations = true end
+    end
     if has("notebook_content") then set.notebook = true end
     if has("library_content") then set.book_list = true end
     if type(md.stats_groups) == "table" and next(md.stats_groups) then set.habits = true end
@@ -1030,9 +1054,12 @@ function DataAccess.askForDispatch(plugin, action, features, ui, config, run_fn)
     local sm = cf._source_mode
     -- A refusal or a Cancel: the chat this run would have opened never starts
     -- (an input dialog closes before its action dispatches), so the chat's
-    -- allowance ends here, never reaching a later request
+    -- allowance ends here, never reaching a later request; the same for every
+    -- other just-in-time key the dispatch would have consumed from this config
+    -- (a run option, the chips' state, the scope pick: Dialogs.DISPATCH_TRANSIENTS),
+    -- which a shared config would otherwise hand to the next, unrelated request
     local function drop()
-        cf._data_once = nil
+        require("koassistant.ui.dialogs").dropDispatchTransients(cf)
     end
     -- Book info None (B500): an action with nothing of the book to go on but
     -- its title says so, instead of asking the AI about "this book"
@@ -1069,6 +1096,22 @@ function DataAccess.askForDispatch(plugin, action, features, ui, config, run_fn)
             if action.use_analyze_cache then stamps.analyze = stored(function() return ex:getAnalyzeCache() end) end
             if action.use_summary_cache or sm == "summary" then
                 stamps.summary = stored(function() return ex:getSummaryCache() end)
+            end
+        end
+    end
+    -- The run's own saved result, when the run continues it (an action with
+    -- an update prompt, not a rebuild): its stamps are asked too
+    -- (Gates.needs, stamps.own)
+    local own_amounts
+    if path and action.update_prompt and action.id and not cf._xray_rebuild and not cf._ladder_fresh then
+        local okc, ActionCache = pcall(require, "koassistant.artifacts.action_cache")
+        local okg, own = pcall(function() return okc and ActionCache.get(path, action.id) end)
+        if okg and type(own) == "table" and own.result then
+            local kinds
+            kinds, own_amounts = DataAccess.baseKinds(own, action.text or action.id)
+            if #kinds > 0 then
+                stamps = stamps or {}
+                stamps.own = own
             end
         end
     end
@@ -1119,13 +1162,23 @@ function DataAccess.askForDispatch(plugin, action, features, ui, config, run_fn)
     if live and ui.annotation and type(ui.annotation.annotations) == "table" then
         local n, notes = 0, 0
         for _idx, a in ipairs(ui.annotation.annotations) do
-            if type(a) == "table" and type(a.text) == "string" and a.text ~= "" then
+            if require("koassistant.request.context_extractor").isHighlight(a) then
                 n = n + 1
                 if type(a.note) == "string" and a.note ~= "" then notes = notes + 1 end
             end
         end
         amounts.highlights = T(_("your highlights (%1)"), n)
         amounts.annotations = T(_("your notes on highlights (%1)"), notes)
+    end
+    -- A kind asked only for the saved result's sake says so: the run sends
+    -- the result, not today's highlights
+    if stamps and stamps.own and own_amounts then
+        if not action.use_highlights and not action.use_annotations then
+            amounts.highlights = own_amounts.highlights or amounts.highlights
+        end
+        if not action.use_annotations then
+            amounts.annotations = own_amounts.annotations or amounts.annotations
+        end
     end
     -- What the run has to send (2026-10-20): an optional kind with nothing
     -- behind it is not asked (Gates.needs opts.exists): the reading habits
@@ -1153,7 +1206,7 @@ function DataAccess.askForDispatch(plugin, action, features, ui, config, run_fn)
     if live and ui.annotation and type(ui.annotation.annotations) == "table" then
         local n, notes = 0, 0
         for _idx, a in ipairs(ui.annotation.annotations) do
-            if type(a) == "table" and type(a.text) == "string" and a.text ~= "" then
+            if require("koassistant.request.context_extractor").isHighlight(a) then
                 n = n + 1
                 if type(a.note) == "string" and a.note ~= "" then notes = notes + 1 end
             end

@@ -106,6 +106,7 @@ Registry.SETTINGS_SUBKEYS = {
         "selected_behavior", "selected_domain", "trusted_providers",
         "gesture_actions", "markdown_font_size", "export_custom_path",
         "session_chips", "_dismissed_session_chips",
+        "_dismissed_gesture_actions",                        -- top-level (see TOPLEVEL_SUBKEYS): the gesture defaults the reader removed (B581)
         "minimal_popup_actions",
         "ollama_num_ctx",           -- ollama context-window cap (model menu row; nil = automatic sizing)
         "xray_default_categories",  -- global default for new X-Rays' category groups (presets v0.21)
@@ -116,8 +117,15 @@ Registry.SETTINGS_SUBKEYS = {
         "run_recent_models",        -- the hold menu's recent "More models…" picks (B345; newest first)
         "library_recent_folders",   -- folders added on the fly for a library run (newest first, five; never scan folders of their own)
         "favorite_models",          -- favorite models (B345): the long-press menus' first model spots; ♥ in pickers
+        "rtl_font",                 -- the font of right-to-left text in the Markdown view (nil = Noto Naskh Arabic, a family KOReader knows, false = none; B558)
     },
     internal = {
+        -- The custom behaviors' and domains' id counters (never reused; the
+        -- sweep of 2026-11-06). Internal, not assets: Fresh Start drops the
+        -- assets and keeps every book's own domain value, so a counter that
+        -- started over handed the next domain an id some book still points
+        -- at (audit 2026-11-12)
+        "custom_behavior_next_id", "custom_domain_next_id",
         "languages_migrated", "behavior_migrated",
         "_reasoning_v2_migrated",
         "codex_models_reset_v1",    -- Kindle build: hand-picked Codex models cleared once
@@ -151,6 +159,7 @@ Registry.SETTINGS_SUBKEYS = {
         "_privacy_ask_migrated",   -- the sharing switches reset to Ask (B395 slice 2, migrations.lua)
         "_privacy_notice_pending", -- the one-time notice of that reset, cleared when shown (data_access.lua)
         "_privacy_decided",        -- a privacy preset was picked or Ask kept: the Setup Wizard's privacy probe (main.lua applyPrivacyPreset, setup_wizard.lua stepPrivacy)
+        "_stream_autoscroll_off_migrated",  -- a stored "on" of Auto-scroll Streaming cleared once for the new default, off (B752, migrations.lua)
     },
 }
 
@@ -162,6 +171,7 @@ Registry.TOPLEVEL_SUBKEYS = {
     custom_actions = true,
     custom_prompts = true,
     setup_wizard_completed = true,
+    _dismissed_gesture_actions = true,
 }
 
 -- ── The inventory ────────────────────────────────────────────────────────────
@@ -202,19 +212,19 @@ Registry.entries = {
     {
         id = "pinned_general", label = "Pinned (general)",
         location = "settings_dir", ref = "koassistant_pinned_general.lua",
-        category = "artifacts", backup = true,
+        category = "artifacts", backup = true, merge = "pins",
         reset_in = { "wipe_all" }, opt_in_reset = true, uninstall = true,
     },
     {
         id = "pinned_library", label = "Pinned (library)",
         location = "settings_dir", ref = "koassistant_pinned_library.lua",
-        category = "artifacts", backup = true,
+        category = "artifacts", backup = true, merge = "pins",
         reset_in = { "wipe_all" }, opt_in_reset = true, uninstall = true,
     },
     {
         id = "book_groups", label = "Groups",
         location = "settings_dir", ref = "koassistant_book_groups.lua",
-        category = "artifacts", backup = true,
+        category = "artifacts", backup = true, merge = "groups",
         reset_in = { "wipe_all" }, opt_in_reset = true, uninstall = true,
         notes = "User-authored ordered book groups (item 46). NOT an index — never auto-pruned or rebuilt; missing member files stay listed.",
     },
@@ -447,6 +457,13 @@ Registry.entries = {
         notes = "Kept images from highlight image generation (keep-all policy 2026-07-16); filenames carry date + prompt; koassistant/images/image_browser.lua manages deletion. Also holds koassistant_index.lua (the images index: book, prompt, who drew it, agenda 2b and image round S7) and thumbnails/ (one small JPEG per image, image round S7) — covered by dir-level flows, no separate entries. Preserved on teardown like exports.",
     },
     {
+        id = "fonts_dir", label = "Fonts of the Markdown view",
+        location = "data_dir", ref = "data/koassistant/images/koassistant_fonts",
+        category = "internal", backup = false, rebuildable = true,
+        reset_in = { "wipe_all" }, uninstall = true,
+        notes = "Copies of the font files the Markdown view draws Arabic, Hebrew, Devanagari and emoji with (koassistant/ui/script_fonts.lua, resource()): MuPDF 1.28 loads a font that a page's style sheet names only from the page's resource folder, so each face in use is copied here once and the window hands this folder to the renderer. Safe to delete: a missing file is copied again when an answer needs it.",
+    },
+    {
         id = "notebooks_vault_dir", label = "Notebook vault (default)",
         location = "data_dir", ref = "data/koassistant/notebooks",
         category = "notebooks", backup = false,
@@ -539,6 +556,27 @@ function Registry.backupSettingsFiles()
     end
     return out
 end
+
+--- How a restore in Merge mode joins a backed-up settings-dir store with the
+--- one on the device: "pins" (a pin file: its pins by id), "groups" (the book
+--- groups file: its groups by id, the id counter never lower), nil = the
+--- backup's file replaces the device's.
+function Registry.mergeKind(ref)
+    for _, e in ipairs(Registry.entries) do
+        if e.location == "settings_dir" and e.ref == ref then return e.merge end
+    end
+    return nil
+end
+
+--- The settings' lists of things the reader made, each item with an `id`: a
+--- restore in Merge mode joins them by id (an item both hold takes the
+--- backup's version, an item only the device holds stays).
+Registry.MERGE_BY_ID = { "custom_domains", "custom_behaviors", "custom_providers" }
+
+--- The settings' id counters. No restore, in either mode, lowers one: an id
+--- handed out once is never handed out again (a book's own setting or an
+--- action may still point at it).
+Registry.ID_COUNTERS = { "custom_domain_next_id", "custom_behavior_next_id" }
 
 -- Plugin-folder dirs the backup includes (domains/, behaviors/).
 function Registry.backupPluginDirs()

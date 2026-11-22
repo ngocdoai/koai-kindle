@@ -1,4 +1,5 @@
 -- GFM-style pipe tables for KOReader's Markdown renderer.
+local Bidi = require("koassistant.ui.bidi")
 local ChatTables = {}
 
 local function splitRow(line)
@@ -97,17 +98,17 @@ local function renderTable(rows, align, available_em)
             out[#out + 1] = "<tr>"
             local tag = r == 1 and "th" or "td"
             for c, cell in ipairs(cells) do
-                out[#out + 1] = string.format('<%s align="%s">%s</%s>', tag, align[c], cell, tag)
+                out[#out + 1] = string.format('<%s style="text-align:%s">%s</%s>', tag, align[c], cell, tag)
             end
             out[#out + 1] = "</tr>"
         end
         out[#out + 1] = (#rows == 1 and "</thead>" or "</tbody>") .. "</table>"
     else
         for r = #rows == 1 and 1 or 2, #rows do
-            out[#out + 1] = '<div class="koa-table-row">'
+            out[#out + 1] = Bidi.STACK_OPEN
             for c, cell in ipairs(rows[r]) do
                 local label = r > 1 and header[c] ~= "" and ("<strong>" .. header[c] .. ":</strong> ") or ""
-                out[#out + 1] = "<p>" .. label .. (cell ~= "" and cell or "&#160;") .. "</p>"
+                out[#out + 1] = Bidi.STACK_LINE .. label .. (cell ~= "" and cell or "&#160;") .. "</p>"
             end
             out[#out + 1] = "</div>"
         end

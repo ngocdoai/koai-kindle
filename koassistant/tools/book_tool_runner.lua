@@ -958,8 +958,10 @@ function BookToolRunner.queryWith(query_fn, messages, cfg, callback, plugin, ui)
     end
     -- Live spoiler line: decorate a COPY per attempt — the ⚡ retry recursion above
     -- re-enters with the caller's original array, so every attempt carries exactly
-    -- one line, current as of that send.
-    local send_messages = BookToolRunner.decorateSpoilerMessages(messages,
+    -- one line, current as of that send. The shown copy of the first question
+    -- stays out of every request (MessageHistory.wireMessages).
+    local send_messages = BookToolRunner.decorateSpoilerMessages(
+        require("koassistant.request.message_history").wireMessages(messages),
         liveSpoilerLine(cfg, ui),
         cfg and cfg.features and cfg.features._spoiler_in_prompt)
     if BookToolRunner.shouldUse(cfg, ui) then
@@ -1317,7 +1319,7 @@ function BookToolRunner.run(params)
                 web_available = features.enable_web_search == true
             end
             web_available = web_available
-                and ModelConstraints.supportsWebSearch(provider, config.model)
+                and ModelConstraints.supportsWebSearch(provider, ModelConstraints.dispatchModel(config))
             if web_available then
                 context_text = "[Book lookup note]\nBook lookups found no relevant passages for this question. Search the web if that would help answer it; otherwise answer from the conversation and general knowledge, and say so when the book text would have been needed."
             else

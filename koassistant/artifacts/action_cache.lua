@@ -625,6 +625,11 @@ function ActionCache.clearAll(document_path)
     ActionCache.clearXrayCheckpoints(document_path)
     ActionCache.clearXrayLadder(document_path)
     updateArtifactIndex(document_path, nil)
+    -- the open book's marks redraw without its X-Ray (notifyEdited is
+    -- defined further down; the sweep of 2026-11-06)
+    if type(ActionCache.on_xray_edited) == "function" then
+        pcall(ActionCache.on_xray_edited, document_path)
+    end
     return true
 end
 
@@ -873,6 +878,16 @@ function ActionCache.getXrayCache(document_path)
     return ActionCache.get(document_path, ActionCache.XRAY_CACHE_KEY)
 end
 
+-- What a book's X-Ray matches changed (its live X-Ray written or deleted, a
+-- name the reader added, renamed, set to capitals or left unmatched): main.lua
+-- sets ActionCache.on_xray_edited, which redraws the open page's underlines
+-- now instead of at the next page turn
+local function notifyEdited(document_path)
+    if type(ActionCache.on_xray_edited) == "function" then
+        pcall(ActionCache.on_xray_edited, document_path)
+    end
+end
+
 --- Save X-Ray to reusable cache
 --- @param document_path string The document file path
 --- @param result string The X-Ray text
@@ -891,6 +906,7 @@ function ActionCache.setXrayCache(document_path, result, progress_decimal, metad
             and not ActionCache.suppress_write_hook then
         pcall(ActionCache.on_live_xray_written, document_path)
     end
+    if ok then notifyEdited(document_path) end
     return ok
 end
 
@@ -962,6 +978,7 @@ function ActionCache.deleteXray(document_path, opts)
     if not opts.keep_versions then
         ActionCache.clearXrayCheckpoints(document_path)
     end
+    notifyEdited(document_path)
     return true
 end
 
@@ -1192,7 +1209,8 @@ function ActionCache.getUserAliases(document_path)
             and name ~= ActionCache.DEDUP_OFFERED_KEY
             and name ~= ActionCache.REMOVED_STUBS_KEY
             and name ~= ActionCache.PROMOTED_STUBS_KEY
-            and type(entry) == "table" and not entry.add and not entry.ignore then
+            and type(entry) == "table" and not entry.add and not entry.ignore
+            and not entry.ai_name and not entry.typed and not entry.case then
             -- Old format: plain array of strings
             data[name] = { add = entry }
         end
@@ -1207,6 +1225,8 @@ end
 function ActionCache.setUserAliases(document_path, aliases_table)
     local path = ActionCache.getUserAliasesPath(document_path)
     if not path then return false end
+    -- the automatic capitals ride the matchers' copy only (matchOverlay)
+    aliases_table[require("koassistant.xray.xray_parser").AUTO_CAPS_KEY] = nil
 
     -- Remove entries with no content (the reserved pair-list keys hold
     -- arrays of pairs, not add/ignore lists — judged on their own emptiness)
@@ -1223,7 +1243,10 @@ function ActionCache.setUserAliases(document_path, aliases_table)
         else
             local add = entry.add or {}
             local ignore = entry.ignore or {}
-            if #add == 0 and #ignore == 0 then
+            local typed = entry.typed or {}
+            local renamed = type(entry.ai_name) == "string" and entry.ai_name ~= ""
+            local cased = type(entry.case) == "table" and next(entry.case) ~= nil
+            if #add == 0 and #ignore == 0 and #typed == 0 and not renamed and not cased then
                 aliases_table[name] = nil
             end
         end
@@ -1232,6 +1255,7 @@ function ActionCache.setUserAliases(document_path, aliases_table)
     -- If nothing left, remove the file
     if not next(aliases_table) then
         os.remove(path)
+        notifyEdited(document_path)
         return true
     end
 
@@ -1242,7 +1266,10 @@ function ActionCache.setUserAliases(document_path, aliases_table)
         util.makePath(dir)
     end
 
-    local file, err = io.open(path, "w")
+    -- a temp file renamed over the old one, as saveCache does: a write a
+    -- full card cuts short never tears the reader's names (the sweep of 2026-11-06)
+    local tmp = path .. ".tmp"
+    local file, err = io.open(tmp, "w")
     if not file then
         logger.err("KOAssistant ActionCache: Failed to open user aliases file for writing:", err)
         return false
@@ -1293,14 +1320,184 @@ function ActionCache.setUserAliases(document_path, aliases_table)
                 file:write(", ignore = ")
                 write_array(file, entry.ignore)
             end
+            -- B533's rename record: the AI's name, the reader's typed names
+            if type(entry.ai_name) == "string" and entry.ai_name ~= "" then
+                file:write(string.format(", ai_name = %q", entry.ai_name))
+            end
+            if type(entry.typed) == "table" and #entry.typed > 0 then
+                file:write(", typed = ")
+                write_array(file, entry.typed)
+            end
+            -- B533 S2/S3: the reader's capitals per name ("capitals", or
+            -- "any", which keeps the automatic rule off the name)
+            if type(entry.case) == "table" and next(entry.case) then
+                local terms = {}
+                for term, how in pairs(entry.case) do
+                    if type(term) == "string" and (how == "capitals" or how == "any") then
+                        terms[#terms + 1] = term
+                    end
+                end
+                table.sort(terms)
+                if #terms > 0 then
+                    file:write(", case = {")
+                    for _ti, term in ipairs(terms) do
+                        file:write(string.format(" [%q] = %q,", term, entry.case[term]))
+                    end
+                    file:write(" }")
+                end
+            end
             file:write(" },\n")
         end
     end
     file:write("}\n")
-    file:close()
+    local closed, close_err = file:close()
+    local moved, move_err
+    if closed then moved, move_err = os.rename(tmp, path) end
+    if not moved then
+        os.remove(tmp)
+        logger.warn("KOAssistant ActionCache: user aliases not saved for", document_path, ":",
+            tostring(close_err or move_err))
+        return false
+    end
 
     logger.dbg("KOAssistant ActionCache: Saved user aliases for", document_path)
+    notifyEdited(document_path)
     return true
+end
+
+-- path -> { key, set, sig }: the automatic capitals, per the files they read
+local auto_caps_memo = {}
+
+local function fileKey(path)
+    local attr = path and lfs.attributes(path)
+    return attr and (tostring(attr.modification) .. ":" .. tostring(attr.size)) or "-"
+end
+
+--- The stored layouts of the name index this book is judged on: those of
+--- the book file as it is now (XrayIndex.currentLayouts, which read the same
+--- text), newest first; each name is judged on the first holding all its
+--- forms (XrayIndex.layoutHolding), since new forms are stored in the layout
+--- in use only (B597: the layout with the most forms could lack a name
+--- indexed after a font change). Empty until the index has the book.
+local function judgedLayouts(document_path)
+    return require("koassistant.xray.xray_index").currentLayouts(document_path)
+end
+
+--- The book's live X-Ray parsed with the reader's overlay merged, or nil
+--- (none, prose, an error).
+local function parsedLive(document_path)
+    local entry = ActionCache.getXrayCache(document_path)
+    if not (entry and type(entry.result) == "string" and entry.source_mode ~= "ai_knowledge") then return nil end
+    local XrayParser = require("koassistant.xray.xray_parser")
+    local data = XrayParser.isJSON(entry.result) and XrayParser.parse(entry.result)
+    if type(data) ~= "table" or data.error then return nil end
+    XrayParser.mergeUserAliases(data, ActionCache.getUserAliases(document_path))
+    return data, entry
+end
+
+--- The names this book's own usage sets to capitals only (B533 S3, the
+--- automatic default; XrayIndex.autoCaps over the stored layouts of the book
+--- file as it is now, which read the same text, each name on the first
+--- holding its forms: judgedLayouts), memoized on the name index, the X-Ray, the ladder, the
+--- reader's overlay and the book file. Empty until the index has the
+--- book: every name then matches any case, as before. The upcoming entities
+--- are judged too (#120: an entry known from the next checkpoint only, marked
+--- and matched while the install waits, "Lady" matching "my lady"): the
+--- newest built checkpoint ahead of the live X-Ray, which holds every earlier
+--- checkpoint's names, parsed once, the names judged already skipped.
+--- @param document_path string
+--- @param parsed table|nil the book's X-Ray already parsed with the reader's
+---   overlay merged (parsedXrayFor's), read instead of parsing it again
+--- @return table { [name lowered] = true }, string sig (the names, for memo keys)
+function ActionCache.autoCaps(document_path, parsed)
+    if not document_path then return {}, "" end
+    local XrayIndex = require("koassistant.xray.xray_index")
+    local key = fileKey(XrayIndex.path(document_path)) .. "|" .. fileKey(ActionCache.getPath(document_path))
+        .. "|" .. fileKey(ActionCache.getUserAliasesPath(document_path)) .. "|" .. fileKey(document_path)
+        .. "|" .. fileKey(ActionCache.getXrayLadderPath(document_path))
+    local memo = auto_caps_memo[document_path]
+    if memo and memo.key == key then return memo.set, memo.sig end
+    local set = {}
+    local layouts = judgedLayouts(document_path)
+    if #layouts > 0 then
+        local judged = {}
+        local function judge(data)
+            for n in pairs(XrayIndex.autoCaps(layouts, data, judged)) do set[n] = true end
+        end
+        local live_p = 0
+        if type(parsed) == "table" then
+            judge(parsed)
+            local entry = ActionCache.getXrayCache(document_path)
+            live_p = entry and (entry.full_document and 1.0 or tonumber(entry.progress_decimal)) or 0
+        else
+            local data, entry = parsedLive(document_path)
+            if data then
+                judge(data)
+                live_p = entry.full_document and 1.0 or tonumber(entry.progress_decimal) or 0
+            end
+        end
+        -- the newest built checkpoint past the live X-Ray (the one the peek
+        -- reads lies between them and its names are in it)
+        local XrayAuto = require("koassistant.xray.xray_auto")
+        local newest, newest_p
+        for _idx, rung in ipairs(ActionCache.getXrayLadder(document_path)) do
+            local p = rung.full_document and 1.0 or tonumber(rung.progress_decimal)
+            if p and type(rung.result) == "string" and not rung.intro
+                    and p > live_p + XrayAuto.LADDER_TOLERANCE and (not newest_p or p > newest_p) then
+                newest, newest_p = rung, p
+            end
+        end
+        if newest then
+            local XrayParser = require("koassistant.xray.xray_parser")
+            local data = XrayParser.isJSON(newest.result) and XrayParser.parse(newest.result)
+            if type(data) == "table" and not data.error then
+                XrayParser.mergeUserAliases(data, ActionCache.getUserAliases(document_path))
+                judge(data)
+            end
+        end
+    end
+    local names = {}
+    for n in pairs(set) do names[#names + 1] = n end
+    table.sort(names)
+    local sig = table.concat(names, "\0")
+    auto_caps_memo[document_path] = { key = key, set = set, sig = sig }
+    return set, sig
+end
+
+--- How the book writes one name, for the names screen (#120): P, the
+--- occurrences mid-sentence with every capital the name requires, and L,
+--- those with none of them (XrayIndex.capsEvidence, the automatic rule's
+--- own counts). nil until the index has the book and this name's forms.
+--- @param document_path string
+--- @param name string the name as written
+--- @param data table|nil the parsed X-Ray the entry belongs to (its other
+---   entries' longer names leave the count, as the rule does)
+--- @param entry table|nil the entry
+--- @return number|nil P, number L
+function ActionCache.capsCounts(document_path, name, data, entry)
+    if not (document_path and type(name) == "string" and name ~= "") then return nil end
+    local XrayIndex = require("koassistant.xray.xray_index")
+    local XrayParser = require("koassistant.xray.xray_parser")
+    local set = XrayParser.matchTermSet({ name = name, _caps = { [name:lower()] = true } })
+    if not (set and set.caps) then return nil end
+    local layout = XrayIndex.layoutHolding(judgedLayouts(document_path), set.all)
+    if not layout then return nil end
+    local handles = type(data) == "table" and entry and XrayParser.containingMatchHandles(data, entry) or nil
+    return XrayIndex.capsEvidence(layout, set, handles)
+end
+
+--- The reader's overlay as the matchers read it (B533 S3): the stored records
+--- (getUserAliases) and, under XrayParser.AUTO_CAPS_KEY, the automatic
+--- capitals, for XrayParser.mergeUserAliases. A copy for reading: what the
+--- names screen edits and saves is getUserAliases'.
+--- @param document_path string
+--- @return table overlay, string sig (autoCaps' names)
+function ActionCache.matchOverlay(document_path)
+    local out = {}
+    for k, v in pairs(ActionCache.getUserAliases(document_path)) do out[k] = v end
+    local auto, sig = ActionCache.autoCaps(document_path)
+    if next(auto) then out[require("koassistant.xray.xray_parser").AUTO_CAPS_KEY] = auto end
+    return out, sig
 end
 
 --- A reserved name list of the aliases sidecar as a lowercased-name set; the
@@ -1407,6 +1604,51 @@ end
 --- @return table pairs Array of { name_a, name_b }
 function ActionCache.neverMergePairsFrom(aliases_table)
     return pairListFrom(aliases_table, ActionCache.NEVER_MERGE_KEY)
+end
+
+--- The names the READER gave each entry, by the entry's main name (both
+--- lowercased): the names they added (the duplicate review's folded-in names
+--- land there too), the names they typed, and the AI's name an entry was
+--- renamed away from. The update's merge folds an incoming entry that carries
+--- one of these into that entry; a name only the model listed as an alias
+--- folds nothing (B732). Pure.
+--- @param aliases_table table getUserAliases output
+--- @return table names { [main_name_lower] = { [name_lower] = true } }
+function ActionCache.readerNamesFrom(aliases_table)
+    local names = {}
+    for main, rec in pairs(type(aliases_table) == "table" and aliases_table or {}) do
+        if type(main) == "string" and main:sub(1, 2) ~= "__" and type(rec) == "table" then
+            local set, any = {}, false
+            for _idx, list_key in ipairs({ "add", "typed" }) do
+                for _i, name in ipairs(type(rec[list_key]) == "table" and rec[list_key] or {}) do
+                    if type(name) == "string" and name ~= "" then
+                        set[name:lower()] = true
+                        any = true
+                    end
+                end
+            end
+            if type(rec.ai_name) == "string" and rec.ai_name ~= "" then
+                set[rec.ai_name:lower()] = true
+                any = true
+            end
+            if any then names[main:lower()] = set end
+        end
+    end
+    return names
+end
+
+--- What the reading-along update's merge takes from the reader's own file:
+--- the pairs never to merge, and the rule that an alias-only match needs the
+--- update's own bridge or the reader's name (B732). One read of the file.
+--- @param document_path string
+--- @return table opts for XrayParser.merge
+function ActionCache.updateMergeOptions(document_path)
+    local all = ActionCache.getUserAliases(document_path)
+    return {
+        never_pairs = ActionCache.neverMergePairsFrom(all),
+        alias_needs_bridge = true,
+        reader_names = ActionCache.readerNamesFrom(all),
+    }
 end
 
 --- Already-offered dedup-ask pairs (round 18). Pure.
@@ -1532,7 +1774,16 @@ function ActionCache.renameEntityKeys(document_path, category_key, old_name, new
     if type(old_rec) == "table" then
         local new_rec = all[new_name]
         if type(new_rec) == "table" then
-            for _idx, list_key in ipairs({ "add", "ignore" }) do
+            -- B533's rename record: the AI's name and the reader's typed names
+            new_rec.ai_name = new_rec.ai_name or old_rec.ai_name
+            -- and the names set to capitals only (S2)
+            if type(old_rec.case) == "table" then
+                new_rec.case = type(new_rec.case) == "table" and new_rec.case or {}
+                for term, how in pairs(old_rec.case) do
+                    if new_rec.case[term] == nil then new_rec.case[term] = how end
+                end
+            end
+            for _idx, list_key in ipairs({ "add", "ignore", "typed" }) do
                 local src = old_rec[list_key]
                 if type(src) == "table" then
                     new_rec[list_key] = new_rec[list_key] or {}
@@ -2306,8 +2557,11 @@ function ActionCache.promoteXrayLadderRung(document_path, rung, limit, opts)
             -- checkpoint was built from the text and does not hold it)
             local kept = XrayParser.keepPromoted(parsed,
                 ActionCache.getPromotedStubs(document_path))
+            -- B533: a checkpoint built from scratch names a renamed entry as
+            -- the AI did; the reader's name comes back
+            local renamed = XrayParser.keepRenames(parsed, ActionCache.getUserAliases(document_path))
             if u_added == 0 and u_refreshed == 0 and n == 0 and #woken == 0
-                    and dropped == 0 and kept == 0 then
+                    and dropped == 0 and kept == 0 and renamed == 0 then
                 return nil
             end
             return XrayParser.serialize(parsed), n, #woken, u_added + u_refreshed
@@ -2323,6 +2577,15 @@ function ActionCache.promoteXrayLadderRung(document_path, rung, limit, opts)
     local function pickFlag(archived, fallback)
         if archived ~= nil then return archived end
         return fallback
+    end
+    -- B536: the outgoing version's AI merges stay on record beside the
+    -- rung's own (the carry above brought their lines and rows across)
+    local merged_from, merged_from_books = rung.merged_from, rung.merged_from_books
+    if live and (live.merged_from or live.merged_from_books) then
+        local XrayMerge = require("koassistant.xray.xray_merge")
+        local led = XrayMerge.ledgerOf(rung)
+        for _idx, rec in ipairs(XrayMerge.ledgerOf(live)) do XrayMerge.appendMergedFrom(led, rec) end
+        if #led > 0 then merged_from, merged_from_books = led, XrayMerge.provenanceString(led) end
     end
     local meta = {
         model = rung.model or (live and live.model),
@@ -2344,8 +2607,8 @@ function ActionCache.promoteXrayLadderRung(document_path, rung, limit, opts)
         coverage_spans = rung.coverage_spans,
         producer = rung.producer,
         base_timestamp = rung.base_timestamp,
-        merged_from_books = rung.merged_from_books,
-        merged_from = rung.merged_from,
+        merged_from_books = merged_from_books,
+        merged_from = merged_from,
         -- The rung's OWN category stamp (nil = built full) — never the live
         -- entry's: the field describes the artifact it rides with
         xray_categories = rung.xray_categories,
@@ -2690,6 +2953,11 @@ end
 local parsed_xray_memo = {}
 local parsed_xray_memo_n = 0
 local PARSED_XRAY_MEMO_MAX = 12
+-- the files of the walk in progress (groupXrays, heldBackLater): a full memo
+-- drops what the walk does not read and never a book of the walk, so a
+-- group's books stay parsed between walks (13 group books wiped the memo on
+-- every page turn; the sweep of 2026-11-06)
+local parsed_xray_memo_walk = nil
 
 --- Nearest earlier X-Rayed book in the current book's ORDERED group (S2,
 --- ref #90): its parsed main X-Ray (own user aliases merged) answers
@@ -2717,8 +2985,12 @@ function ActionCache.parsedXrayFor(file)
     if not ca then return nil end
     local ap = ActionCache.getUserAliasesPath(file)
     local aa = ap and lfs.attributes(ap)
+    -- the name index and the book file join the stamp: the book's automatic
+    -- capitals change when the index learns the book, and read only the
+    -- book file as it is now (B533 S3)
     local stamp = tostring(ca.modification) .. ":" .. tostring(ca.size) .. "|"
-        .. (aa and (tostring(aa.modification) .. ":" .. tostring(aa.size)) or "-")
+        .. (aa and (tostring(aa.modification) .. ":" .. tostring(aa.size)) or "-") .. "|"
+        .. fileKey(require("koassistant.xray.xray_index").path(file)) .. "|" .. fileKey(file)
     local m = parsed_xray_memo[file]
     if m and m.stamp == stamp then return m.res or nil end
     local XrayParser = require("koassistant.xray.xray_parser")
@@ -2728,7 +3000,15 @@ function ActionCache.parsedXrayFor(file)
             and XrayParser.isJSON(entry.result) then
         local data = XrayParser.parse(entry.result)
         if data and not data.error then
-            XrayParser.mergeUserAliases(data, ActionCache.getUserAliases(file))
+            local overlay = ActionCache.getUserAliases(file)
+            XrayParser.mergeUserAliases(data, overlay)
+            -- the automatic capitals from this same parse; merging again with
+            -- them is the reader's names unchanged and the capitals settled
+            local auto = ActionCache.autoCaps(file, data)
+            if next(auto) then
+                overlay[XrayParser.AUTO_CAPS_KEY] = auto
+                XrayParser.mergeUserAliases(data, overlay)
+            end
             local ok_bg, BookGroups = pcall(require, "koassistant.books.book_groups")
             res = {
                 file = file,
@@ -2741,8 +3021,13 @@ function ActionCache.parsedXrayFor(file)
     end
     if not m then
         if parsed_xray_memo_n >= PARSED_XRAY_MEMO_MAX then
-            parsed_xray_memo = {}
-            parsed_xray_memo_n = 0
+            local keep = parsed_xray_memo_walk
+            for f in pairs(parsed_xray_memo) do
+                if not (keep and keep[f]) then
+                    parsed_xray_memo[f] = nil
+                    parsed_xray_memo_n = parsed_xray_memo_n - 1
+                end
+            end
         end
         parsed_xray_memo_n = parsed_xray_memo_n + 1
     end
@@ -2812,6 +3097,8 @@ function ActionCache.groupXrays(document_path, opts)
     if not ok_bg or type(BookGroups.lookupBooksFor) ~= "function" then return out, "-" end
     local rows = BookGroups.lookupBooksFor(document_path, true)
     if #rows == 0 then return out, "-" end
+    parsed_xray_memo_walk = {}
+    for _idx, row in ipairs(rows) do parsed_xray_memo_walk[row.file] = true end
     local all_later = (opts and opts.include_later) and true or false
     local reveal_left = (opts and tonumber(opts.reveal)) or 0
     local reach = all_later and #rows or laterReach(document_path, rows)
@@ -2856,6 +3143,8 @@ local function heldBackLater(document_path, reveal)
     if not ok_bg or type(BookGroups.lookupBooksFor) ~= "function" then return out end
     local rows = BookGroups.lookupBooksFor(document_path, true)
     if #rows == 0 or rows[#rows].direction ~= "later" then return out end
+    parsed_xray_memo_walk = {}
+    for _idx, row in ipairs(rows) do parsed_xray_memo_walk[row.file] = true end
     local reach = laterReach(document_path, rows)
     local skip, seen = tonumber(reveal) or 0, 0
     for _idx, row in ipairs(rows) do
@@ -3025,11 +3314,14 @@ function ActionCache.matchAnyXrayExact(document_path, query, opts)
     -- Rank-free here by design — the SET only routes; the card router owns
     -- the order (live -> sections -> carried -> predecessor -> ahead).
     key = key .. "|group:" .. group_stamp
+    -- B533 S3: the names the book's usage sets to capitals only
+    local _auto, auto_sig = ActionCache.autoCaps(document_path)
+    key = key .. "|caps:" .. auto_sig
     if not (exact_route_index and exact_route_index.path == path
             and exact_route_index.key == key) then
         local XrayParser = require("koassistant.xray.xray_parser")
         local set = {}
-        local user_aliases = ActionCache.getUserAliases(document_path)
+        local user_aliases = ActionCache.matchOverlay(document_path)
         local live_p = 0
         local main = ActionCache.getXrayCache(document_path)
         if main and main.result then
@@ -3101,8 +3393,9 @@ function ActionCache.searchAllXrays(document_path, query, doc, opts)
     local all_results = {}
     -- User search terms must match here too, not only in the browser — this is
     -- the matcher behind highlight-menu lookup AND the #63 conditional bypass
-    -- (F1, xray_marking_plan.md; one sidecar read serves every parse below)
-    local user_aliases = ActionCache.getUserAliases(document_path)
+    -- (F1, xray_marking_plan.md; one sidecar read serves every parse below),
+    -- with the automatic capitals (B533 S3)
+    local user_aliases = ActionCache.matchOverlay(document_path)
 
     -- Search main X-Ray
     if main and main.result then

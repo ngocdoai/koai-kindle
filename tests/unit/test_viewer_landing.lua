@@ -1,0 +1,350 @@
+-- The landing on a reply (B561, 2026-11-06): the page break that opens the
+-- newest reply on a fresh page sits AFTER the reply's label, so the question,
+-- the usage line and the label stay on the page before and the landed page
+-- starts with the reply's first line; a short first question gets the page
+-- too (the 2026-08-12 skip is gone); the first answer of a chat lands like
+-- any other; and the first step up while the stream is followed only stops
+-- the following, the page stays (the next step scrolls).
+--
+-- Run: lua tests/unit/test_viewer_landing.lua  (or lua tests/run_tests.lua --unit)
+
+local function setupPaths()
+    local info = debug.getinfo(1, "S")
+    local script_path = info.source:match("@?(.*)")
+    local unit_dir = script_path:match("(.+)/[^/]+$") or "."
+    local tests_dir = unit_dir:match("(.+)/[^/]+$") or "."
+    local plugin_dir = tests_dir:match("(.+)/[^/]+$") or "."
+    package.path = table.concat({
+        plugin_dir .. "/?.lua", tests_dir .. "/?.lua", tests_dir .. "/lib/?.lua", package.path,
+    }, ";")
+    return plugin_dir
+end
+local plugin_dir = setupPaths()
+require("mock_koreader")
+
+local TestRunner = require("test_runner"):new()
+local ChatGPTViewer = require("koassistant.ui.chatgptviewer")
+local breaks = ChatGPTViewer._applyExchangePageBreaks
+
+local SPACER = '<div class="koa-exchange-break"></div>'
+local LABEL = "<p>◉ KOAssistant:</p>"
+local ON = { features = {} }
+
+local function count(s, needle)
+    local n, from = 0, 1
+    while true do
+        local a, b = s:find(needle, from, true)
+        if not a then return n end
+        n = n + 1
+        from = b + 1
+    end
+end
+
+local function read(rel)
+    local f = assert(io.open(plugin_dir .. "/" .. rel, "r"))
+    local s = f:read("*a")
+    f:close()
+    return s
+end
+
+print("Running: test_viewer_landing")
+print("")
+print("  [the break on the newest label]")
+
+-- The break rides the label's own paragraph (audit 2026-11-12): as an empty
+-- spacer block after it, the block spilled onto a page of its own whenever
+-- the label was a page's last line, and the window landed on that empty page
+-- (tests/scenarios/s09_reply_landing.lua shows it in the real widget)
+local BREAK_LABEL = '<p class="koa-exchange-break">◉ KOAssistant:</p>'
+-- An empty block after the label, with no break of its own (B696): MuPDF gives
+-- the first block after a forced break no top margin, and this one takes that
+-- place, so the reply's first block keeps its margin as at a document's start
+-- and stands where the stream window showed it
+local KEEP_MARGIN = "<div></div>"
+
+TestRunner:test("the question, the usage line and the label stay before the break", function()
+    local body = "<p>▶ User:</p><p>q</p><p>🧠 Reasoning used</p>" .. LABEL .. "<p>the answer</p><p>more</p>"
+    local out, placed = breaks(body, ON, nil, nil)
+    TestRunner:assertEqual(placed, true)
+    TestRunner:assertEqual(count(out, BREAK_LABEL), 1)
+    TestRunner:assertEqual(count(out, SPACER), 0)
+    TestRunner:assertTrue(out:find(BREAK_LABEL .. KEEP_MARGIN .. "<p>the answer</p>", 1, true) ~= nil,
+        "the label carries the break; the empty block and the reply's first paragraph follow it")
+    TestRunner:assertTrue(out:find("<p>🧠 Reasoning used</p>" .. BREAK_LABEL, 1, true) ~= nil,
+        "the usage line keeps its place before the label")
+    TestRunner:assertEqual(#out, #body + #BREAK_LABEL + #KEEP_MARGIN - #LABEL)
+end)
+
+TestRunner:test("the newest reply only", function()
+    local body = "<p>▶ User:</p><p>q1</p>" .. LABEL .. "<p>a1</p><p>▶ User:</p><p>q2</p>" .. LABEL .. "<p>a2</p>"
+    local out, placed = breaks(body, ON, nil, nil)
+    TestRunner:assertEqual(placed, true)
+    TestRunner:assertEqual(count(out, BREAK_LABEL), 1)
+    TestRunner:assertTrue(out:find(BREAK_LABEL .. KEEP_MARGIN .. "<p>a2</p>", 1, true) ~= nil, "on the second label")
+    TestRunner:assertTrue(out:find(LABEL .. "<p>a1</p>", 1, true) ~= nil, "the first exchange untouched")
+end)
+
+TestRunner:test("a window that opens at the top keeps the released rule: the break before the label, none after a short prefix", function()
+    local body = "<p>▶ User:</p><p>q</p>" .. LABEL .. "<p>the answer</p>"
+    local out, placed = breaks(body, ON, nil, nil, false)
+    TestRunner:assertEqual(out, body)
+    TestRunner:assertEqual(placed, false)
+    local _landed, placed_landing = breaks(body, ON, nil, nil, true)
+    TestRunner:assertEqual(placed_landing, true)
+    -- a long question: the label and its reply start the new page together
+    local long = "<p>▶ User:</p><p>" .. string.rep("a long question ", 40) .. "</p>" .. LABEL .. "<p>the answer</p>"
+    local out_long, placed_long = breaks(long, ON, nil, nil, false)
+    TestRunner:assertEqual(placed_long, false)
+    TestRunner:assertTrue(out_long:find("</p>" .. SPACER .. LABEL .. "<p>the answer</p>", 1, true) ~= nil,
+        "the spacer sits before the label, which keeps its reply")
+    TestRunner:assertEqual(count(out_long, BREAK_LABEL), 0)
+end)
+
+TestRunner:test("nothing before the label: no page for the label alone", function()
+    local body = LABEL .. "<p>the answer</p><p>more</p>"
+    local out, placed = breaks(body, ON, nil, nil, true)
+    TestRunner:assertEqual(out, body)
+    TestRunner:assertEqual(placed, false)
+    local blank_before = "<p> </p>" .. LABEL .. "<p>the answer</p>"
+    local out2, placed2 = breaks(blank_before, ON, nil, nil, true)
+    TestRunner:assertEqual(out2, blank_before)
+    TestRunner:assertEqual(placed2, false)
+end)
+
+TestRunner:test("the viewer hands its landing flag to the break", function()
+    local src = read("koassistant/ui/chatgptviewer.lua")
+    TestRunner:assertTrue(src:find("opts.carry_anchor, opts.carry_occurrence, viewer.scroll_to_last_question)", 1, true) ~= nil,
+        "markdownHtml passes scroll_to_last_question")
+    TestRunner:assertTrue(src:find("\n.koa%-exchange%-break {") ~= nil,
+        "the CSS rule serves the label paragraph and the carry's spacer div alike")
+end)
+
+TestRunner:test("a table's cells carry no rule that breaks a word (B702)", function()
+    -- MuPDF gives a column of single words exactly its word's width, and the
+    -- rule then split a word whenever the room it found was a rounding short;
+    -- it never made a column narrower, so nothing is lost with it
+    local css = ChatGPTViewer.viewerCSS("auto", {}, "")
+    local cells = css:match("\n%.koa%-table td, %.koa%-table th (%b{})")
+    TestRunner:assertTrue(cells ~= nil, "the cells' rule is there")
+    TestRunner:assertTrue(not cells:find("break-word", 1, true), "no overflow-wrap / word-wrap: break-word in it: " .. tostring(cells))
+    TestRunner:assertTrue(cells:find("border: 1px solid #aaa", 1, true) ~= nil and cells:find("padding:", 1, true) ~= nil,
+        "the border and the padding stay")
+    -- a code block still wraps its long lines (MuPDF cannot scroll one)
+    local pre = css:match("\npre (%b{})")
+    TestRunner:assertTrue(pre and pre:find("word-wrap: break-word", 1, true) ~= nil, "the code block's own rule is untouched")
+end)
+
+TestRunner:test("a short first question gets the page too", function()
+    local body = "<p>▶ User:</p><p>hi</p>" .. LABEL .. "<p>hello</p>"
+    local _out, placed = breaks(body, ON, nil, nil)
+    TestRunner:assertEqual(placed, true)
+end)
+
+TestRunner:test("the setting off: untouched", function()
+    local body = "<p>▶ User:</p><p>q</p>" .. LABEL .. "<p>a</p>"
+    local out, placed = breaks(body, { features = { chat_exchange_page_breaks = false } }, nil, nil)
+    TestRunner:assertEqual(out, body)
+    TestRunner:assertEqual(placed, false)
+end)
+
+TestRunner:test("no label (a streamed artifact text): untouched", function()
+    local body = "<p>plain text</p><p>more</p>"
+    local out, placed = breaks(body, ON, nil, nil)
+    TestRunner:assertEqual(out, body)
+    TestRunner:assertEqual(placed, false)
+end)
+
+TestRunner:test("nothing after the label: no blank last page", function()
+    local body = "<p>▶ User:</p><p>q</p>" .. LABEL .. "<p> </p>"
+    local out, placed = breaks(body, ON, nil, nil)
+    TestRunner:assertEqual(out, body)
+    TestRunner:assertEqual(placed, false)
+end)
+
+print("")
+print("  [the plain-text landing tops the reply's first line]")
+
+TestRunner:test("the line after the label and its blank line", function()
+    local text = "▶ User:\n\nq\n\n◉ KOAssistant:\n\nanswer line\n\nmore"
+    local lines = {
+        { offset = 1, end_offset = 7 }, { offset = 9, end_offset = 8 },
+        { offset = 10, end_offset = 10 }, { offset = 12, end_offset = 11 },
+        { offset = 13, end_offset = 26 }, { offset = 28, end_offset = 27 },
+        { offset = 29, end_offset = 39 }, { offset = 41, end_offset = 40 },
+        { offset = 42, end_offset = 45 },
+    }
+    local got_ratio, got_force
+    local v = setmetatable({
+        text = text,
+        render_markdown = false,
+        configuration = { features = {} },
+        scroll_text_w = {
+            text_widget = { lines_per_page = 4, vertical_string_list = lines },
+            scrollToRatio = function(_self, ratio, force) got_ratio, got_force = ratio, force end,
+            moveCursorToCharPos = function() end,
+        },
+    }, { __index = ChatGPTViewer })
+    v:scrollToLastQuestion()
+    TestRunner:assertEqual(got_force, false)
+    -- line 7 ("answer line") on top: (R - 1 + lpp / 2 + 0.5) / #lines
+    TestRunner:assertTrue(got_ratio and math.abs(got_ratio - (7 - 1 + 2 + 0.5) / 9) < 1e-9,
+        "the reply's first text line is the top line, got " .. tostring(got_ratio))
+end)
+
+print("")
+print("  [the first answer lands, the stream's first step up stops the following]")
+
+TestRunner:test("dialogs.lua lands the first answer too", function()
+    local src = read("koassistant/ui/dialogs.lua")
+    TestRunner:assertTrue(src:find("scroll_to_last_question = not (temp_config and temp_config.features and temp_config.features.scroll_to_last_message == false)\n"
+        .. "            and history and history.getAssistantTurnCount and history:getAssistantTurnCount() >= 1,", 1, true) ~= nil,
+        "the first viewer lands from the first answer on")
+    TestRunner:assertTrue(src:find("local to_last_question = history and history.getAssistantTurnCount\n"
+        .. "                        and history:getAssistantTurnCount() >= 1", 1, true) ~= nil,
+        "the reply viewer lands on every reply")
+end)
+
+TestRunner:test("the stream window's up hooks: the first step up only stops the following", function()
+    -- "stop the page where it is": the step is eaten, the next one scrolls
+    local src = read("koassistant/request/stream_handler.lua")
+    TestRunner:assertTrue(src:find('turnOffAutoScroll%("scroll%-up button"%)\n%s*return\n%s*end\n%s*return original_scrollUp%(self_widget, %.%.%.%)') ~= nil,
+        "the dialog's up button")
+    TestRunner:assertTrue(src:find('turnOffAutoScroll%("swipe/key up"%)\n%s*return\n%s*end\n%s*return orig_scrollText%(self_w, direction, %.%.%.%)') ~= nil,
+        "a swipe up")
+    TestRunner:assertTrue(src:find('turnOffAutoScroll%("page%-up"%)\n%s*return true\n%s*end\n%s*return orig_onScrollUp%(self_w, %.%.%.%)') ~= nil,
+        "the page-up key, consumed so nothing behind the window takes it")
+end)
+
+print("")
+print("  [the sweep of 2026-11-06: the counted occurrence, one Markdown pipeline, the per-chat tap under Auto RTL]")
+
+TestRunner:test("plain text: the landing takes the occurrence the stream window counted, from the label", function()
+    local anchor = "one two three four five six"
+    local text = "▶ User: q\n\n◉ KOAssistant:\nIntro " .. anchor .. " seven.\nMiddle filler text here.\nLater "
+        .. anchor .. " eight.\nEnd."
+    local first = text:find(anchor, 1, true)
+    local second = text:find(anchor, first + 1, true)
+    local _s1, c1 = text:sub(1, first - 1):gsub("[^\128-\191]", "")
+    local _s2, c2 = text:sub(1, second - 1):gsub("[^\128-\191]", "")
+    local function land(occ)
+        local got
+        local v = setmetatable({ text = text, render_markdown = false, _stream_carry_anchor = anchor,
+            _stream_carry_occurrence = occ,
+            scroll_text_w = { moveCursorToCharPos = function(_self, pos) got = pos end } },
+            { __index = ChatGPTViewer })
+        TestRunner:assertTrue(v:landOnStreamPosition(), "landed")
+        return got
+    end
+    TestRunner:assertEqual(land(2), c2 + 1, "the second copy")
+    TestRunner:assertEqual(land(1), c1 + 1, "the first copy")
+    TestRunner:assertEqual(land(nil), c1 + 1, "no count: the first, as before")
+    TestRunner:assertEqual(land(5), c2 + 1, "past the count: the last copy found")
+end)
+
+TestRunner:test("Markdown: the pages from the marker's are walked by their match counts", function()
+    local anchor = "one two three four five six"
+    local function land(occ, per_page)
+        local scrolled
+        local box = { page_number = 1, page_count = 6 }
+        function box:findText(needle)
+            if needle:find("KOAssistant", 1, true) then
+                self._search_index = { [1] = { {} } }
+                self._match_page_list = { 1 }
+            else
+                self._search_index = {}
+                self._match_page_list = {}
+                for page, n in pairs(per_page) do
+                    local rects = {}
+                    for _i = 1, n do rects[#rects + 1] = {} end
+                    self._search_index[page] = rects
+                    table.insert(self._match_page_list, page)
+                end
+                table.sort(self._match_page_list)
+            end
+            return true
+        end
+        function box:clearSearch() end
+        local v = setmetatable({ text = "x", render_markdown = true, _stream_carry_anchor = anchor,
+            _stream_carry_occurrence = occ,
+            scroll_text_w = { htmlbox_widget = box, scrollToRatio = function(_self, r) scrolled = r end } },
+            { __index = ChatGPTViewer })
+        TestRunner:assertTrue(v:landOnStreamPosition(), "landed")
+        return scrolled
+    end
+    local function ratio(page) return (page - 0.5) / 6 end
+    TestRunner:assertEqual(land(1, { [2] = 1, [4] = 1 }), ratio(2), "the first copy's page")
+    TestRunner:assertEqual(land(2, { [2] = 1, [4] = 1 }), ratio(4), "the second copy's page")
+    TestRunner:assertEqual(land(2, { [2] = 2, [4] = 1 }), ratio(2), "two copies on one page: still that page")
+    TestRunner:assertEqual(land(3, { [2] = 2, [4] = 1 }), ratio(4), "the third is on the next")
+    TestRunner:assertEqual(land(9, { [2] = 2, [4] = 1 }), ratio(4), "past the count: the last page holding it")
+end)
+
+TestRunner:test("the late carry path reads the counted occurrence too", function()
+    local src = read("koassistant/ui/chatgptviewer.lua")
+    local a = src:find("function ChatGPTViewer:landOnStreamPosition()", 1, true)
+    local head = src:sub(a, a + 1200)
+    TestRunner:assertTrue(head:find("self._stream_carry_occurrence = pending.occurrence", 1, true) ~= nil)
+end)
+
+TestRunner:test("the refresh rebuilds through the one Markdown pipeline; the translate toggle keeps the math", function()
+    local src = read("koassistant/ui/chatgptviewer.lua")
+    local a = src:find("function ChatGPTViewer:refreshMarkdownDisplay()", 1, true)
+    local body = src:sub(a, src:find("\nend\n", a, true))
+    TestRunner:assertTrue(body:find("self:rebuildScrollWidget()", 1, true) ~= nil, "rebuildScrollWidget")
+    TestRunner:assertTrue(body:find("ScrollHtmlWidget:new", 1, true) == nil, "no hand copy of the pipeline left")
+    local t = src:find("function ChatGPTViewer:toggleTranslateQuoteVisibility()", 1, true)
+    local tbody = src:sub(t, src:find("\nend\n", t, true))
+    TestRunner:assertTrue(tbody:find("self:_markdownHtml(self.text)", 1, true) ~= nil, "the one pipeline, the math pass inside it")
+    TestRunner:assertTrue(tbody:find("autoLinkUrls(", 1, true) == nil, "no hand copy of the pipeline")
+end)
+
+TestRunner:test("no plain-text switch for right-to-left text is left; the windows keep direction only (B621)", function()
+    local src = read("koassistant/ui/chatgptviewer.lua")
+    for _idx, gone in ipairs({ "rtl_chat_text_mode", "rtl_translate_text_mode", "rtl_dictionary_text_mode",
+        "reapplyRtlMode", "getLatestResponse" }) do
+        TestRunner:assertTrue(src:find(gone, 1, true) == nil, gone .. " is gone from the viewer")
+    end
+    -- the dictionary and translate windows set the plain-text widget's direction, nothing else
+    local a = src:find("if self.compact_view or self.dictionary_view then\n      if ChatGPTViewer.dictionaryPlainText(self.configuration.features, self) then", 1, true)
+    TestRunner:assertTrue(a ~= nil, "the dictionary block")
+    local block = src:sub(a, src:find("  end\n", src:find("translate_view and Languages.isRTL", a, true), true))
+    local _, forced = block:gsub("self%.render_markdown = false", "")
+    TestRunner:assertEqual(forced, 1, "Plain Text only on the reader's own Text Mode for Dictionary")
+    -- the schema and the quick settings carry no such row
+    local schema = read("koassistant/ui/settings_schema.lua")
+    TestRunner:assertTrue(schema:find("rtl_chat_text_mode", 1, true) == nil and schema:find("rtl_translate_text_mode", 1, true) == nil
+        and schema:find("rtl_dictionary_text_mode", 1, true) == nil, "no schema row")
+end)
+
+TestRunner:test("one Markdown pipeline: every HTML build goes through it, the span pass last", function()
+    local src = read("koassistant/ui/chatgptviewer.lua")
+    local _, md_calls = src:gsub("= MD%(", "")
+    TestRunner:assertEqual(md_calls, 2, "luamd renders the document and individual table cells")
+    TestRunner:assertTrue(src:find('MD(require("koassistant.ui.list_numbers").mark(healMarkdown(prepared)), {})', 1, true) ~= nil,
+        "on the text whose numbered items carry their numbers (B691)")
+    local _, builds = src:gsub("self:_markdownHtml%(", "")
+    TestRunner:assertEqual(builds, 4, "init, update, rebuild, the translate toggle")
+    local _, widgets = src:gsub("self:_htmlWidget%(", "")
+    TestRunner:assertEqual(widgets, 5, "the content widget built in one place: the four above, and one answer for the minimal popup")
+    local _, css_sites = src:gsub("getViewerCSS%(self%.text_align, font_css%)", "")
+    TestRunner:assertEqual(css_sites, 1, "one CSS site")
+    TestRunner:assertTrue(src:find("local font_css, font_dir = self:_scriptFontCSS(html_body)", 1, true) ~= nil
+        and src:find("html_resource_directory = font_dir,", 1, true) ~= nil,
+        "the script fonts' rules and the folder the renderer reads them from, together")
+    -- the pipeline's two halves (the streaming window keeps the first half's
+    -- result for an answer's finished part): the whole conversion is both
+    local a = src:find("local function markdownHtml(viewer, text, opts)", 1, true)
+    local body = src:sub(a, src:find("\nend\n", a, true))
+    TestRunner:assertTrue(body:find("return finishHtml(viewer, markdownBlocks(viewer, text, opts), opts)", 1, true) ~= nil,
+        "the first half, then the second")
+    local f = src:find("local function finishHtml(viewer, html_body, opts)", 1, true)
+    local finish = src:sub(f, src:find("\nend\n", f, true))
+    local numbers = finish:find('require("koassistant.ui.list_numbers").resolve(', 1, true)
+    local direction = finish:find("addHtmlBidiAttributes(", 1, true)
+    local breaks = finish:find("applyExchangePageBreaks(", 1, true)
+    local spans = finish:find("ScriptFonts.markRuns(", 1, true)
+    TestRunner:assertTrue(numbers and direction and breaks and spans and direction > numbers and breaks > direction and spans > breaks,
+        "the lists' numbers, the direction pass, the page breaks, the spans last")
+end)
+
+return TestRunner:summary()

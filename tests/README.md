@@ -269,6 +269,8 @@ The 104 files, with what each one pins:
 - `test_ollama_endpoints.lua` - Ollama server address normalization and the wire routing at the active endpoint
 - `test_ollama_num_ctx.lua` - per-request `num_ctx` sizing (the silent-truncation guard)
 - `test_ollama_tools_request.lua` - Ollama tool declarations, decoded-object arguments, ignored `tool_choice`
+- `test_one_shot_cache.lua` - a request whose answer is saved as a result carries no prompt-cache mark for its messages (Anthropic, OpenRouter): the rule, the hand-off from the request bake to both handlers, a chat keeping its mark, and every handler that sends a mark reading the flag
+- `test_xray_update_guards.lua` - the reading-along update's merge: a second person of a name (an incoming entry whose name is only an alias of a stored one) is its own entry unless the update bridges the two names or the alias is the reader's; a missing, blank or stub text never replaces a description; a merge of two books' X-Rays passes neither rule (B732, B733)
 - `test_openai_codex_handler.lua` - OpenAI Subscription: codex endpoint, OAuth headers, collected-SSE transport, web-search and tool wire
 - `test_openai_codex_oauth.lua` - device-code OAuth: user-code / poll / exchange / refresh requests, JWT claims
 - `test_openai_compatible.lua` - the OpenAI-compatible base handler and its hooks
@@ -306,6 +308,7 @@ The 104 files, with what each one pins:
 - `test_web_search.lua` - web-search request building, response parsing, streaming detection
 - `test_web_tools.lua` - the SearXNG / Tavily backend module (built but not wired into the plugin yet): request and parse, null sentinels, result formatting
 - `test_update_versions.lua` - update checker version order: SemVer pre-release identifiers (rc.11 > rc.9), one-to-three-part tags, a release beats its rc
+- `test_update_cooldown.lua` - the automatic update check's session gate: one check after a success, never two at once, a failed attempt tried again only after the 30-minute cooldown, and the gate sits before the fork (#121)
 - `test_user_input_placeholder.lua` - `{user_input}` puts the typed text in the prompt in place of the tail block
 - `test_xai_responses.lua` - the xAI Responses routing and request builder
 - `test_xray_auto.lua` - the background auto-update gate matrix and the checkpoint ring
@@ -400,6 +403,48 @@ local new_config = ConstraintUtils.buildRetryConfig(original_config, constraint)
 - ✅ Removed 75+ lines of duplicated code
 - ✅ No drift between test expectations and plugin behavior
 - ✅ Adding new constraints automatically updates all tests
+
+### Flow tests: `tests/lib/ui_recorder.lua` and `tests/lib/koamock.lua`
+
+A flow test drives the plugin's real dialog code the way a device round would, without KOReader: open a popup, read its buttons, tap one, type into the box it opens, check what ran. `ui_recorder` replaces `UIManager:show/close` and the dialog widgets' `:new` with recorders (patched in place, put back by `restore()`); `koamock` hands a test the invented books of the device fixture (`tests/fixtures/mock_series/spec.lua`) as parsed data, the same X-Rays `gen.lua` writes to disk. The example is `tests/unit/test_flow_xray_entry.lua`.
+
+```lua
+local Recorder = require("ui_recorder")
+local KoaMock = require("koamock")
+local ui = Recorder.install()               -- before loading the module under test
+local data, path = KoaMock.xray("Mock Series 3")
+-- ... open something ...
+ui:texts()                                  -- the top dialog's buttons
+ui:tap("Names and matching…")               -- run that button's callback
+ui:type("at dusk"); ui:tap("OK")            -- type into the box it opens, confirm
+ui:tapOutside()                             -- a tap outside the top dialog (or the Back key)
+ui:restore()                                -- at the end of the file
+```
+
+### Headless scenarios: `tests/scenarios/` (KOReader itself, no window)
+
+What a flow test cannot reach (the text on a real page: marks, the name index, KOReader's search engine, a checkpoint install, a group hook firing) runs in KOReader's own frontend on its dummy framebuffer, on the same mock books:
+
+```bash
+sh tests/scenarios/run.sh /path/to/a/scratch/folder              # every s*.lua
+sh tests/scenarios/run.sh /path/to/a/scratch/folder s02_capitals # one
+sh tests/scenarios/run.sh /path/to/a/scratch/folder /elsewhere/probe.lua # a one-off probe file
+KOA_CAPS=/path/manifest.lua sh tests/scenarios/run.sh /path/to/a/scratch/folder tests/tools/caps_calibration.lua
+                                                                 # the capitals calibration (its header says the manifest)
+```
+
+Each run makes a NEW folder under the one given (`run-<time>-<pid>/`): `home/` is a fresh KOReader home with this plugin linked into its `plugins/`, `Books/` the fixture with its groups written into that home, `shots/` the screenshots a scenario takes, one log per scenario. Nothing is deleted and nothing of a real KOReader home is read. `boot.lua` refuses to start unless the home sits inside the run folder, stands an empty table in for `apikeys.lua` before the plugin loads, blocks the network (LuaSocket, LuaSec, child processes, the plugin's request functions; a blocked call fails the scenario), turns KOReader's other plugins off and skips the update check. Needs the macOS app at `/Applications/KOReader.app`. The exit code is the number of scenarios that failed.
+
+A scenario is a short Lua file: `local S = dofile(os.getenv("KOA_PLUGIN") .. "/tests/scenarios/boot.lua")`, then `S.features{...}` (the plugin's settings, before the book opens), `S.open("Mock Series 3")`, `S.chapter("Rented Quiet")`, `S.marks()` (the visible page's X-Ray marks with the words under each), `S.settle()` (every scheduled task now: debounces, the marks' deferred scan), `S.check(cond, "what it shows")`, `S.shot("name")`, `S.finish()`. `S.texts()` / `S.tap(text)` read and tap a dialog's buttons or a menu's rows; in a window built by hand (the picture popup, s06) they reach every button and checkbox in its widget tree, radio rows included (`S.buttons()` gives each one's `checked`).
+
+#### Wiki screenshots: `tests/scenarios/wiki_shots.sh`
+
+```bash
+sh tests/scenarios/wiki_shots.sh /path/to/a/scratch/folder                     # every w_*.lua
+sh tests/scenarios/wiki_shots.sh /path/to/a/scratch/folder w_privacy_and_data  # one page's shots
+```
+
+The `w_<page>.lua` scenarios stage and shoot the shots of `docs/assets/wiki_shotlist.txt` (the wiki's manifest), each in a run of its own (a fresh home, so one scenario's settings never reach the next), on a Kobo Clara's screen: `KOA_SCREEN=1072x1448` (the dummy screen's size; off by default), `EMULATE_READER_DPI=300`, a device with no keyboard, keys or D-pad (no shortcut letters in lists, no focus frames; an input box's keyboard is then its own window above it), `KOA_EMOJI` (the plugin's emoji font registered as a UI fallback when the desktop's user font folder has it, read only) and KOReader's Gestures plugin on. The plugin is linked from the working tree, whose own `behaviors/` and `domains/` hold personal files: a wiki run loads none of them, only what a scenario stages in `S.userBehaviors` / `S.userDomains`. The books come from the folder `KOA_BOOKS` names (none without it): `run.sh` COPIES it into the run, and its untracked `koashots.lua` names the files by role (`S.shotsBook("series", 2)`, `"standalone"`, `"nonfiction"`), so no tracked file names a book. At the end the script lists the manifest's names produced and not produced and copies the produced PNGs into `docs/assets/screenshots-src/wiki/` for review; nothing lands in `screenshots/` by itself. Helpers: `S.wiki("name.png")` (the whole stack repainted, then `<run>/wiki/name.png`; a name not in the manifest gets a note), `S.openMenu` / `S.menuTap` / `S.menuPath({ "KOAssistant", "Privacy & Data" })` / `S.menuRows()` (KOReader's main menu, rows matched with or without their emoji), `S.fileManager(dir)` (the file browser, the folder as Home), `S.hold(text)` (a long-press); `tests/scenarios/wiki_lib.lua` stages in the run only: fake keys (`W.FAKE`, `W.fileKeys` for the apikeys.lua stand-in), `W.preSetting(key, value)` (a top-level plugin setting before the plugin loads), `W.prose()` (the first full page of prose), `W.select(skip, count)` (words selected from the page's start, as a drag would, then `W.highlightMenu()`), `W.group(name, kind, books)`, `W.scrollTo(text)` in a long dialog, `W.listPageWith(pattern)` in a long list.
 
 ## Prerequisites
 
@@ -563,10 +608,16 @@ tests/
 ├── fixtures/
 │   ├── sample_context.lua     # Sample context data for tests
 │   └── mock_series/           # Offline mock-book generator (X-Ray/groups device fixture):
-│                              #   lua tests/fixtures/mock_series/gen.lua --out <dir> [--base <target>]
-│                              # 7 tiny invented EPUBs + real-API sidecar data (see gen.lua header)
+│                              #   lua tests/fixtures/mock_series/gen.lua --out <dir> [--base <target>] [--home <KOReader home>]
+│                              # 8 tiny invented EPUBs + real-API sidecar data; --home also writes the three groups (see gen.lua header)
+├── scenarios/                 # Headless KOReader runs on the mock books: sh tests/scenarios/run.sh <scratch dir>
+│   ├── boot.lua               # The run's environment (scratch home, no network, no keys) + helpers
+│   └── s01_boot.lua …         # One scenario per file
 ├── lib/
 │   ├── mock_koreader.lua      # KOReader module mocks
+│   ├── ui_recorder.lua        # Flow tests: records shown dialogs, taps their buttons
+│   ├── koamock.lua            # The mock_series fixture as parsed test data
+│   ├── markdown_samples.lua   # Markdown of every shape an answer takes (the stream view's piece-by-piece conversion)
 │   ├── test_runner.lua        # Assertion/reporting harness every unit file uses
 │   ├── test_helpers.lua       # Integration-test helpers (sync HTTP instead of KOReader subprocesses)
 │   ├── constraint_utils.lua   # Plugin constraint utilities wrapper

@@ -21,7 +21,7 @@ local CONFIGURATION = {
     --   anthropic, openai, openai_codex, deepseek, gemini, ollama, groq, mistral, xai,
     --   openrouter, requesty, qwen, kimi, together, fireworks, sambanova, cohere, doubao,
     --   zai, perplexity, nvidia, cerebras, minimax, deepinfra, novita, hyperbolic, nebius,
-    --   chutes, featherless, vercel, opencode, opencode_go, a2agent
+    --   chutes, featherless, vercel, opencode, opencode_go, a2agent, bedrock
     --
     -- provider = "anthropic",
     -- model = "claude-sonnet-5-5",
@@ -78,7 +78,7 @@ local CONFIGURATION = {
 
         -- Streaming
         -- enable_streaming = true,            -- Show responses as they generate
-        -- stream_auto_scroll = true,          -- Auto-scroll during streaming
+        -- stream_auto_scroll = false,         -- Follow the arriving text during streaming (off: read from the first page)
         -- large_stream_dialog = true,         -- Full-screen streaming dialog
 
         -- AI behavior

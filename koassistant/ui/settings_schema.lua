@@ -85,6 +85,11 @@ local IMAGE_DETAIL_OPTIONS = {
     { value = "best", text = _("Best") },
 }
 
+local IMAGE_WRITER_MODEL_OPTIONS = {
+    { value = "chat", text = _("Chat model") },
+    { value = "fast", text = _("Fast model") },
+}
+
 -- Helper: Build model list string from capabilities
 local function getModelList(provider, capability)
     local caps = ModelConstraints.capabilities[provider]
@@ -202,10 +207,8 @@ local SettingsSchema = {
             type = "submenu",
             emoji = "🤖",
             text_func = function(plugin)
-                local f = plugin.settings:readSetting("features") or {}
-                local provider = f.provider or "anthropic"
                 return T(_("Model: %1 (%2)"), plugin:getCurrentModel(),
-                    plugin:getProviderDisplayName(provider))
+                    plugin:getProviderDisplayName(plugin:getCurrentProvider()))
             end,
             callback = "buildProviderModelHub",
         },
@@ -242,7 +245,7 @@ local SettingsSchema = {
                                 { value = true, label = _("Markdown") },
                                 { value = false, label = _("Plain Text") },
                             },
-                            help_text = _("Markdown renders formatting. Plain Text has better font support for Arabic/CJK."),
+                            help_text = _("Markdown renders formatting, lays every paragraph out in its own direction and draws each script in its own face: Arabic and Persian in the right-to-left font, Hebrew and Devanagari in KOReader's interface faces, emoji with the bundled emoji font. Plain Text uses KOReader's interface fonts and keeps headers, bold and lists readable."),
                         },
                         {
                             id = "render_math",
@@ -257,12 +260,27 @@ local SettingsSchema = {
                             help_text = _("Show LaTeX math from responses as readable formulas: Greek letters, operators, superscripts, vectors, fractions as a/b. Markdown view only. Saved chats, copies and exports keep the original notation, which Obsidian and similar apps render fully."),
                         },
                         {
+                            id = "rtl_font",
+                            type = "submenu",
+                            text = _("Right-to-left text font"),
+                            callback = "rtlFontMenuItems",
+                            text_func = function(plugin)
+                                local f = plugin.settings:readSetting("features") or {}
+                                return T(_("Right-to-left text font: %1"), require("koassistant.ui.script_fonts").label(f))
+                            end,
+                            enabled_func = function(plugin)
+                                local f = plugin.settings:readSetting("features") or {}
+                                return f.render_markdown ~= false
+                            end,
+                            help_text = _("The font of Arabic, Persian and Urdu letters in the Markdown view, wherever they appear: a whole paragraph or a word inside an English sentence. Noto Naskh Arabic, the default, is the face KOReader gives Arabic books; Noto Sans Arabic UI is the face of its plain-text windows; any font KOReader knows can be picked (a font copied into KOReader's fonts folder appears after a restart). None shows those letters in the window's own fallback font. Hebrew and Devanagari have their own fixed faces, the ones KOReader's interface uses."),
+                        },
+                        {
                             id = "chat_exchange_page_breaks",
                             type = "toggle",
                             text = _("Latest Reply on New Page"),
                             path = "features.chat_exchange_page_breaks",
                             default = true,
-                            help_text = _("Present the newest reply from the top of a fresh page. Markdown chats get a real page break before it (older exchanges stay compact; the break moves forward with each reply and never touches saves or exports); Plain Text chats align the view so the reply starts the screen. Chat viewer only."),
+                            help_text = _("Open the newest reply on a fresh page: your question, the usage line and the KOAssistant label stay on the page before, and the reply's first line opens the page. Markdown chats get a real page break (older exchanges stay compact; the break moves forward with each reply and never touches saves or exports); Plain Text chats align the view so the reply's first line starts the screen. Chat window only."),
                         },
                         {
                             id = "scroll_to_last_message",
@@ -270,7 +288,7 @@ local SettingsSchema = {
                             text = _("Open Chats at Latest Exchange"),
                             path = "features.scroll_to_last_message",
                             default = true,
-                            help_text = _("When opening a saved chat, jump to the newest question and reply instead of the top. Replies always land on the newest exchange regardless of this setting. Independent of New Page per Exchange (that one changes the page layout; this one changes where an opened chat starts)."),
+                            help_text = _("When opening a saved chat, jump to the newest reply instead of the top. Replies always land on the newest reply regardless of this setting. Independent of Latest Reply on New Page (that one changes the page layout; this one changes where an opened chat starts)."),
                         },
                         {
                             id = "plain_text_options",
@@ -294,39 +312,7 @@ local SettingsSchema = {
                             text = _("Text Mode for Dictionary"),
                             path = "features.dictionary_text_mode",
                             default = false,
-                            help_text = _("Use Plain Text mode for dictionary popup. Better font support for non-Latin scripts."),
-                        },
-                        {
-                            id = "rtl_dictionary_text_mode",
-                            type = "toggle",
-                            text = _("Text Mode for RTL Dictionary"),
-                            path = "features.rtl_dictionary_text_mode",
-                            default = true,
-                            enabled_func = function(plugin)
-                                local f = plugin.settings:readSetting("features") or {}
-                                return not f.dictionary_text_mode
-                            end,
-                            help_text = _("Use Plain Text mode for dictionary popup when dictionary language is Arabic, Classical Arabic, Persian or Urdu. Grayed out when Text Mode for Dictionary is enabled."),
-                        },
-                        {
-                            id = "rtl_translate_text_mode",
-                            type = "toggle",
-                            text = _("Text Mode for RTL Translate"),
-                            path = "features.rtl_translate_text_mode",
-                            default = true,
-                            help_text = _("Use Plain Text mode for translate popup when translation language is Arabic, Classical Arabic, Persian or Urdu."),
-                        },
-                        {
-                            id = "rtl_chat_text_mode",
-                            type = "toggle",
-                            text = _("Auto RTL mode for Chat"),
-                            path = "features.rtl_chat_text_mode",
-                            default = true,
-                            enabled_func = function(plugin)
-                                local f = plugin.settings:readSetting("features") or {}
-                                return f.render_markdown ~= false
-                            end,
-                            help_text = _("Automatically detect RTL content and switch to RTL mode (right-aligned text + Plain Text). Activates when the latest response has more RTL than Latin characters. Disabling removes all automatic RTL adjustments. Grayed out when markdown is disabled."),
+                            help_text = _("Use Plain Text in dictionary windows whatever the View Mode."),
                         },
                     },
                 },
@@ -552,9 +538,9 @@ local SettingsSchema = {
                             type = "toggle",
                             text = _("Auto-scroll Streaming"),
                             path = "features.stream_auto_scroll",
-                            default = true,
+                            default = false,
                             depends_on = { id = "enable_streaming", value = true },
-                            help_text = _("Follow the arriving text while a response streams. Scrolling up pauses the follow for that response so you can read in place while the rest arrives; the Autoscroll button in the streaming window turns it back on."),
+                            help_text = _("Off: a response fills the first page and stays there while the rest arrives. You turn the pages as you read, and the finished chat opens on the page you are on. On: the window follows the arriving text, and a step up stops it for that response. Either way, the Autoscroll button in the streaming window switches it for one response. A result that is data (an X-Ray being built) is always followed."),
                         },
                         {
                             id = "stream_keep_read_position",
@@ -571,11 +557,21 @@ local SettingsSchema = {
                             text = _("Page-based Scroll (e-ink)"),
                             path = "features.stream_page_scroll",
                             default = true,
-                            depends_on = {
-                                { id = "enable_streaming", value = true },
-                                { id = "stream_auto_scroll", value = true },
-                            },
-                            help_text = _("Stream text into empty page space instead of scrolling from the bottom. Reduces full-screen refreshes on e-ink. Disable for continuous bottom-scrolling."),
+                            depends_on = { id = "enable_streaming", value = true },
+                            help_text = _("While the window follows a response in the plain text view: stream text into empty page space instead of scrolling from the bottom. Reduces full-screen refreshes on e-ink. Disable for continuous bottom-scrolling."),
+                        },
+                        {
+                            id = "stream_markdown",
+                            type = "toggle",
+                            text = _("Markdown While Streaming"),
+                            path = "features.stream_markdown",
+                            default = true,
+                            depends_on = { id = "enable_streaming", value = true },
+                            enabled_func = function(plugin)
+                                local f = plugin.settings:readSetting("features") or {}
+                                return f.render_markdown ~= false
+                            end,
+                            help_text = _("Show the answer rendered while it streams (bold, headings, lists, the fonts of every script) instead of plain text swapped for the rendered view at the end. It is drawn again several times a second where the device keeps up, and less often on a slow device or as the answer grows, since each time the whole answer is laid out again. Grayed out while Plain Text is your default."),
                         },
                         {
                             id = "large_stream_dialog",
@@ -732,7 +728,7 @@ local SettingsSchema = {
                     -- sites check ~= false; the resolver's "default" branch is
                     -- the single flip point for requests AND X-Ray promotion.
                     default = true,
-                    help_text = _("On by default: the AI is told not to reveal events beyond your current reading position in book and highlight chats, and X-Ray checkpoint updates follow your position instead of installing the newest version. Research mode disables protection. Override per book in Book Settings; per chat via the Spoiler chip (chat input's gear menu → Toolbar Buttons). Custom actions can use the {spoiler_free_nudge} placeholder."),
+                    help_text = _("On by default: the AI is told not to reveal events beyond your current reading position in book and highlight chats, and X-Ray checkpoint updates follow your position instead of installing the newest version. Research mode and a book marked Finished disable protection. Override per book in Book Settings; per chat via the Spoiler chip (chat input's gear menu → Toolbar Buttons). Custom actions can use the {spoiler_free_nudge} placeholder."),
                     separator = true,
                 },
                 -- Content Format submenu
@@ -1051,7 +1047,7 @@ local SettingsSchema = {
                             text = _("Preset for New X-Rays"),
                             callback = "showXrayDefaultPresetPicker",
                             keep_menu_open = true,
-                            help_text = _("One tap for the three settings below it: what a new X-Ray tracks, whether it keeps the status block (\"Where things stand\"), and how much each entry carries. Characters only is the cheapest (the cast, no status block); Reference is the default (people, places, ideas and terms); Everything adds the story arc; Light companion and Deep study change the depth as well. Each setting can still be changed on its own; the preset then reads Custom. A book can pick its own preset in Book Settings and a group in its Group Settings. Applies when an X-Ray is created or rebuilt."),
+                            help_text = _("One tap for the three settings below it: the categories a new X-Ray tracks, whether it keeps Current State (the section that says where things stand), and how much each entry carries. Who's who is the shortest and cheapest (the cast, one line each, no Current State); Characters only gives the cast a few sentences each; Reference is the default (people, places, ideas and terms); Everything adds the story arc; Light companion and Deep study change the depth as well. Each setting can still be changed on its own; the preset then reads Custom. A book can pick its own preset in Book Settings and a group in its Group Settings. Applies when an X-Ray is created or rebuilt."),
                         },
                         {
                             id = "xray_default_categories_picker",
@@ -1059,7 +1055,7 @@ local SettingsSchema = {
                             text = _("Categories for New X-Rays"),
                             callback = "showXrayDefaultCategoriesPicker",
                             keep_menu_open = true,
-                            help_text = _("Which category groups a new X-Ray tracks by default. Reference (everything except the timeline) unless changed here; All categories adds the timeline or argument development, Characters only is the lightest. The last checkbox, \"Where things stand\", is the status block (current state, or the conclusion of a whole-book X-Ray): every update rewrites it, so an X-Ray without it has shorter updates. Applies when an X-Ray is created or rebuilt; individual books can pick their own categories in Book Settings."),
+                            help_text = _("Which categories a new X-Ray tracks by default: people, places, ideas and terms unless changed here. The timeline (the story arc or the argument's development) can be added, and people alone is the lightest. The last checkbox, Current State, is the section that says where things stand (Current Position in nonfiction, the Conclusion of a whole-book X-Ray): every update rewrites it, so an X-Ray without it has shorter updates. Applies when an X-Ray is created or rebuilt; individual books can pick their own categories in Book Settings."),
                         },
                         {
                             id = "xray_default_depth_picker",
@@ -1165,7 +1161,7 @@ local SettingsSchema = {
                                 { value = "name", text = _("Name only, tap to show a one-line description") },
                                 { value = "entry", text = _("First sentence right away") },
                             },
-                            help_text = _("What the card shows first for an upcoming entity, known only from the next checkpoint built ahead of you. Name only shows the tapped name and its category; a tap on the card adds the entry's first sentence, and another tap opens the full entry behind a spoiler confirmation. First sentence right away skips the first step (it can reveal that a name is another character's alias). Can be overridden per book."),
+                            help_text = _("What the card shows first for an upcoming entity, known only from the next checkpoint built past your reading position. Name only shows the tapped name as written and its category; a tap on the card adds the entry's first sentence, and another tap opens the full entry after a confirmation, whatever the spoiler setting. First sentence right away skips the first step. The confirmation box also offers Matching…, to stop a wrong underline without reading the entry. Can be overridden per book."),
                             enabled_func = function(plugin)
                                 local f = plugin.settings:readSetting("features") or {}
                                 return f.xray_show_ahead_entities ~= false
@@ -1185,7 +1181,7 @@ local SettingsSchema = {
                                 { value = "sentence", text = _("First sentence only") },
                                 { value = "full", text = _("Full entry") },
                             },
-                            help_text = _("How much of an entry the card shows for entities already in your installed X-Ray. First sentence keeps the card to a one-line identification, with the full entry a tap away. Full entry shows the whole description (swipe to scroll the footnote panel; the floating popup cuts it where it runs out of room). Can be overridden per book."),
+                            help_text = _("How much of an entry the card shows for entities already in your installed X-Ray. First sentence keeps the card to a one-line identification, with the full entry a tap away. Full entry shows the entry's own text: its description and what its page has under it, such as its other names and its Significance (swipe to scroll it). Its connections stay on the entry's page. Can be overridden per book."),
                         },
                         {
                             id = "xray_card_landing",
@@ -1193,7 +1189,7 @@ local SettingsSchema = {
                             text = _("Entity Card First"),
                             path = "features.xray_card_landing",
                             default = true,
-                            help_text = _("Exact entity hits (tapping a marked word, or selecting text that matches an entity) open a compact card first: the name, category and role, and a one-line identification, with the full entry a tap on the card away. The identification may come from the newest built checkpoint, so newly appearing names are known on sight; the full entry stays at your reading position, behind a confirmation, while spoiler protection is on. Off = open the full entry directly."),
+                            help_text = _("Exact entity hits (tapping a marked word, or selecting text that matches an entity) open a compact card first: the name, category and role, and a one-line identification, with the full entry a tap on the card away. An entity known only from the next checkpoint built past your reading position goes through stages instead (see Upcoming Entity Cards): its name, one line, then the full entry after a confirmation, whatever the spoiler setting. Off = open the full entry directly; an upcoming entity still goes through its stages."),
                             on_change = function(new_value, plugin)
                                 if plugin.syncXrayMarks then
                                     local UIManager = require("ui/uimanager")
@@ -1221,7 +1217,7 @@ local SettingsSchema = {
                                 { value = "footnote", text = _("Footnote panel (bottom of the screen)") },
                                 { value = "popup", text = _("Floating popup (near the tapped word)") },
                             },
-                            help_text = _("How the entity card is presented. The footnote panel slides in at the bottom of the screen, like KOReader's footnote popups, and follows the book's margins and font size. The floating popup is a small window anchored next to the tapped word. In both, tapping the card opens the full entry; tapping elsewhere dismisses it."),
+                            help_text = _("How the entity card is presented. The footnote panel slides in at the bottom of the screen, like KOReader's footnote popups, and follows the book's margins and font size. The floating popup is a small window anchored next to the tapped word. In both, tapping the card opens the full entry (an upcoming entity's card moves to its next stage); tapping elsewhere dismisses it."),
                         },
                         {
                             id = "xray_marking_density",
@@ -1641,17 +1637,9 @@ local SettingsSchema = {
                     text_func = function(plugin)
                         local f = plugin.settings:readSetting("features") or {}
                         local action_id = f.dictionary_bypass_action or "quick_define"
-                        -- Try to get action name
-                        local Actions = require("koassistant.prompts.actions")
-                        local action = Actions.getById(action_id)
-                        if action then
-                            return T(_("Bypass Action: %1"), action.text)
-                        end
-                        -- Check special actions
-                        if Actions.special and Actions.special[action_id] then
-                            return T(_("Bypass Action: %1"), Actions.special[action_id].text)
-                        end
-                        return T(_("Bypass Action: %1"), action_id)
+                        -- the reader's own actions by name too (B610)
+                        local name = require("koassistant.prompts.action_service").bypassActionName(plugin, "highlight", action_id)
+                        return T(_("Bypass Action: %1"), name or T(_("%1 (no longer exists)"), action_id))
                     end,
                     callback = "buildDictionaryBypassActionMenu",
                     help_text = _("Action to trigger when dictionary bypass is enabled. With Look up in X-Ray, a tapped word that has an X-Ray entry opens it directly; any other word falls through to the normal dictionary."),
@@ -1836,7 +1824,19 @@ local SettingsSchema = {
                         { value = "short", label = _("When it fits") },
                         { value = "always", label = _("Always") },
                     },
-                    help_text = _("Show responses from the actions below in a small popup next to the highlighted text: just the response, no buttons. Tap the popup to open the full window; tap outside to dismiss. 'When it fits' shows the popup only when the whole response fits inside it; longer responses open the full window directly. 'Always' shows the popup regardless, trimmed with an ellipsis. Streaming is skipped for these requests. Never applies to full-page translation."),
+                    help_text = _("Show responses from the actions below in a small popup: just the response, no buttons. Tap the popup to open the full window; tap outside to dismiss. 'When it fits' shows the popup only when the whole response fits inside it; longer responses open the full window directly. 'Always' shows the popup for any response; one that is too long scrolls inside it (swipe up or down, or use the page-turn keys). Streaming is skipped for these requests. Never applies to full-page translation."),
+                },
+                {
+                    id = "minimal_popup_style",
+                    type = "dropdown",
+                    text = _("Popup Style"),
+                    path = "features.minimal_popup_style",
+                    default = "box",
+                    options = {
+                        { value = "box", label = _("Floating box (near the selection)") },
+                        { value = "panel", label = _("Footnote panel (bottom of the screen)") },
+                    },
+                    help_text = _("Where the popup appears. The floating box sits next to the selected text and is as wide as the chat window. The footnote panel sits at the bottom of the screen from edge to edge, like KOReader's footnote popups. Either one is as tall as the response needs, up to about half the screen."),
                 },
                 {
                     id = "minimal_popup_actions",
@@ -1946,17 +1946,9 @@ local SettingsSchema = {
                     text_func = function(plugin)
                         local f = plugin.settings:readSetting("features") or {}
                         local action_id = f.highlight_bypass_action or "translate"
-                        -- Try to get action name
-                        local Actions = require("koassistant.prompts.actions")
-                        local action = Actions.getById(action_id)
-                        if action then
-                            return T(_("Bypass Action: %1"), action.text)
-                        end
-                        -- Check special actions
-                        if Actions.special and Actions.special[action_id] then
-                            return T(_("Bypass Action: %1"), Actions.special[action_id].text)
-                        end
-                        return T(_("Bypass Action: %1"), action_id)
+                        -- the reader's own actions by name too (B610)
+                        local name = require("koassistant.prompts.action_service").bypassActionName(plugin, "highlight", action_id)
+                        return T(_("Bypass Action: %1"), name or T(_("%1 (no longer exists)"), action_id))
                     end,
                     callback = "buildHighlightBypassActionMenu",
                     help_text = _("Action to trigger when highlight bypass is enabled"),
@@ -2239,7 +2231,7 @@ local SettingsSchema = {
                     text = _("Reading position"),
                     path = "features.enable_basic_stats",
                     default = true,
-                    help_text = _("Your reading progress (percentage), the current chapter, chapters read and the time since you last read. On by default: spoiler protection relies on it. Sent or not; never asked. Used by X-Ray, Recap."),
+                    help_text = _("Your reading progress (percentage), the current chapter, chapters read and the time since you last read. A permission, on or off, never asked; on by default, since spoiler protection relies on it. It is sent only where something uses it: an action that asks for it (X-Ray, Recap, Reading Guide and others), the spoiler line of a book chat while spoiler protection is on, and every request when Book info is set to \"Title, author & position\"."),
                 },
                 {
                     id = "enable_library_scanning",
@@ -2442,7 +2434,7 @@ local SettingsSchema = {
                     text = _("Highlight Menu Actions"),
                     callback = "showHighlightMenuManager",
                     keep_menu_open = true,
-                    help_text = _("Choose which actions appear in the highlight menu. Changes take effect the next time the menu opens (up to 15 shown)."),
+                    help_text = _("Choose which actions appear in the highlight menu. Changes take effect the next time the menu opens (up to 30 shown)."),
                     separator = true,
                 },
                 -- Dictionary popup
@@ -2934,9 +2926,8 @@ local SettingsSchema = {
                     -- rather than disable — this is a GLOBAL default that still applies to every
                     -- other model the reader switches to (same rule as the QS web-search tile).
                     suffix_func = function(plugin)
-                        local f = plugin.settings:readSetting("features") or {}
                         local mode = ModelConstraints.temperatureSupport(
-                            f.provider or "anthropic", plugin:getCurrentModel())
+                            plugin:getCurrentProvider(), plugin:getCurrentModel())
                         if mode == "rejected" then return _("ignored by this model") end
                         if mode == "forced" then return _("fixed by this model") end
                         return nil
@@ -3077,7 +3068,7 @@ local SettingsSchema = {
                                 local f = plugin.settings:readSetting("features") or {}
                                 return T(_("OpenAI model: %1"), imageModelLabel("openai", f.image_gen_model_openai))
                             end,
-                            help_text = _("gpt-image-2.5-flare is fast (about 11 s at low quality) and cheap; gpt-image-2.5-sunburst gives the finest detail but is slower."),
+                            help_text = _("gpt-image-2.6-flare is fast (about 10 s at low quality) and cheap; gpt-image-2.6-sunburst gives the finest detail but is slower (about 25 s). The 2.5 pair and gpt-image-2 stay listed."),
                             path = "features.image_gen_model_openai",
                             default = "default",
                             options = imageModelOptions("openai"),
@@ -3158,7 +3149,23 @@ local SettingsSchema = {
                             text = _("Write the prompt with AI"),
                             path = "features.image_gen_writer",
                             default = true,
-                            help_text = _("Before each picture, your chat provider's fast model writes the prompt the image model receives: from the passage, the text around it, the book's title and author, the book's Background, the X-Ray entries the passage names and your note, under rules that keep it to what the book says (and, with spoiler protection on, to nothing later than the passage).\n\nIt adds one quick text request (a fraction of a cent) and sends that material to your chat provider (or to the provider a global Fast tier pin names) as well. The viewer's caption and the gallery say who wrote the prompt and from what.\n\nOff: the passage goes to the image model framed as before."),
+                            help_text = _("Before each picture, a text model (Prompt writer, below) writes the prompt the image model receives: from the passage, the text around it, the book's title and author, the book's Background, the X-Ray entries the passage names and your note, under rules that keep it to what the book says (and, with spoiler protection on, to nothing later than the passage).\n\nIt adds one text request (usually a fraction of a cent) and sends that material to your chat provider (or to the provider a global Fast tier pin names, with the fast model) as well. The viewer's caption and the gallery say who wrote the prompt and from what.\n\nOff: the passage goes to the image model framed as before."),
+                        },
+                        {
+                            id = "image_gen_writer_model",
+                            type = "radio",
+                            text_func = function(plugin)
+                                local f = plugin.settings:readSetting("features") or {}
+                                return T(_("Prompt writer: %1"), optionText(IMAGE_WRITER_MODEL_OPTIONS, f.image_gen_writer_model or "chat"))
+                            end,
+                            help_text = _("The model that writes the prompt when Write the prompt with AI is on.\n\nChat model (the default): the model you chat with. Fast model: your chat provider's fast model (or the one a global Fast tier pin names), quicker and cheaper but less careful with the writer's rules. A provider without a fast model uses the chat model either way."),
+                            path = "features.image_gen_writer_model",
+                            default = "chat",
+                            options = IMAGE_WRITER_MODEL_OPTIONS,
+                            enabled_func = function(plugin)
+                                local f = plugin.settings:readSetting("features") or {}
+                                return f.image_gen_writer ~= false
+                            end,
                         },
                         {
                             -- A submenu built when opened (main.lua
@@ -3328,6 +3335,33 @@ local SettingsSchema = {
                             options = {
                                 { value = "international", text = _("International (api.moonshot.ai)") },
                                 { value = "china", text = _("China (api.moonshot.cn)") },
+                            },
+                        },
+                        {
+                            id = "bedrock_region",
+                            type = "radio",
+                            text_func = function(plugin)
+                                local f = plugin.settings:readSetting("features") or {}
+                                return T(_("Amazon Bedrock Region: %1"), f.bedrock_region or "us-east-1")
+                            end,
+                            help_text = _("The AWS region whose Bedrock runtime answers. A Bedrock API key is made in one region and works there; a model must be enabled for the account in that region. A base_url in configuration.lua overrides this setting."),
+                            path = "features.bedrock_region",
+                            default = "us-east-1",
+                            options = {
+                                { value = "us-east-1", text = _("US East (N. Virginia)") },
+                                { value = "us-east-2", text = _("US East (Ohio)") },
+                                { value = "us-west-2", text = _("US West (Oregon)") },
+                                { value = "ca-central-1", text = _("Canada (Central)") },
+                                { value = "eu-central-1", text = _("Europe (Frankfurt)") },
+                                { value = "eu-west-1", text = _("Europe (Ireland)") },
+                                { value = "eu-west-2", text = _("Europe (London)") },
+                                { value = "eu-west-3", text = _("Europe (Paris)") },
+                                { value = "eu-north-1", text = _("Europe (Stockholm)") },
+                                { value = "ap-south-1", text = _("Asia Pacific (Mumbai)") },
+                                { value = "ap-southeast-1", text = _("Asia Pacific (Singapore)") },
+                                { value = "ap-southeast-2", text = _("Asia Pacific (Sydney)") },
+                                { value = "ap-northeast-1", text = _("Asia Pacific (Tokyo)") },
+                                { value = "sa-east-1", text = _("South America (São Paulo)") },
                             },
                         },
                     },

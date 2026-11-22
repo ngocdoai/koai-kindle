@@ -9,7 +9,7 @@ Small ButtonDialog stack over koassistant_book_groups.lua:
 - showGroup: since G0 (2026-09-06, docs/group_hub_plan.md) the GROUP HUB —
   koassistant/books/group_page.lua, a full-screen Menu in the Book Hub's shape —
   whose rows call the flows this file exports (addBooksFlow, addFolderFlow,
-  foldFlow, renameFlow, deleteFlow, showMoveDialog) and whose hamburger opens
+  renameFlow, deleteFlow, showMoveDialog) and whose hamburger opens
   showGroupDialog, the group's management popup (also the Groups list's hold;
   G0 round 4). The old ButtonDialog screen is retired; every flow still ends
   with GroupsUI.showGroup, which refreshes the hub in place, or with the
@@ -234,10 +234,9 @@ local function runSeriesScan(group_id, seed_path, sp, candidates, source_label, 
             buttons = {
                 {{ text = T(_("Add all (%1)"), #matches), callback = function()
                     UIManager:close(ask)
-                    local added = 0
-                    for _idx, m in ipairs(matches) do
-                        if BookGroups.addBook(group_id, m.path) then added = added + 1 end
-                    end
+                    local paths = {}
+                    for _idx, m in ipairs(matches) do paths[#paths + 1] = m.path end
+                    local added = #BookGroups.addBooks(group_id, paths)
                     local idx_map = { [seed_path] = sp.idx }
                     for _idx, m in ipairs(matches) do idx_map[m.path] = m.idx end
                     local g = BookGroups.byId(group_id)
@@ -247,9 +246,9 @@ local function runSeriesScan(group_id, seed_path, sp, candidates, source_label, 
                             entries[#entries + 1] = { path = p, idx = idx_map[p] }
                         end
                         local sorted = BookGroups.orderBySeriesIndex(entries)
-                        for i, e in ipairs(sorted) do
-                            BookGroups.moveBookTo(group_id, e.path, i)
-                        end
+                        local order = {}
+                        for i, e in ipairs(sorted) do order[i] = e.path end
+                        BookGroups.setOrder(group_id, order)
                     end
                     UIManager:show(require("ui/widget/notification"):new{
                         text = T(_("Added %1 book(s)."), added),
@@ -358,61 +357,6 @@ local function seriesSuggestRow(path, host_close, opts)
             offerSeriesScan(group.id, path, sp, opts)
         end,
     }
-end
-
--- Fold target picker (A3 fan-in surfacing): a project group's fold needs ONE
--- receiving book — the member picked here launches the cross-book picker,
--- whose "Fold in the other books…" row is the fan-in.
-local function showFoldTargetPicker(group_id, opts)
-    local ButtonDialog = require("ui/widget/buttondialog")
-    local BookGroups = groups()
-    local group = BookGroups.byId(group_id)
-    if not group then return end
-    local ActionCache = require("koassistant.artifacts.action_cache")
-    local XrayParser = require("koassistant.xray.xray_parser")
-    local dialog
-    local rows = {}
-    local has_n = 0
-    for _idx, path in ipairs(group.books) do
-        local captured = path
-        local title = BookGroups.displayTitle(captured, opts.ui)
-        local ok, e = pcall(ActionCache.getXrayCache, captured)
-        local has = ok and e and e.result and XrayParser.isJSON(e.result) and true or false
-        if has then has_n = has_n + 1 end
-        rows[#rows + 1] = {{
-            text = has and title or (title .. " " .. _("(no X-Ray)")),
-            align = "left",
-            enabled = has,
-            callback = function()
-                UIManager:close(dialog)
-                -- B394 slice 1: straight to the fold's confirm (it used to
-                -- open the merge picker, whose first row was this fold)
-                if opts.plugin._startGroupXrayMergeFlow then
-                    opts.plugin:_startGroupXrayMergeFlow("project", captured)
-                else
-                    opts.plugin:_startCrossBookXrayFlow(captured)
-                end
-            end,
-        }}
-    end
-    if has_n == 0 then
-        UIManager:show(require("ui/widget/infomessage"):new{
-            text = _("No book in this group has an X-Ray yet. Create one first."),
-            timeout = 4,
-        })
-        GroupsUI.showGroup(group_id, opts)
-        return
-    end
-    rows[#rows + 1] = {{ text = _("Cancel"), callback = function()
-        UIManager:close(dialog)
-        GroupsUI.showGroup(group_id, opts)
-    end }}
-    dialog = ButtonDialog:new{
-        title = _("AI merge the group's X-Rays into which book?") .. "\n"
-            .. _("Knowledge flows INTO the book you pick. The others are not changed. One request per other book."),
-        buttons = rows,
-    }
-    UIManager:show(dialog)
 end
 
 --- Self-refreshing member move dialog (kenken QoL, #90: 30-book reordering).
@@ -681,10 +625,7 @@ end
 local function addSelected(group_id, opts, selected_files)
     local BookPicker = require("koassistant.ui.book_picker")
     local BookGroups = groups()
-    local added = {}
-    for _idx, path in ipairs(BookPicker.orderedSelection(selected_files)) do
-        if BookGroups.addBook(group_id, path) then added[#added + 1] = path end
-    end
+    local added = BookGroups.addBooks(group_id, BookPicker.orderedSelection(selected_files))
     addedDone(group_id, opts, added)
 end
 
@@ -771,11 +712,7 @@ function GroupsUI.addFolderFlow(group_id, opts)
                 buttons = {
                     {{ text = T(_("Add all (%1)"), #paths), callback = function()
                         UIManager:close(ask)
-                        local added = {}
-                        for _idx, path in ipairs(paths) do
-                            if BookGroups.addBook(group_id, path) then added[#added + 1] = path end
-                        end
-                        addedDone(group_id, opts, added)
+                        addedDone(group_id, opts, BookGroups.addBooks(group_id, paths))
                     end }},
                     {{ text = _("Choose which…"), callback = function()
                         UIManager:close(ask)
@@ -824,11 +761,7 @@ function GroupsUI.addCollectionFlow(group_id, opts)
             buttons = {
                 {{ text = T(_("Add all (%1)"), #paths), callback = function()
                     UIManager:close(ask)
-                    local added = {}
-                    for _idx, path in ipairs(paths) do
-                        if BookGroups.addBook(group_id, path) then added[#added + 1] = path end
-                    end
-                    addedDone(group_id, opts, added)
+                    addedDone(group_id, opts, BookGroups.addBooks(group_id, paths))
                 end }},
                 {{ text = _("Choose which…"), callback = function()
                     UIManager:close(ask)
@@ -848,45 +781,6 @@ function GroupsUI.addCollectionFlow(group_id, opts)
         }
         UIManager:show(ask)
     end, function() GroupsUI.showGroup(group_id, opts) end)
-end
-
--- A2/A3: the fold surface the kind picker promises — series chain or project
--- fan-in, via the cross-book picker (ONE flow owns consent, skip-done
--- accounting and the confirms). Callers gate on sharesKnowledge.
-function GroupsUI.foldFlow(group_id, opts)
-    local BookGroups = groups()
-    local group = BookGroups.byId(group_id)
-    if not group or not (opts.plugin and opts.plugin._startCrossBookXrayFlow) then return end
-    if BookGroups.kindOf(group) == BookGroups.KIND_PROJECT then
-        showFoldTargetPicker(group_id, opts)
-        return
-    end
-    -- Series: the chain runs oldest → newest, so it ends at the LAST member
-    -- with an X-Ray and covers the whole series. B394 slice 1: straight to
-    -- the chain's confirm (it used to open that book's merge picker, where
-    -- the chain was one more row)
-    local ActionCache = require("koassistant.artifacts.action_cache")
-    local XrayParser = require("koassistant.xray.xray_parser")
-    local target
-    for _idx, p in ipairs(group.books) do
-        local ok, e = pcall(ActionCache.getXrayCache, p)
-        if ok and e and e.result and XrayParser.isJSON(e.result) then
-            target = p
-        end
-    end
-    if not target then
-        UIManager:show(require("ui/widget/infomessage"):new{
-            text = _("No book in this group has an X-Ray yet. Create one first."),
-            timeout = 4,
-        })
-        GroupsUI.showGroup(group_id, opts)
-        return
-    end
-    if opts.plugin._startGroupXrayMergeFlow then
-        opts.plugin:_startGroupXrayMergeFlow("series", target)
-    else
-        opts.plugin:_startCrossBookXrayFlow(target)
-    end
 end
 
 -- Where a flow lands: the hub's in-place refresh, or the caller's own
@@ -914,8 +808,13 @@ function GroupsUI.deleteFlow(group_id, opts)
     local group = BookGroups.byId(group_id)
     if not group then return end
     local confirm
+    -- B536: a series or a project carried entries between its books, and
+    -- those follow the group
+    local title = BookGroups.sharesKnowledge(group)
+        and T(_("Delete the group \"%1\"?\nThe books and their artifacts stay. Their X-Rays drop the entries they carried from each other; what an AI merge added stays."), displayName(group))
+        or T(_("Delete the group \"%1\"?\nBooks and their artifacts are not touched. Only the grouping is removed."), displayName(group))
     confirm = ButtonDialog:new{
-        title = T(_("Delete the group \"%1\"?\nBooks and their artifacts are not touched. Only the grouping is removed."), displayName(group)),
+        title = title,
         buttons = {
             {{ text = _("Delete"), callback = function()
                 UIManager:close(confirm)
@@ -939,8 +838,25 @@ end
 function GroupsUI.showGroup(group_id, opts)
     opts = opts or {}
     require("koassistant.books.group_page").show({
-        group_id = group_id, plugin = opts.plugin, ui = opts.ui,
+        group_id = group_id, plugin = opts.plugin, ui = opts.ui, file = opts.file,
         on_close = opts.on_close, front = opts.front,
+    })
+end
+
+--- A later volume the series holds back from a book (G2; B418, B591): the
+--- words beside its row and the confirm before it opens, ONE copy for the
+--- "→ Group" popup, the Group Hub's member rows and the browser's lines.
+function GroupsUI.laterLabel(title)
+    return T(_("%1 (later in the series)"), title)
+end
+
+--- @param raw_title string the volume's title, undecorated
+--- @param on_open function runs on "Open it"
+function GroupsUI.confirmLaterVolume(raw_title, on_open)
+    UIManager:show(require("ui/widget/confirmbox"):new{
+        text = T(_("%1 comes later in the series and can reveal what happens in the books before it. Open it anyway?"), raw_title),
+        ok_text = _("Open it"),
+        ok_callback = on_open,
     })
 end
 
@@ -1123,8 +1039,9 @@ function GroupsUI.showBookRow(path, opts)
             align = "left",
             callback = function()
                 BookGroups.addBook(captured.id, path)
-                reopen()
-                -- G1 (Q-A): a group that sets values asks before the book follows them
+                -- G1 (Q-A): a group that sets values asks before the book follows
+                -- them; its done callback reopens this popup once (a bare reopen
+                -- here as well stacked two copies, sweep 2026-11-06)
                 require("koassistant.books.group_settings").offerJoin(captured.id, { path },
                     { plugin = opts.plugin, ui = opts.ui }, reopen)
             end,

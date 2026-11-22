@@ -18,7 +18,51 @@ local T = require("ffi/util").template
 local ScopeResolver = require("koassistant.request.scope_resolver")
 
 local ContextExtractor = {}
+
+-- Text that is only whitespace is no text: a scanned PDF's pages each read
+-- as "", and joined by newlines they made N-1 newlines that passed for the
+-- book's text, so the empty-extraction ask and the text-fallback nudge never
+-- fired (docs/research/2026-08-14/T5_vision.md section 3.2)
+local function realText(s)
+    if type(s) ~= "string" or not s:find("%S") then return "" end
+    return s
+end
 ContextExtractor.__index = ContextExtractor
+
+-- The reader's place around an extraction that walks the document (B646).
+-- KOReader caches some engine answers per view (credocument.lua's call cache,
+-- on by default): the cache's tag follows gotoPage and gotoPos and never
+-- gotoXPointer, and getXPointer is one of the cached answers. An extraction
+-- that jumped to a page and came back with gotoXPointer alone left the engine
+-- on the reader's page and the cache answering for the page it had jumped to,
+-- until KOReader painted the page again: the reading position read in between
+-- was the extraction's end (a checkpoint ahead of the reader installed with
+-- spoiler protection on) or the book's start. The tag is saved with the
+-- position and put back with it.
+local function savePlace(document)
+    local place = {}
+    pcall(function() place.xp = document:getXPointer() end)
+    if type(document._callCacheGetCurrentTag) == "function" then
+        place.cached = true
+        pcall(function() place.tag = document._callCacheGetCurrentTag() end)
+    end
+    return place
+end
+local function restorePlace(document, place)
+    if not (place and place.xp) then return end
+    pcall(function() document:gotoXPointer(place.xp) end)
+    if not place.cached then return end
+    pcall(function()
+        if place.tag ~= nil and type(document._callCacheSetCurrentTag) == "function" then
+            document._callCacheSetCurrentTag(place.tag)
+        else
+            -- no view was tagged yet: back to answering from the engine
+            document._tag_call_cache = nil
+            document._current_call_cache_tag = nil
+        end
+    end)
+end
+ContextExtractor._savePlace, ContextExtractor._restorePlace = savePlace, restorePlace
 
 --- Get contiguous ranges of visible (flow 0) pages within a page range.
 --- Short-circuits when no hidden flows active.
@@ -228,17 +272,14 @@ function ContextExtractor.documentEndXPointer(document, total_pages)
     total_pages = total_pages or (document.info and document.info.number_of_pages) or 0
     if total_pages < 1 then return nil end
     local Screen = require("device").screen
-    local restore_xp
-    pcall(function() restore_xp = document:getXPointer() end)
+    local place = savePlace(document)
     local ok, end_xp = pcall(function()
         document:gotoPage(total_pages)
         local range = document:getTextFromPositions({ x = 0, y = 0 },
             { x = Screen:getWidth(), y = Screen:getHeight() }, true)
         return range and range.pos1
     end)
-    if restore_xp then
-        pcall(function() document:gotoXPointer(restore_xp) end)
-    end
+    restorePlace(document, place)
     if not ok or type(end_xp) ~= "string" or end_xp == "" then
         return nil
     end
@@ -340,7 +381,7 @@ end
 function ContextExtractor.readSidecarNotebook(document_path)
     if not document_path then return "" end
     local Notebook = require("koassistant.chat.notebook")
-    return Notebook.read(document_path) or ""
+    return Notebook.readForRequest(document_path) or ""
 end
 
 --- Read reading progress from a book's sidecar file on disk.
@@ -554,8 +595,8 @@ function ContextExtractor:getBookText(options)
             -- BEFORE the pcall and restored unconditionally after — an error right after
             -- gotoPos(0) would otherwise strand the reader at the book START (same
             -- position-safety rule as getBookTextRange; background fires depend on it).
-            local restore_xp
-            pcall(function() restore_xp = self.ui.document:getXPointer() end)
+            local place = savePlace(self.ui.document)
+            local restore_xp = place.xp
             local success, text = pcall(function()
                 if not restore_xp then
                     return ""
@@ -568,9 +609,7 @@ function ContextExtractor:getBookText(options)
                 -- Extract text between start and current
                 return self.ui.document:getTextFromXPointers(start_xp, restore_xp) or ""
             end)
-            if restore_xp then
-                pcall(function() self.ui.document:gotoXPointer(restore_xp) end)
-            end
+            restorePlace(self.ui.document, place)
             if success then
                 book_text = text
             else
@@ -643,8 +682,8 @@ function ContextExtractor:getBookText(options)
         book_text = notice .. "\n\n" .. ScopeResolver.utf8Tail(book_text, max_chars)
     end
 
-    result.text = book_text
-    result.char_count = #book_text
+    result.text = realText(book_text)
+    result.char_count = #result.text
 
     return result
 end
@@ -721,8 +760,7 @@ function ContextExtractor:getBookTextRange(from_progress, to_progress, options)
             -- BEFORE the pcall and restored unconditionally after — a mid-navigation error
             -- must never strand the position pages back (KOReader's progress autosave would
             -- silently persist it; background auto-update fires depend on this).
-            local restore_xp
-            pcall(function() restore_xp = document:getXPointer() end)
+            local place = savePlace(document)
             local success, text = pcall(function()
                 document:gotoPage(from_page)
                 local start_xp = document:getXPointer()
@@ -737,9 +775,7 @@ function ContextExtractor:getBookTextRange(from_progress, to_progress, options)
 
                 return document:getTextFromXPointers(start_xp, end_xp) or ""
             end)
-            if restore_xp then
-                pcall(function() document:gotoXPointer(restore_xp) end)
-            end
+            restorePlace(document, place)
             if success then
                 book_text = text
             else
@@ -815,8 +851,8 @@ function ContextExtractor:getBookTextRange(from_progress, to_progress, options)
         book_text = notice .. "\n\n" .. ScopeResolver.utf8Tail(book_text, max_chars)
     end
 
-    result.text = book_text
-    result.char_count = #book_text
+    result.text = realText(book_text)
+    result.char_count = #result.text
 
     logger.dbg("ContextExtractor:getBookTextRange - extracted", result.char_count, "chars")
     return result
@@ -876,10 +912,10 @@ function ContextExtractor:getFullDocumentText(options)
                 logger.warn("ContextExtractor: Failed to extract flow-aware full EPUB text:", text)
             end
         else
-            -- Standard path: navigate to get start/end XPointers
+            -- Standard path: navigate to get start/end XPointers. The reader's
+            -- place is put back whether or not the walk fails midway
+            local place = savePlace(document)
             local success, text = pcall(function()
-                local current_xp = document:getXPointer()
-
                 -- gotoPage(total_pages) + getXPointer() is the TOP of the last page,
                 -- which dropped the book's final page from every full extraction
                 local end_xp = ContextExtractor.documentEndXPointer(document, total_pages)
@@ -892,12 +928,9 @@ function ContextExtractor:getFullDocumentText(options)
                     end_xp = document:getXPointer()
                 end
 
-                if current_xp then
-                    document:gotoXPointer(current_xp)
-                end
-
                 return document:getTextFromXPointers(start_xp, end_xp) or ""
             end)
+            restorePlace(document, place)
             if success then
                 book_text = text
             else
@@ -964,8 +997,8 @@ function ContextExtractor:getFullDocumentText(options)
         book_text = notice .. "\n\n" .. ScopeResolver.utf8Tail(book_text, max_chars)
     end
 
-    result.text = book_text
-    result.char_count = #book_text
+    result.text = realText(book_text)
+    result.char_count = #result.text
 
     logger.dbg("ContextExtractor:getFullDocumentText - extracted", result.char_count, "chars")
     return result
@@ -1090,8 +1123,8 @@ function ContextExtractor:getPageRangeText(start_page, end_page, options)
         book_text = notice .. "\n\n" .. ScopeResolver.utf8Tail(book_text, max_chars)
     end
 
-    result.text = book_text
-    result.char_count = #book_text
+    result.text = realText(book_text)
+    result.char_count = #result.text
 
     logger.dbg("ContextExtractor:getPageRangeText - extracted", result.char_count, "chars from pages", start_page, "-", end_page)
     return result
@@ -1161,6 +1194,11 @@ function ContextExtractor:getVisiblePageText()
             end
             if #lines > 0 then
                 page_text = table.concat(lines, "\n")
+                -- The text layer of a PDF or DjVu page knows printed lines, not
+                -- paragraphs: a line break here ends a LINE of the page, where a
+                -- reflowable page has one between its paragraphs. Whoever shows
+                -- this text needs to know which (the translate window)
+                result.printed_lines = true
             end
 
             -- Fallback: try getTextFromPositions with text box bounds
@@ -1191,6 +1229,14 @@ function ContextExtractor:getVisiblePageText()
     return result
 end
 
+--- Whether an entry of KOReader's annotations list is a highlight. The list
+--- holds the page bookmarks too (no drawer, the page's first words as text),
+--- which are not the reader's highlights: every reader of the list that means
+--- highlights asks this (the sweep of 2026-11-06).
+function ContextExtractor.isHighlight(a)
+    return type(a) == "table" and a.drawer ~= nil and type(a.text) == "string" and a.text ~= ""
+end
+
 --- Format a raw annotations array into highlights (text only, no notes).
 -- @param annotations table Array of annotation tables from ui.annotation or sidecar
 -- @param options table { max_count = 100, include_chapter = true }
@@ -1206,7 +1252,7 @@ function ContextExtractor.formatHighlights(annotations, options)
 
     for _idx, annotation in ipairs(annotations) do
         if count >= max_count then break end
-        if annotation.text and annotation.text ~= "" then
+        if ContextExtractor.isHighlight(annotation) then
             count = count + 1
             table.insert(result.items, {
                 text = annotation.text,
@@ -1268,7 +1314,7 @@ function ContextExtractor.formatAnnotations(annotations, options)
 
     for _idx, annotation in ipairs(annotations) do
         if count >= max_count then break end
-        if annotation.text and annotation.text ~= "" then
+        if ContextExtractor.isHighlight(annotation) then
             count = count + 1
             table.insert(result.items, {
                 text = annotation.text,
@@ -1514,7 +1560,7 @@ function ContextExtractor:getNotebookContent()
     if not doc_path then return result end
 
     local Notebook = require("koassistant.chat.notebook")
-    local content = Notebook.read(doc_path)
+    local content = Notebook.readForRequest(doc_path)
     if content and content ~= "" then
         result.content = content
     end

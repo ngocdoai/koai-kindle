@@ -21,6 +21,9 @@ local logger = require("koassistant.core.logger")
 
 local Notebook = {}
 
+--- The name of a notebook kept beside its book (the "Alongside book" location)
+Notebook.SIDECAR_FILE = "koassistant_notebook.md"
+
 -- Plugin settings reference (set via Notebook.init)
 local _settings = nil
 
@@ -73,6 +76,12 @@ local function yamlQuote(str)
     return '"' .. str:gsub('\\', '\\\\'):gsub('"', '\\"') .. '"'
 end
 
+-- The KOAssistant notebooks folder: the "KOAssistant folder" save location,
+-- and where a deleted book's notebook is kept whatever the save location is
+local function centralDir()
+    return require("datastorage"):getDataDir() .. "/data/koassistant/notebooks"
+end
+
 --- Get the base directory for vault/central notebook storage
 --- @param features table|nil Plugin features settings (reads from G_reader_settings if nil)
 --- @return string|nil base_dir The base directory path, or nil for sidecar mode
@@ -83,8 +92,7 @@ function Notebook.getBaseDir(features)
     local location = features.notebook_save_location or "sidecar"
     if location == "sidecar" then return nil end
     if location == "central" then
-        local DataStorage = require("datastorage")
-        return DataStorage:getDataDir() .. "/data/koassistant/notebooks"
+        return centralDir()
     end
     -- custom
     return features.notebook_custom_path
@@ -134,7 +142,7 @@ local function recordedBookPath(notebook_path)
     local head = f:read(2048) or ""
     f:close()
     if head:sub(1, 3) ~= "---" then return nil end
-    local quoted = head:match("\nbook_path:%s*\"(.-)\"\n")
+    local quoted = head:match("\nbook_path:%s*\"(.-)\"\r?\n")
     if not quoted then return nil end
     return (quoted:gsub("\\(.)", "%1"))
 end
@@ -525,8 +533,12 @@ function Notebook.append(notebook_path, entry)
         return false, "Failed to open: " .. (err or "unknown")
     end
 
-    file:write(entry)
-    file:close()
+    local wrote = file:write(entry)
+    local closed = file:close()
+    if not wrote or not closed then
+        logger.err("KOAssistant Notebook: Failed to write the entry (full card?)")
+        return false, "Failed to write the entry"
+    end
     return true, nil
 end
 
@@ -727,6 +739,33 @@ function Notebook.read(document_path)
     return Notebook.stripFrontmatter(content)
 end
 
+--- A notebook's text without the header this plugin writes at its top: the
+--- line "# Notebook: <the book's title>" and the rule under it (B727). Only
+--- that first line, as create() writes it; a heading the reader wrote further
+--- down is theirs.
+--- @param content string|nil
+--- @return string|nil
+function Notebook.stripHeader(content)
+    if type(content) ~= "string" then return content end
+    local rest = content:match("^%s*# Notebook: [^\n]*\n%s*%-%-%-[ \t]*\r?\n(.*)$")
+        or content:match("^%s*# Notebook: [^\n]*\n(.*)$")
+        or content:match("^%s*# Notebook: [^\n]*$") and ""
+    if rest == nil then return content end
+    return (rest:gsub("^%s+", ""))
+end
+
+--- The notebook as a request carries it (B727): its entries, without the
+--- plugin's own header. That header names the book, and with Book info on
+--- None nothing the plugin writes may; with any other level the request's
+--- book line already names it, and the section's own label says what the
+--- text is. A notebook that holds nothing but its header is an empty one.
+--- Every path that sends the notebook reads it here; read() is for showing it.
+--- @param document_path string The document file path
+--- @return string|nil content
+function Notebook.readForRequest(document_path)
+    return Notebook.stripHeader(Notebook.read(document_path))
+end
+
 --- Get file stats for index
 --- Includes filename field in vault/central mode for fast index lookups
 --- @param document_path string The document file path
@@ -868,8 +907,12 @@ function Notebook.create(document_path)
         return false, "Failed to create: " .. (err or "unknown")
     end
 
-    file:write(table.concat(content_parts, ""))
-    file:close()
+    local wrote = file:write(table.concat(content_parts, ""))
+    local closed = file:close()
+    if not wrote or not closed then
+        logger.err("KOAssistant Notebook: Failed to write the new notebook (full card?)")
+        return false, "Failed to write the new notebook"
+    end
 
     -- Store DocSettings ref for vault mode (travels with book on move)
     if location ~= "sidecar" and final_filename then
@@ -889,7 +932,7 @@ end
 function Notebook.stripFrontmatter(content)
     if not content then return "" end
     -- Match opening --- through closing --- (YAML block)
-    local stripped = content:match("^%-%-%-\n.-\n%-%-%-\n(.*)")
+    local stripped = content:match("^%-%-%-\r?\n.-\n%-%-%-\r?\n(.*)")
     return stripped or content
 end
 
@@ -909,8 +952,7 @@ function Notebook.resolvePathForLocation(document_path, location, features, inde
     -- Vault/central mode
     local base_dir
     if location == "central" then
-        local DataStorage = require("datastorage")
-        base_dir = DataStorage:getDataDir() .. "/data/koassistant/notebooks"
+        base_dir = centralDir()
     else
         base_dir = features.notebook_custom_path
     end
@@ -939,6 +981,24 @@ end
 --- @param features table Current features settings (contains paths)
 --- @return number moved Count of successfully moved notebooks
 --- @return number failed Count of failed moves
+-- Writes the whole content and proves it landed (the write and the close
+-- succeed and the size on disk matches) before a caller may remove the file
+-- it replaces: with buffered io a full card fails at close, and a cut copy
+-- replaced the only good notebook while the move reported success (sweep
+-- 2026-11-06). A partial file is removed.
+local function writeWhole(path, content)
+    local file = io.open(path, "wb")
+    if not file then return false end
+    local wrote = file:write(content)
+    local closed = file:close()
+    if wrote and closed and lfs.attributes(path, "size") == #content then
+        return true
+    end
+    os.remove(path)
+    return false
+end
+Notebook._writeWhole = writeWhole
+
 function Notebook.migrateAll(from_location, to_location, features)
     local util = require("util")
     local index = G_reader_settings:readSetting("koassistant_notebook_index", {})
@@ -976,10 +1036,7 @@ function Notebook.migrateAll(from_location, to_location, features)
                 local dir = new_path:match("(.*/)") or ""
                 if dir ~= "" then util.makePath(dir) end
                 local clean_content = Notebook.stripFrontmatter(nb.content)
-                local file = io.open(new_path, "w")
-                if file then
-                    file:write(clean_content)
-                    file:close()
+                if writeWhole(new_path, clean_content) then
                     ok = true
                     -- Remove DocSettings ref (no longer needed in sidecar mode)
                     local ds = SafeDocSettings.resolve(nb.doc_path)
@@ -991,8 +1048,7 @@ function Notebook.migrateAll(from_location, to_location, features)
             -- Write to vault/central (add frontmatter if missing)
             local base_dir
             if to_location == "central" then
-                local DataStorage = require("datastorage")
-                base_dir = DataStorage:getDataDir() .. "/data/koassistant/notebooks"
+                base_dir = centralDir()
             else
                 base_dir = features.notebook_custom_path
             end
@@ -1019,10 +1075,7 @@ function Notebook.migrateAll(from_location, to_location, features)
                     content = Notebook.generateFrontmatter(nb.doc_path, doc_props) .. content
                 end
 
-                local file = io.open(new_path, "w")
-                if file then
-                    file:write(content)
-                    file:close()
+                if writeWhole(new_path, content) then
                     ok = true
                     -- Store DocSettings ref
                     ds:saveSetting("koassistant_notebook_ref", {
@@ -1059,6 +1112,105 @@ function Notebook.migrateAll(from_location, to_location, features)
     G_reader_settings:flush()
 
     return moved, failed
+end
+
+--- A deleted book's notebook, kept (B756). The notebook is the one file of a
+--- book's that can hold the reader's own writing, and KOReader's own per-book
+--- notebook file outlives a deletion too: a notebook beside its book is moved
+--- into the KOAssistant notebooks folder under the book's name, with the
+--- front matter a notebook there carries (title, author, the path the book
+--- had). The Notebooks list shows it (keptNotebooks), and a notebook made for
+--- the same book in that folder later adopts it (fileServes). Never over
+--- another file; the book-side file is removed only once the copy is proven
+--- whole; a notebook that holds nothing but the header this plugin writes is
+--- not kept.
+--- @param document_path string the deleted book's path
+--- @param sidecar_file string the notebook file beside it
+--- @return string|nil kept_path
+--- @return string|nil reason "empty" (nothing to keep), or what failed
+function Notebook.keepDeleted(document_path, sidecar_file)
+    local file = io.open(sidecar_file, "rb")
+    if not file then return nil, "unreadable" end
+    local content = file:read("*all") or ""
+    file:close()
+    if (Notebook.stripHeader(Notebook.stripFrontmatter(content)) or ""):match("^%s*$") then
+        return nil, "empty"
+    end
+    local base_dir = centralDir()
+    require("util").makePath(base_dir)
+    local filename = Notebook.generateFilename(document_path)
+    if lfs.attributes(base_dir .. "/" .. filename, "mode") ~= nil then
+        filename = freeName(base_dir, filename)
+    end
+    if not content:match("^%-%-%-\r?\n") then
+        content = Notebook.generateFrontmatter(document_path) .. content
+    end
+    local kept_path = base_dir .. "/" .. filename
+    if not writeWhole(kept_path, content) then return nil, "write failed" end
+    os.remove(sidecar_file)
+    return kept_path
+end
+
+-- One quoted value of a notebook's front matter (title, author), unescaped
+local function frontValue(head, key)
+    local quoted = head:match("\n" .. key .. ":%s*\"(.-)\"\r?\n")
+    if not quoted or quoted == "" then return nil end
+    return (quoted:gsub("\\(.)", "%1"))
+end
+
+--- The notebooks whose book is not on this device (B756): the files of the
+--- KOAssistant notebooks folder, and of the folder in use when that is
+--- another one, that record a book no file stands at and that no book of the
+--- index is linked to. A deleted book's notebook is one (keepDeleted), and so
+--- is the notebook a deleted book left in that folder. For the Notebooks
+--- list: it reads the head of each such file, nothing more.
+--- @return table list of { path, filename, book_path, title, author, modified, size }
+function Notebook.keptNotebooks()
+    local index = G_reader_settings:readSetting("koassistant_notebook_index", {})
+    local linked = {}
+    for _doc, entry in pairs(index) do
+        if type(entry) == "table" and entry.filename then linked[entry.filename] = true end
+    end
+    local list, seen_dir = {}, {}
+    local function scan(dir)
+        if not dir or seen_dir[dir] or lfs.attributes(dir, "mode") ~= "directory" then return end
+        seen_dir[dir] = true
+        for filename in lfs.dir(dir) do
+            -- a dot file is none of ours (macOS writes "._name.md" beside every copied file)
+            if filename:match("%.md$") and filename:sub(1, 1) ~= "." and not linked[filename] then
+                local path = dir .. "/" .. filename
+                local attr = lfs.attributes(path)
+                local recorded = attr and attr.mode == "file" and recordedBookPath(path)
+                if recorded and lfs.attributes(recorded, "mode") == nil then
+                    local f = io.open(path, "r")
+                    local head = f and f:read(2048) or ""
+                    if f then f:close() end
+                    list[#list + 1] = {
+                        path = path, filename = filename, book_path = recorded,
+                        title = frontValue(head, "title") or (filename:gsub("%.md$", "")),
+                        author = frontValue(head, "author"),
+                        modified = attr.modification, size = attr.size,
+                    }
+                end
+            end
+        end
+    end
+    scan(centralDir())
+    scan(Notebook.getBaseDir())
+    table.sort(list, function(a, b) return a.path < b.path end)
+    return list
+end
+
+--- A kept notebook's text, for showing it: the file by its own path, without
+--- the front matter
+--- @param path string a path keptNotebooks listed
+--- @return string|nil
+function Notebook.readKept(path)
+    local file = path and io.open(path, "r")
+    if not file then return nil end
+    local content = file:read("*all")
+    file:close()
+    return Notebook.stripFrontmatter(content)
 end
 
 --- Scan vault directory and rebuild missing index entries

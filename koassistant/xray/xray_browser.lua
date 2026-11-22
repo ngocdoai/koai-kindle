@@ -264,9 +264,27 @@ end
 --- the exact same term rules.
 local collectSearchTerms = XrayParser.collectSearchTerms
 
+-- A case-sensitive pattern longer than this falls back to the any-case one
+local CASED_PATTERN_MAX = 2000
+
 --- EPUB regex-OR of every term (so the native search session walks name AND
 --- aliases with its own prev/next). nil when a single plain term suffices.
+--- With a name set to capitals only (B533 S2) the pattern is for a
+--- case-sensitive session (second return true): each term in letters of
+--- either case except the capitals it requires, so prev/next stops where
+--- the counts do.
 local function buildSearchPattern(terms)
+    for _idx, t in ipairs(terms) do
+        if t.caps then
+            local parts = {}
+            for _j, u in ipairs(terms) do
+                parts[#parts + 1] = u.regex or XrayParser.caseSearchRegex(u.text, u.caps)
+            end
+            local pattern = table.concat(parts, "|")
+            if #pattern <= CASED_PATTERN_MAX then return pattern, true end
+            break
+        end
+    end
     if #terms == 1 and not terms[1].regex then return nil end
     local function one(term)
         return term.regex
@@ -290,6 +308,25 @@ end
 --- exclude = XrayParser.containingHandles output (B266): a hit whose context
 --- spells another entity's longer handle around it is that entity's mention
 --- and is dropped here, so counts, tree and lists agree by construction.
+--- KOReader's PDF search matches a single word inside a longer one
+--- (koptinterface's word:find: "Christ" in "Christian", "Ann" in "Hannah"),
+--- and hands back the whole words it matched: a hit counts only when the
+--- term is those words as a whole (B600). The EPUB engine and the name
+--- index match whole words already.
+local function pdfWholeWord(matched_text, term_text)
+    local needle = (XrayParser.matchNormalize(term_text or ""):match("^%s*(.-)%s*$")) or ""
+    if needle == "" or type(matched_text) ~= "string" then return true end
+    -- A script written without spaces (Chinese, Japanese, Thai): the PDF
+    -- engine hands each character back as a word box of its own and KOReader
+    -- joins the boxes with spaces ("林 黛 玉" for 林黛玉), so the whole-word
+    -- test never held and every mention of such a name was dropped (audit
+    -- 2026-11-12). There is no word boundary to check there, as in a
+    -- reflowable book.
+    if XrayParser._skipBoundaryCheck(needle) then return true end
+    return #XrayParser._collectMatchSpans(XrayParser.matchNormalize(matched_text), needle) > 0
+end
+XrayBrowser._pdfWholeWord = pdfWholeWord
+
 --- @return table hits Array of {page?, xp?, display_page, row_text, term, order}
 local function gatherMentionHits(ui, terms, exclude)
     local TextBoxWidget = require("ui/widget/textboxwidget")
@@ -317,9 +354,17 @@ local function gatherMentionHits(ui, terms, exclude)
                     page = r.start
                     local b = r.boxes and r.boxes[1]
                     key = tostring(page) .. "|" .. tostring(b and b.x) .. "|" .. tostring(b and b.y)
+                    -- the term inside a longer word is no mention (B600)
+                    if not pdfWholeWord(r.matched_text, term.text) then page = nil end
                 else
                     page = ui.document:getPageFromXPointer(r.start)
                     key = tostring(r.start)
+                end
+                -- A name set to capitals only counts a hit with its
+                -- capitals (B533 S2); another term may still claim the spot
+                if term.caps and not XrayParser.textCapsOk(r.matched_text or term.text,
+                        term.caps, term.words) then
+                    page = nil
                 end
                 if page and not seen[key] and exclude
                     and XrayParser.hitInsideHandle(r.prev_text,
@@ -383,7 +428,7 @@ end
 --- @return table|nil hits, nil when the reader cancelled
 local function gatherMentionHitsInSubprocess(ui, terms, exclude)
     local Trapper = require("ui/trapper")
-    local info = InfoMessage:new{ text = _("Searching the book… (tap to cancel)") }
+    local info = require("koassistant.ui.waiting").message{ text = _("Searching the book… (tap to cancel)") }
     UIManager:show(info)
     UIManager:forceRePaint()
     local completed, hits = Trapper:dismissableRunInSubprocess(function()
@@ -401,17 +446,27 @@ end
 --- Open KOReader's native search session for the term at the CURRENT
 --- position, then float the "Back to X-Ray" button. The built-in search owns
 --- highlighting and prev/next — no custom overlay (maintainer 2026-08-13).
-local function launchSearchSession(ui, term, use_regex, return_info)
+--- case_sensitive: the pattern spells out its own case (buildSearchPattern).
+--- name: the entry's name as typed, for the search window's own input.
+local function launchSearchSession(ui, term, use_regex, return_info, case_sensitive, name)
     UIManager:scheduleIn(0.2, function()
         if use_regex then
             -- The session runs ENTIRELY on onShowSearchDialog's args (its
-            -- prev/next closures capture them) — write NOTHING onto the
-            -- search module. Setting last_search_text leaked our pipes
-            -- pattern into the user's regular search-input prefill, and a
-            -- synthesized current_search_type table read as "no type
-            -- selected" there (the type checkboxes compare by TABLE
-            -- IDENTITY), so a later manual search ran the pattern literally
-            -- and found nothing (device 2026-08-13).
+            -- prev/next closures capture them). Setting last_search_text to
+            -- the pattern leaked our pipes into the user's regular
+            -- search-input prefill, and a synthesized current_search_type
+            -- table read as "no type selected" there (the type checkboxes
+            -- compare by TABLE IDENTITY), so a later manual search ran the
+            -- pattern literally and found nothing (device 2026-08-13).
+            -- What the search window's magnifier opens on is the entry's
+            -- name, plain, as KOReader's own Search from a selection leaves
+            -- it (in memory; its find-all list dropped, as that search
+            -- does); never the pattern or a search type (device 2026-10-22:
+            -- the box showed the reader's own last search).
+            if name then
+                ui.search.last_search_text = name
+                ui.search.last_search_hash = nil
+            end
             -- KOReader master changed onShowSearchDialog's 3rd arg from a
             -- boolean `regex` to a `search_type` table ({flags, regex}); the
             -- master handler does `search_type.regex`, so a bare boolean
@@ -432,7 +487,7 @@ local function launchSearchSession(ui, term, use_regex, return_info)
                 -- Legacy boolean API read the module field, not the arg
                 ui.search.use_regex = true
             end
-            ui.search:onShowSearchDialog(term, 0, regex_arg, true)
+            ui.search:onShowSearchDialog(term, 0, regex_arg, not case_sensitive)
         else
             ui.search:searchCallback(0, term)
         end
@@ -829,9 +884,10 @@ local function findItemHighlights(item, ui)
     if #names == 0 then return {} end
 
     local matches = {}
+    local isHighlight = require("koassistant.request.context_extractor").isHighlight
     for _idx, annotation in ipairs(ui.annotation.annotations) do
         local ann_text = annotation.text
-        if ann_text and ann_text ~= "" then
+        if isHighlight(annotation) then
             local text_lower = ann_text:lower()
             for _idx2, name in ipairs(names) do
                 if text_lower:find(name, 1, true) then
@@ -1060,7 +1116,7 @@ function XrayBrowser:show(xray_data, metadata, ui, on_delete)
     -- Merge user-defined search terms into item aliases
     if metadata.book_file then
         local ActionCache = require("koassistant.artifacts.action_cache")
-        local user_aliases = ActionCache.getUserAliases(metadata.book_file)
+        local user_aliases = ActionCache.matchOverlay(metadata.book_file)
         if next(user_aliases) then
             XrayParser.mergeUserAliases(self.xray_data, user_aliases)
         end
@@ -1330,6 +1386,27 @@ end
 ---   with no carried list is not parsed (this runs when the popup opens, and
 ---   a long series' X-Ray is large)
 --- @return string|nil
+--- What an X-Ray was built with, as lines for its Info (B568): the preset its
+--- three dials match, or "Custom" with the dials themselves. The values are
+--- the saved entry's own stamps (an entry from before a dial existed carries
+--- none, which is that dial's widest value: all categories, standard depth,
+--- the status block on). The research track takes no dials. Pure.
+--- @param entry table|nil the saved X-Ray entry (xray_categories, xray_depth, xray_status)
+--- @param academic boolean the X-Ray is on the research track
+--- @return table lines
+function XrayBrowser.buildLines(entry, academic)
+    if type(entry) ~= "table" or academic then return {} end
+    local BookSettings = require("koassistant.books.book_settings")
+    local preset = BookSettings.xrayPresetFor(entry.xray_categories, entry.xray_status, entry.xray_depth)
+    local lines = { _("Preset:") .. " " .. BookSettings.xrayPresetLabel(preset) }
+    if not preset then
+        lines[#lines + 1] = _("Categories:") .. " " .. BookSettings.xrayCategoriesLabel(entry.xray_categories)
+        lines[#lines + 1] = _("Depth:") .. " " .. BookSettings.xrayDepthLabel(entry.xray_depth)
+        lines[#lines + 1] = _("Current State:") .. " " .. (entry.xray_status == "off" and _("Off") or _("On"))
+    end
+    return lines
+end
+
 function XrayBrowser.carriedListLabel(book_file, raw)
     if type(raw) == "string"
             and not raw:find('"' .. XrayParser.DORMANT_KEY .. '"', 1, true) then
@@ -1598,20 +1675,7 @@ end
 --- sit whole beside the role; otherwise the source title.
 --- @return function label(stub) -> string text, boolean short
 function XrayBrowser:_carriedSourceLabeler()
-    local BookGroups = require("koassistant.books.book_groups")
-    local pos = {}
-    for _idx, g in ipairs(BookGroups.groupsFor(self.metadata.book_file or "") or {}) do
-        if BookGroups.kindOf(g) == BookGroups.KIND_SERIES then
-            for i, p in ipairs(g.books or {}) do
-                if pos[p] == nil then pos[p] = i end
-            end
-        end
-    end
-    return function(stub)
-        local n = type(stub.file) == "string" and pos[stub.file]
-        if n then return T(_("Book %1"), n), true end
-        return type(stub.source) == "string" and stub.source or "", false
-    end
+    return require("koassistant.books.book_groups").carriedSourceLabeler(self.metadata.book_file)
 end
 
 --- Menu rows for carried entries: the ONE row grammar every carried list
@@ -2370,7 +2434,7 @@ function XrayBrowser:reloadLiveMain(file)
     if not (entry and entry.result and XrayParser.isJSON(entry.result)) then return false end
     local data = XrayParser.parse(entry.result)
     if not data or data.error then return false end
-    local user_aliases = ActionCache.getUserAliases(file)
+    local user_aliases = ActionCache.matchOverlay(file)
     if next(user_aliases) then
         XrayParser.mergeUserAliases(data, user_aliases)
     end
@@ -2422,7 +2486,7 @@ function XrayBrowser:_commitDormantOp(apply_fn, success_text)
     -- The view keeps the reader's own aliases (the fresh parse holds none):
     -- entry pages show them, search finds by them, and the review of likely
     -- matches reads them
-    local user_aliases = require("koassistant.artifacts.action_cache").getUserAliases(self.metadata.book_file)
+    local user_aliases = require("koassistant.artifacts.action_cache").matchOverlay(self.metadata.book_file)
     if next(user_aliases) then
         XrayParser.mergeUserAliases(data, user_aliases)
     end
@@ -2839,6 +2903,65 @@ function XrayBrowser:_dismissDetail(viewer)
     self._detail_nav_close = nil
 end
 
+--- The words of "First appears" and "Last seen" (B748), pure.
+--- @param first table { page, chapter } the first page the entry is written on
+--- @param last table|nil the last one (nil or the same page: one statement)
+--- @param reach_limited boolean the reader's reach ends before the book does
+---   (spoiler protection): the last page is the last one SO FAR
+--- @return string
+function XrayBrowser.firstLastText(first, last, reach_limited)
+    local function where(at)
+        if type(at.chapter) == "string" and at.chapter:find("%S") then
+            return T(_("%1 (p. %2)"), at.chapter, at.page)
+        end
+        return T(_("p. %1"), at.page)
+    end
+    if not last or last.page == first.page then
+        return T(_("First appears: %1."), where(first))
+    end
+    if reach_limited then
+        return T(_("First appears: %1.\nLast seen: %2."), where(first), where(last))
+    end
+    return T(_("First appears: %1.\nLast appears: %2."), where(first), where(last))
+end
+
+--- That line for an entry of the open book, or nil (B748): the first and the
+--- last page its names are written on, up to the reader's reach (the gate
+--- Mentions clips at) or inside a section browser's own pages, read from the
+--- book's STORED name index. No model, no pass over the book and nothing new
+--- stored: nil while the index does not hold the entry's names (the marks
+--- keep it up to date; Chapter Appearances and Mentions build it when asked).
+--- @return string|nil
+function XrayBrowser:_firstLastLine(item, category_key, title)
+    local ui = self.ui
+    local doc = ui and ui.document
+    if not doc or DISTRIBUTION_EXCLUDED[category_key] or XrayParser.TEXT_MATCH_EXCLUDED[category_key] then
+        return nil
+    end
+    local owner = self.metadata and self.metadata.book_file
+    if owner and doc.file ~= owner then return nil end
+    local XrayIndex = require("koassistant.xray.xray_index")
+    if not XrayIndex.supported(doc) then return nil end
+    local layout = XrayIndex.layout(doc.file, XrayIndex.stamp(ui))
+    local set = layout and XrayParser.matchTermSet(item, title)
+    if not set then return nil end
+    local gate = self:_spoilerGate()
+    local from, to = nil, gate
+    if self.scope then from, to = self.scope_start, self.scope_end end
+    local lo, hi = XrayIndex.firstLast(layout, set,
+        XrayParser.containingMatchHandles(self.xray_data, item), from, to)
+    if not lo then return nil end
+    local function at(page)
+        local chapter
+        if ui.toc and ui.toc.getTocTitleByPage then
+            local ok, found = pcall(ui.toc.getTocTitleByPage, ui.toc, page)
+            chapter = ok and type(found) == "string" and found or nil
+        end
+        return { page = page, chapter = chapter }
+    end
+    return XrayBrowser.firstLastText(at(lo), hi and at(hi) or nil, gate ~= nil)
+end
+
 function XrayBrowser:showItemDetail(item, category_key, title, source, nav_context)
     require("koassistant.core.logger").dbg("KOAssistant XrayBrowser: entity",
         (item and item.name) or "?", "in", tostring(category_key),
@@ -2871,6 +2994,13 @@ function XrayBrowser:showItemDetail(item, category_key, title, source, nav_conte
         detail_text = _("As of") .. " " .. self.metadata.progress .. "\n\n" .. detail_text
         chat_text = _("As of") .. " " .. self.metadata.progress .. "\n\n" .. chat_text
     end
+    -- Where the book first writes this entry's name and where it last does,
+    -- as far as the reader has read (B748). On the page only: "Chat about
+    -- this" sends the entry, as before.
+    do
+        local ok_fl, first_last = pcall(self._firstLastLine, self, item, category_key, title)
+        if ok_fl and first_last then detail_text = detail_text:gsub("%s+$", "") .. "\n\n" .. first_last end
+    end
     -- G2 (group hub plan, 2026-09-06): what the other books of the group say
     -- about this entry, as far as the chain reaches (earlier books; later
     -- books only once every book before them is read or unprotected) —
@@ -2890,7 +3020,7 @@ function XrayBrowser:showItemDetail(item, category_key, title, source, nav_conte
             for _idx, b in ipairs(also) do
                 local first = XrayCard.firstSentence(XrayCard.itemText(b.item))
                 local label = b.direction == "later"
-                    and T(_("%1 (later in the series)"), b.title) or b.title
+                    and require("koassistant.books.book_groups_ui").laterLabel(b.title) or b.title
                 lines[#lines + 1] = first ~= "" and T(_("%1: %2"), label, first) or label
             end
             detail_text = detail_text .. "\n" .. table.concat(lines, "\n")
@@ -3163,8 +3293,9 @@ function XrayBrowser:showItemDetail(item, category_key, title, source, nav_conte
     local fallback_row = {}
     if DISTRIBUTION_EXCLUDED[category_key] and self.metadata.book_file
         and not self.scope and not self.metadata.checkpoint
-        and type(item) == "table" and ((type(item.background) == "table"
-        and #item.background > 0) or self:_canIllustrate(item, category_key)) then
+        and type(item) == "table" and (self:_offersMoveBack(item, category_key)
+        or self:_canIllustrate(item, category_key)
+        or ((self:_entryPictures(item, category_key) or {}).count or 0) > 0) then
         table.insert(fallback_row, {
             text = _("More…"),
             callback = function()
@@ -3614,9 +3745,39 @@ function XrayBrowser:_canIllustrate(item, category_key)
         require("koassistant.core.config_helper").mainProvider(feats), plugin.settings)
 end
 
---- Illustrate… (S8): an optional note, then the picture, drawn from the
---- entry's description (the entry is the subject; the book's identity per the
---- Book info level, its Background and spoiler posture as for a passage).
+--- The pictures that show an entry of this book (B486), for its More… row:
+--- { count, entry = the gallery's entry set }, nil when the X-Ray is not at
+--- hand. Matched by the entry's names (ImageGenerator.picturesOf).
+function XrayBrowser:_entryPictures(item, category_key)
+    local file = self.metadata.book_file
+    if not (file and type(item) == "table" and self.xray_data) then return nil end
+    local ImageGenerator = require("koassistant.images.image_generator")
+    local names, others, main = ImageGenerator.entryNames(self.xray_data, item, category_key)
+    return {
+        count = #ImageGenerator.picturesOf(file, names, others, main),
+        entry = { book_file = file, names = names, others = others, main = main,
+            title = XrayParser.getItemName(item, category_key) },
+    }
+end
+
+--- "Move back to carried list" (B534): the way back out of "Add as a new
+--- entry", so only for an entry on the hand-added record (B400). Background
+--- lines prove nothing: every entry of this book that matches a carried name
+--- gains them. The move itself needs a history to file the entry under.
+function XrayBrowser:_offersMoveBack(item, category_key)
+    if self.scope or self.metadata.checkpoint or not self.metadata.book_file then return false end
+    if type(item) ~= "table" or type(item.background) ~= "table" or #item.background == 0 then return false end
+    local name = XrayParser.getItemName(item, category_key)
+    if type(name) ~= "string" or name == "" then return false end
+    local ActionCache = require("koassistant.artifacts.action_cache")
+    return ActionCache.getPromotedStubs(self.metadata.book_file)[name:lower()] ~= nil
+end
+
+--- Illustrate… (S8): the picture popup (B535, B537: a note for this picture,
+--- the settings it is drawn with, as a tap of Generate Image shows them), then
+--- the picture, drawn from the entry's description (the entry is the subject;
+--- the book's identity per the Book info level, its Background and spoiler
+--- posture as for a passage), with the note when the reader adds one.
 function XrayBrowser:_illustrate(item, category_key)
     local plugin = self.metadata.plugin
     local configuration = self.metadata.configuration
@@ -3648,13 +3809,25 @@ function XrayBrowser:_illustrate(item, category_key)
         plugin = plugin,
     }
     local book_info = { file = file, title = title }
-    ImageGenerator.askNote(nil, function(note)
-        gen_opts.note = note
-        require("ui/network/manager"):runWhenConnected(function()
-            if plugin.updateConfigFromSettings then plugin:updateConfigFromSettings() end
-            ImageGenerator.generate(nil, configuration, plugin.settings, book_info, gen_opts)
-        end)
-    end, { optional = true, confirm_text = _("Illustrate") })
+    local state = {}
+    -- the provider question first, when the chat provider cannot draw
+    ImageGenerator.providerFirst(plugin, function()
+        require("koassistant.images.image_options").show(plugin, {
+            title = T(_("Illustrate \"%1\""), XrayParser.getItemName(item, category_key)),
+            writer = true,
+            note = true,
+            state = state,
+            actions = {
+                { text = _("Illustrate"), callback = function()
+                    gen_opts.note = state.note
+                    require("ui/network/manager"):runWhenConnected(function()
+                        if plugin.updateConfigFromSettings then plugin:updateConfigFromSettings() end
+                        ImageGenerator.generate(nil, configuration, plugin.settings, book_info, gen_opts)
+                    end)
+                end },
+            },
+        })
+    end)
 end
 
 --- One popup for per-entry management (2026-08-09 unified entry-management
@@ -3732,61 +3905,77 @@ function XrayBrowser:_showEntityManagePopup(item, category_key, title, source, n
         }})
     end
     -- Illustrate… (image round S8): a picture of this entry, drawn from its
-    -- description through the prompt writer (image_generator.lua)
+    -- description through the prompt writer (image_generator.lua); beside it
+    -- the pictures that show this entry (B486: drawn from it, or from a
+    -- passage that names it), in the gallery's grid
+    local picture_row = {}
+    local pictures = named and self.metadata.book_file and self:_entryPictures(item, category_key)
+    if pictures and pictures.count > 0 then
+        picture_row[#picture_row + 1] = {
+            text = T(_("Pictures (%1)…"), pictures.count),
+            callback = function()
+                UIManager:close(dialog)
+                require("koassistant.images.image_browser").show({ entry = pictures.entry })
+            end,
+        }
+    end
     if self:_canIllustrate(item, category_key) then
-        table.insert(buttons, {{
+        picture_row[#picture_row + 1] = {
             text = _("Illustrate…"),
             callback = function()
                 UIManager:close(dialog)
                 self_ref:_illustrate(item, category_key)
             end,
-        }})
+        }
     end
+    if #picture_row > 0 then table.insert(buttons, picture_row) end
     -- Split the reading rows above from the ops below (maintainer 2026-08-18).
     -- ButtonTable already rules between every row, so a disabled row reads as
     -- the double line asked for, and labelling it says WHY the split is there.
     local ops_start = #buttons
-    if can_edit_terms then
+    -- B533: the entry's names, what each matches, Rename… and Reset in one
+    -- screen (Rename is on live main views only: its commit writes the MAIN
+    -- artifact; the screen offers what the view allows)
+    if can_edit_terms or (live_main and named) then
         table.insert(buttons, {{
-            text = _("Edit search terms"),
+            text = _("Names and matching…"),
             callback = function()
                 UIManager:close(dialog)
                 self_ref:editSearchTerms(item, category_key, title, source, nav_context)
             end,
         }})
     end
-    -- Rename (2026-08-09): live main views only — the commit path writes the
-    -- MAIN artifact, so a section/checkpoint view must not offer it
-    if live_main and named then
-        table.insert(buttons, {{
-            text = _("Rename…"),
-            callback = function()
-                UIManager:close(dialog)
-                self_ref:_renameEntity(item, category_key, viewer)
-            end,
-        }})
-    end
     -- Merge with another entry (2026-08-09 round): the dedup flow's manual
     -- picker, seeded with THIS entry — same keep/AI-merge options and the
-    -- same commit (+ ring archive). The browser unwinds to a fresh root
-    -- instead of closing (a merge rewrites the data the stacked pages hold);
-    -- the commit's reloadLiveMain then keeps that root honest.
+    -- same commit (+ ring archive). The entry page stays under the pick, so
+    -- Cancel and Back land on it; only a merge that lands rebuilds the
+    -- browser (it rewrote the data the stacked pages hold), onto the kept
+    -- entry, as rename and link do.
     if live_main and named and self.metadata.plugin then
         table.insert(buttons, {{
             text = _("Merge with another entry…"),
             callback = function()
                 UIManager:close(dialog)
-                self_ref:_dismissDetail(viewer)
-                self_ref:_unwindToRoot()
+                local book_file = self_ref.metadata.book_file
                 require("koassistant.xray.xray_dedup").startFlow({
-                    file = self_ref.metadata.book_file,
+                    file = book_file,
                     ui = self_ref.ui,
                     plugin = self_ref.metadata.plugin,
                     configuration = self_ref.metadata.configuration,
                     title = self_ref.metadata.title,
                     author = self_ref.metadata.book_author,
                     manual_seed = { cat_key = category_key, name = entry_name },
-                    close_browser = function() end, -- root stays; reloadLiveMain refreshes it
+                    on_merged = function(keep_name)
+                        -- Only while this browser still shows this book's
+                        -- live X-Ray (an AI merge lands seconds later); the
+                        -- reload reads the names the commit moved over
+                        if not self_ref:reloadLiveMain(book_file) then return end
+                        local shown = self_ref._detail_viewer
+                        if shown and UIManager:isWidgetShown(shown) then
+                            self_ref:_dismissDetail(shown)
+                        end
+                        self_ref:_rebuildToDetail(category_key, keep_name)
+                    end,
                 })
             end,
         }})
@@ -3808,15 +3997,12 @@ function XrayBrowser:_showEntityManagePopup(item, category_key, title, source, n
     end
     -- "Move back to carried list" — the way back out of "Add as its own entry"
     -- (round 27 maintainer: "it could easily be done by accident and there is
-    -- no way back"). Offered only for entries that carry cross-book background:
-    -- those belong to an earlier book, so the carried list is an honest home.
+    -- no way back"). Offered only for entries added by hand (_offersMoveBack).
     -- A native entry of THIS book would be mislabeled there — removing one of
     -- those is the separate "edit/delete X-Ray entries" question. Undo is
     -- LOCAL: a fold that already copied this forward is not rewritten, exactly
     -- like any other later edit.
-    if not self.scope and not self.metadata.checkpoint and self.metadata.book_file
-        and type(item) == "table" and type(item.background) == "table"
-        and #item.background > 0 then
+    if self:_offersMoveBack(item, category_key) then
         local demote_name = XrayParser.getItemName(item, category_key)
         if type(demote_name) == "string" and demote_name ~= "" then
             table.insert(buttons, {{
@@ -4108,142 +4294,678 @@ end
 
 --- Commit a rename: artifact via the dedup commit pattern (ring-archive =
 --- built-in undo), then re-key the name-keyed side stores (wiki, search
---- terms, never-merge), then the matching follow-up — the old name stays
---- model-visible as an alias either way; whether it keeps matching THE TEXT
---- is the reader's call (the "Andy" case: a nickname that would match
---- strangers in the running text).
+--- terms, never-merge), then the rename record (B533): the AI's name, which
+--- Reset restores and a rebuild renames again, and the names the reader
+--- typed, which stay theirs to delete. The old name stays an alias the model
+--- sees and keeps matching; the names screen shows it as a row, where the
+--- reader can stop matching it (the "Andy" case: a nickname that would match
+--- strangers in the running text). Then the names screen of the renamed entry.
 function XrayBrowser:_commitRename(category_key, old_name, new_name, viewer)
     local book_file = self.metadata.book_file
+    local ActionCache = require("koassistant.artifacts.action_cache")
+    -- Read before the record moves: the AI's name (the first rename's old
+    -- name) and the names the reader typed so far
+    local before = ActionCache.getUserAliases(book_file)[old_name] or {}
+    local typed_before = {}
+    for _idx, t in ipairs(type(before.typed) == "table" and before.typed or {}) do
+        if type(t) == "string" then typed_before[t:lower()] = true end
+    end
+    -- One of the AI's names: an alias in the artifact the reader did not type
+    local new_is_ai = false
     if not self:_commitDormantOp(
         function(data)
+            for _idx, it in ipairs(type(data[category_key]) == "table" and data[category_key] or {}) do
+                if type(it) == "table" and XrayParser.getItemName(it, category_key) == old_name then
+                    for _j, a in ipairs(type(it.aliases) == "table" and it.aliases or {}) do
+                        if type(a) == "string" and a:lower() == new_name:lower() then
+                            new_is_ai = not typed_before[a:lower()]
+                        end
+                    end
+                end
+            end
             return XrayParser.renameItem(data, category_key, old_name, new_name)
         end,
         T(_("\"%1\" renamed to \"%2\"."), old_name, new_name)) then
         return
     end
-    local ActionCache = require("koassistant.artifacts.action_cache")
     ActionCache.renameEntityKeys(book_file, category_key, old_name, new_name)
     -- B267 (B394 slice 6): checkpoints built before the rename take it too.
     -- Without this the next install brought the old name back (the duplicate
     -- review's merge has replayed since round 18; rename and link did not).
     local WriteBack = require("koassistant.xray.artifact_writeback")
     WriteBack.replayIntoRungs(book_file, WriteBack.renameEdit(category_key, old_name, new_name))
+    local all = ActionCache.getUserAliases(book_file)
+    local rec = type(all[new_name]) == "table" and all[new_name] or {}
+    local ai_name = (type(before.ai_name) == "string" and before.ai_name ~= "") and before.ai_name or old_name
+    rec.ai_name = ai_name ~= new_name and ai_name or nil
+    local typed, have = {}, false
+    for _idx, t in ipairs(type(rec.typed) == "table" and rec.typed or {}) do
+        typed[#typed + 1] = t
+        if type(t) == "string" and t:lower() == new_name:lower() then have = true end
+    end
+    if not new_is_ai and new_name ~= ai_name and not have then typed[#typed + 1] = new_name end
+    rec.typed = #typed > 0 and typed or nil
+    -- The main name is matched and is nobody's added name
+    for _idx, key in ipairs({ "add", "ignore" }) do
+        local list = type(rec[key]) == "table" and rec[key] or {}
+        for i = #list, 1, -1 do
+            if type(list[i]) == "string" and list[i]:lower() == new_name:lower() then table.remove(list, i) end
+        end
+        rec[key] = list
+    end
+    all[new_name] = rec
+    ActionCache.setUserAliases(book_file, all)
+    -- The commit's view merged the record under the old name; read it again
+    self:reloadLiveMain(book_file)
     -- STAY IN PLACE (maintainer 2026-08-09, replacing the unwind-to-root):
     -- rebuild the path to the renamed detail synchronously, so no page in the
     -- fresh stack holds pre-rename item tables
     self:_dismissDetail(viewer)
     self:_rebuildToDetail(category_key, new_name)
-    local ConfirmBox = require("ui/widget/confirmbox")
-    local self_ref = self
-    UIManager:show(ConfirmBox:new{
-        text = T(_("Keep matching \"%1\" in the book text?\nThe AI keeps the old name either way. This only affects occurrence counts, search and highlight matching."), old_name),
-        ok_text = _("Keep matching"),
-        cancel_text = _("Stop matching"),
-        cancel_callback = function()
-            local ua = ActionCache.getUserAliases(book_file)
-            local rec = ua[new_name]
-            if type(rec) ~= "table" then
-                rec = {}
-                ua[new_name] = rec
-            end
-            rec.ignore = rec.ignore or {}
-            for _idx, term in ipairs(rec.ignore) do
-                if type(term) == "string" and term:lower() == old_name:lower() then return end
-            end
-            table.insert(rec.ignore, old_name)
-            ActionCache.setUserAliases(book_file, ua)
-            -- The open root menu shows counts built from the pre-ignore
-            -- aliases; a reload picks the ignore up
-            self_ref:reloadLiveMain(book_file)
-        end,
-    })
+    for _idx, it in ipairs((self.xray_data and self.xray_data[category_key]) or {}) do
+        if XrayParser.getItemName(it, category_key) == new_name then
+            self:editSearchTerms(it, category_key, new_name)
+            break
+        end
+    end
 end
 
+-- The names screen's words (B533): what a name is, and what it matches
+local NAME_KINDS = {
+    main = _("main name"),
+    ai = _("from the AI"),
+    ai_name = _("the AI's name"),
+    typed = _("your name"),
+    added = _("added by you"),
+}
+
+--- A row of the names screen as its button reads (B533), pure: the name,
+--- what it is, how it is matched. `matchable` = the entry's category is
+--- matched in the text. opts.no_kind leaves out what the name is (the
+--- reveal box's list, B590: "alias" would say the tapped word is somebody
+--- else's name).
+function XrayBrowser.nameRowLabel(row, matchable, opts)
+    -- capitals: the reader's pick, or the book's usage (S3), named either
+    -- way for a name with a capital to require (the name's options say
+    -- the same)
+    local cased = matchable and row.matched and XrayParser.capsExample(row.name)
+    local state = not row.matched and _("not matched")
+        or not cased and _("matched")
+        or row.case == "capitals" and _("capitals only")
+        or row.case == "any" and _("any case")
+        or row.auto and _("capitals only (automatic)")
+        or _("any case (automatic)")
+    if opts and opts.no_kind then
+        return T(_("%1 · %2"), row.name, state)
+    end
+    return T(_("%1 · %2 · %3"), row.name, NAME_KINDS[row.kind], state)
+end
+
+--- The row of the names screen a tapped text belongs to (B590), pure: the
+--- name whose exact keys the text matches (the rule the marks and the
+--- lookups share, so the underlined words find their name), else the text
+--- itself as a name of the AI's.
+--- @param rows table XrayBrowser.nameRows
+--- @param query string the tapped text
+--- @return table one row
+function XrayBrowser.tappedNameRow(rows, query)
+    local keys = {}
+    for _idx, k in ipairs(XrayParser.exactQueryKeys(query)) do keys[k] = true end
+    for _idx, row in ipairs(rows) do
+        for _j, k in ipairs(XrayParser.exactKeys(row.name)) do
+            if keys[k] then return row end
+        end
+    end
+    return { name = query, kind = "ai", matched = true }
+end
+
+--- A name's matching choices (B533 S1 to S3), pure: { { how, label }, ... }
+--- with how "auto" | "capitals" | "any" | "off"; empty when there is nothing
+--- to choose (a category not matched in the text). Capitals automatic until
+--- the reader picks, each choice a state; a name with no capital has none
+--- to choose, and a name the reader added is deleted rather than set aside.
+function XrayBrowser.nameChoices(row, matchable)
+    if not matchable then return {} end
+    local shown, lower = XrayParser.capsExample(row.name)
+    local choices = {}
+    if shown then
+        choices = {
+            { "auto", row.rule and _("Automatic (now capitals only)") or _("Automatic (now any case)") },
+            { "capitals", T(_("Capitals only (\"%1\", not \"%2\")"), shown, lower) },
+            { "any", T(_("Any case (\"%1\" and \"%2\")"), shown, lower) },
+        }
+    elseif row.kind ~= "added" then
+        choices = { { "auto", _("Matched") } }
+    end
+    if row.kind ~= "added" then
+        choices[#choices + 1] = { "off", _("Not matched (no underline, count or lookup)") }
+    end
+    return choices
+end
+
+--- What Automatic decides from, for the line under a name's choices (#120:
+--- the reporter could not tell why a name stayed any case): the rule's own
+--- counts once the index has the book, else when they come.
+function XrayBrowser.automaticLine(book_file, data, item, category_key, name)
+    local p, l = require("koassistant.artifacts.action_cache").capsCounts(book_file, name, data, item)
+    if p then
+        return T(_("Automatic decides from how the book writes the name: its capitals in %1 of %2 counted uses."), p, p + l)
+    end
+    return _("Automatic decides from how the book writes the name, once the book's names are indexed.")
+end
+
+--- One name's record edit (B533), pure on the tables: `entry` = the entry's
+--- record in the user-aliases sidecar (add, ignore, case), `item` = the
+--- entry as the view holds it (its aliases, `_name_off`, `_caps` follow),
+--- `action` = one of "remove" | "ignore" | "restore" | "capitals" |
+--- "anycase" | "autocase" or a list of them, `auto_fn` = the book's
+--- automatic capitals (ActionCache.autoCaps), read when a name goes back to
+--- automatic. The caller saves the record.
+function XrayBrowser.applyNameAction(entry, item, item_name, alias, action, auto_fn)
+    entry.add = entry.add or {}
+    entry.ignore = entry.ignore or {}
+    local alias_lower = alias:lower()
+    for _step, act in ipairs(type(action) == "table" and action or { action }) do
+        if act == "remove" then
+            -- Remove user-added alias from storage
+            for i = #entry.add, 1, -1 do
+                if entry.add[i]:lower() == alias_lower then
+                    table.remove(entry.add, i)
+                end
+            end
+            -- Remove from in-memory
+            if type(item.aliases) == "table" then
+                for i = #item.aliases, 1, -1 do
+                    if item.aliases[i]:lower() == alias_lower then
+                        table.remove(item.aliases, i)
+                    end
+                end
+            end
+
+        elseif act == "ignore" then
+            -- Add to ignore list (if not already there)
+            local already = false
+            for _idx, ign in ipairs(entry.ignore) do
+                if ign:lower() == alias_lower then already = true; break end
+            end
+            if not already then
+                table.insert(entry.ignore, alias)
+            end
+            -- Remove from in-memory
+            if type(item.aliases) == "table" then
+                for i = #item.aliases, 1, -1 do
+                    if item.aliases[i]:lower() == alias_lower then
+                        table.remove(item.aliases, i)
+                    end
+                end
+            end
+            -- B533: the main name stays the entry's; it only stops matching
+            if alias_lower == item_name:lower() then item._name_off = true end
+
+        elseif act == "restore" then
+            -- Remove from ignore list
+            for i = #entry.ignore, 1, -1 do
+                if entry.ignore[i]:lower() == alias_lower then
+                    table.remove(entry.ignore, i)
+                end
+            end
+            if alias_lower == item_name:lower() then
+                item._name_off = nil
+            else
+                -- Add back to in-memory aliases
+                if type(item.aliases) ~= "table" then
+                    item.aliases = item.aliases and { item.aliases } or {}
+                end
+                table.insert(item.aliases, alias)
+            end
+
+        elseif act == "capitals" or act == "anycase" or act == "autocase" then
+            -- B533 S2/S3: the record by the name as written, lowered ("any" keeps
+            -- the automatic rule off the name; no record = automatic); the view's
+            -- `_caps` the same way (mergeUserAliases)
+            local pick = (act == "capitals" and "capitals") or (act == "anycase" and "any") or nil
+            local case = type(entry.case) == "table" and entry.case or {}
+            case[alias_lower] = pick
+            entry.case = next(case) and case or nil
+            local caps = type(item._caps) == "table" and item._caps or {}
+            if pick then
+                caps[alias_lower] = pick == "capitals" or nil
+            else
+                caps[alias_lower] = (auto_fn and auto_fn() or {})[alias_lower] or nil
+            end
+            item._caps = next(caps) and caps or nil
+        end
+    end
+end
+
+--- The names of an UPCOMING entity and how each is matched (#120: "my lady"
+--- underlined for a "Lady" known from the next checkpoint, with nothing to
+--- set). The entry lives in the next checkpoint, not in the browser, so its
+--- full entry offers this list instead of the names screen: the same rows,
+--- choices and record (the record is by the entry's name, so it holds when
+--- the checkpoint installs), and nothing that edits the X-Ray itself (no
+--- rename, add or delete). A choice applies at once and the list stays open.
+--- From the reveal box, before Reveal (opts.tapped, B590), the list holds
+--- the tapped name alone, under its own words and without what it is, so
+--- it gives away neither the entry's name nor its other names; the full
+--- list once the entry is revealed.
+--- @param hit table XrayCard.resolve's hit (item, category_key, query)
+--- @param book_file string
+--- @param opts table|nil { tapped = true }
+function XrayBrowser.showUpcomingNames(hit, book_file, opts)
+    local ActionCache = require("koassistant.artifacts.action_cache")
+    local item, category_key = hit.item or {}, hit.category_key
+    local item_name = XrayParser.getItemName(item, category_key)
+    local matchable = not DISTRIBUTION_EXCLUDED[category_key]
+    local tapped = opts and opts.tapped and type(hit.query) == "string" and hit.query ~= "" and hit.query or nil
+    local label_opts = tapped and { no_kind = true } or nil
+    local function rows()
+        local all = XrayBrowser.nameRows(item, category_key, ActionCache.getUserAliases(book_file)[item_name],
+            ActionCache.autoCaps(book_file))
+        if not tapped then return all end
+        return { XrayBrowser.tappedNameRow(all, tapped) }
+    end
+    local list, options
+    local showOptions
+    local function showList()
+        local buttons = {}
+        for _idx, row in ipairs(rows()) do
+            local captured = row
+            buttons[#buttons + 1] = {{ text = XrayBrowser.nameRowLabel(row, matchable, label_opts), callback = function()
+                UIManager:close(list)
+                showOptions(captured)
+            end }}
+        end
+        buttons[#buttons + 1] = {{ text = _("Close"), id = "close", callback = function()
+            UIManager:close(list)
+        end }}
+        list = ButtonDialog:new{
+            title = tapped and T(_("Matching of \"%1\" (from the next checkpoint)"), tapped)
+                or T(_("Names of \"%1\" (from the next checkpoint)"), item_name),
+            buttons = buttons,
+        }
+        UIManager:show(list)
+    end
+    showOptions = function(row)
+        -- the row as it is now: a pick changes it
+        for _idx, r in ipairs(rows()) do
+            if r.name:lower() == row.name:lower() then
+                row = r
+                break
+            end
+        end
+        local buttons = {}
+        local choices = XrayBrowser.nameChoices(row, matchable)
+        local current = not row.matched and "off" or row.case or "auto"
+        for _idx, c in ipairs(choices) do
+            local how = c[1]
+            buttons[#buttons + 1] = {{ text = (how == current and "● " or "○ ") .. c[2], callback = function()
+                UIManager:close(options)
+                if how ~= current then
+                    local all = ActionCache.getUserAliases(book_file)
+                    local rec = all[item_name] or { add = {}, ignore = {} }
+                    local actions
+                    if how == "off" then
+                        actions = { "ignore" }
+                    else
+                        actions = { (how == "capitals" and "capitals") or (how == "any" and "anycase") or "autocase" }
+                        if not row.matched then table.insert(actions, 1, "restore") end
+                    end
+                    XrayBrowser.applyNameAction(rec, item, item_name, row.name, actions,
+                        function() return ActionCache.autoCaps(book_file) end)
+                    all[item_name] = rec
+                    ActionCache.setUserAliases(book_file, all)
+                end
+                showOptions(row)
+            end }}
+        end
+        buttons[#buttons + 1] = {{ text = _("Back"), id = "close", callback = function()
+            UIManager:close(options)
+            showList()
+        end }}
+        local title = tapped and row.name or T(_("%1 · %2"), row.name, NAME_KINDS[row.kind])
+        if XrayParser.capsExample(row.name) and #choices > 1 then
+            title = title .. "\n" .. XrayBrowser.automaticLine(book_file, nil, item, category_key, row.name)
+        end
+        options = ButtonDialog:new{
+            title = title,
+            buttons = buttons,
+            tap_close_callback = showList,
+        }
+        UIManager:show(options)
+    end
+    showList()
+end
+
+--- The rows of an entry's names screen (B533), pure: the main name, the
+--- aliases it matches (the AI's, the AI's own name after a rename, the names
+--- the reader typed or added), then the names set to not matched. Capitals:
+--- `case` = the reader's pick ("capitals" | "any", S2/S3), `caps` = the name
+--- matches capitals only (the pick, or the automatic rule: `auto`, S3),
+--- `rule` = what the automatic rule sets, whatever the pick.
+--- @param item table The entry as the browser holds it (the overlay merged)
+--- @param category_key string
+--- @param rec table|nil The entry's record in the user-aliases sidecar
+--- @param auto table|nil the names the book's usage sets to capitals only
+---   (ActionCache.autoCaps), lowered
+--- @return table rows { { name, kind = "main"|"ai"|"ai_name"|"typed"|"added", matched, case, caps, auto, rule } }
+function XrayBrowser.nameRows(item, category_key, rec, auto)
+    rec = type(rec) == "table" and rec or {}
+    local function set(list)
+        local s = {}
+        for _idx, v in ipairs(type(list) == "table" and list or {}) do
+            if type(v) == "string" then s[v:lower()] = true end
+        end
+        return s
+    end
+    local added, typed = set(rec.add), set(rec.typed)
+    local ai_name = type(rec.ai_name) == "string" and rec.ai_name:lower() or nil
+    local function kindOf(n)
+        local k = n:lower()
+        if added[k] then return "added" end
+        if typed[k] then return "typed" end
+        if k == ai_name then return "ai_name" end
+        return "ai"
+    end
+    local case = type(rec.case) == "table" and rec.case or {}
+    auto = type(auto) == "table" and auto or {}
+    local function row(n, kind, matched)
+        local low = n:lower()
+        local pick = (case[low] == "capitals" or case[low] == "any") and case[low] or nil
+        local by_rule = not pick and auto[low] == true
+        return { name = n, kind = kind, matched = matched, case = pick,
+            caps = pick == "capitals" or by_rule or nil, auto = by_rule or nil, rule = auto[low] == true or nil }
+    end
+    local main = XrayParser.getItemName(item, category_key)
+    local rows = { row(main, "main", not item._name_off) }
+    local seen = { [main:lower()] = true }
+    local function add(list, matched)
+        for _idx, n in ipairs(type(list) == "table" and list or {}) do
+            if type(n) == "string" and n ~= "" and not seen[n:lower()] then
+                seen[n:lower()] = true
+                rows[#rows + 1] = row(n, kindOf(n), matched)
+            end
+        end
+    end
+    add(type(item.aliases) == "table" and item.aliases or { item.aliases }, true)
+    add(rec.ignore, false)
+    return rows
+end
+
+--- Whether anything differs from the AI's names: a rename, the reader's own
+--- names, a name set to not matched or to capitals only (Reset's row). Pure.
+function XrayBrowser.namesDiffer(item, rec)
+    rec = type(rec) == "table" and rec or {}
+    local function count(list) return type(list) == "table" and #list or 0 end
+    return (type(rec.ai_name) == "string" and rec.ai_name ~= "") or count(rec.typed) > 0
+        or count(rec.add) > 0 or count(rec.ignore) > 0 or item._name_off == true
+        or (type(rec.case) == "table" and next(rec.case) ~= nil)
+end
+
+--- The names screen (B533; docs/xray_names_matching_plan.md section 4.1):
+--- every name the entry goes by, each with what it is and whether it is
+--- matched in the book text; a tap opens that name's options. Replaces Edit
+--- search terms and Rename… (More… → Names and matching…); the add, ignore
+--- and restore helpers below reopen it.
 function XrayBrowser:editSearchTerms(item, category_key, item_title, source, nav_context)
     local ActionCache = require("koassistant.artifacts.action_cache")
     local item_name = XrayParser.getItemName(item, category_key)
     local self_ref = self
-
-    -- Load stored user edits
-    local all_data = ActionCache.getUserAliases(self.metadata.book_file)
-    local user_entry = all_data[item_name] or { add = {}, ignore = {} }
-    local user_add = user_entry.add or {}
-    local user_ignore = user_entry.ignore or {}
-
-    -- Build lookup sets for classification
-    local add_set = {}
-    for _idx, a in ipairs(user_add) do add_set[a:lower()] = true end
-    local ignore_set = {}
-    for _idx, a in ipairs(user_ignore) do ignore_set[a:lower()] = true end
-
-    -- Current in-memory aliases (post-merge: includes user-added, excludes ignored)
-    local current_aliases = type(item.aliases) == "table" and item.aliases
-        or (item.aliases and { item.aliases } or {})
-
+    local rec = ActionCache.getUserAliases(self.metadata.book_file)[item_name]
+    local live_main = not self.scope and not self.metadata.checkpoint and self.metadata.book_file
+    -- Search terms belong to the categories matched in the text
+    local matchable = not DISTRIBUTION_EXCLUDED[category_key]
     local buttons = {}
-
-    -- Active aliases: show with Ignore (AI) or Remove (user-added) action
-    for _idx, alias in ipairs(current_aliases) do
-        local captured_alias = alias
-        local is_user_added = add_set[alias:lower()]
+    local auto = ActionCache.autoCaps(self.metadata.book_file)
+    for _idx, row in ipairs(XrayBrowser.nameRows(item, category_key, rec, auto)) do
+        local captured = row
         table.insert(buttons, {{
-            text = is_user_added
-                and T(_("Remove \"%1\""), alias)
-                or T(_("Ignore \"%1\""), alias),
+            text = XrayBrowser.nameRowLabel(row, matchable),
             callback = function()
                 UIManager:close(self_ref._edit_dialog)
                 self_ref._edit_dialog = nil
-                self_ref:_editSearchTermAction(item, category_key, item_title, source,
-                    item_name, captured_alias, is_user_added and "remove" or "ignore", nav_context)
+                self_ref:_showNameOptions(item, category_key, item_title, source, nav_context, captured)
             end,
         }})
     end
-
-    -- Ignored aliases: show with Restore action
-    for _idx, alias in ipairs(user_ignore) do
-        local captured_alias = alias
+    buttons[#buttons][1].separator = true
+    if matchable then
         table.insert(buttons, {{
-            text = T(_("Restore \"%1\" (ignored)"), alias),
-            callback = function()
-                UIManager:close(self_ref._edit_dialog)
-                self_ref._edit_dialog = nil
-                self_ref:_editSearchTermAction(item, category_key, item_title, source,
-                    item_name, captured_alias, "restore", nav_context)
-            end,
-        }})
-    end
-
-    -- Add separator before action buttons
-    if #buttons > 0 then
-        buttons[#buttons][1].separator = true
-    end
-
-    -- Add new + Close row
-    table.insert(buttons, {
-        {
-            text = _("Add new"),
+            text = _("Add a name…"),
             callback = function()
                 UIManager:close(self_ref._edit_dialog)
                 self_ref._edit_dialog = nil
                 self_ref:_addSearchTermInput(item, category_key, item_title, source, item_name, nav_context)
             end,
-        },
-        {
-            text = _("Close"),
-            id = "close",
+        }})
+    end
+    -- Reset may rename: on the live X-Ray only, unless nothing was renamed
+    local renamed = type(rec) == "table" and ((type(rec.ai_name) == "string" and rec.ai_name ~= "")
+        or (type(rec.typed) == "table" and #rec.typed > 0))
+    if XrayBrowser.namesDiffer(item, rec) and (live_main or not renamed) then
+        table.insert(buttons, {{
+            text = _("Reset to the AI's names"),
             callback = function()
                 UIManager:close(self_ref._edit_dialog)
                 self_ref._edit_dialog = nil
-                -- Detail viewer already refreshed by each action; just close the dialog
+                self_ref:_confirmResetNames(item, category_key, item_title, source, nav_context)
             end,
-        },
-    })
-
+        }})
+    end
+    table.insert(buttons, {{
+        text = _("Close"),
+        id = "close",
+        callback = function()
+            UIManager:close(self_ref._edit_dialog)
+            self_ref._edit_dialog = nil
+        end,
+    }})
     self._edit_dialog = ButtonDialog:new{
-        title = T(_("Search terms for \"%1\""), item_name),
+        title = T(_("Names of \"%1\""), item_name),
         buttons = buttons,
     }
     UIManager:show(self._edit_dialog)
+end
+
+--- One name's options on the names screen (B533): how it is matched, one
+--- choice with the one in force marked (a pick applies at once and the list
+--- stays, the mark moved), then what else the name allows. Nothing the AI
+--- wrote is deleted (R4): its names are renamed away or set to not matched,
+--- and Reset brings them back; the reader's own names delete.
+function XrayBrowser:_showNameOptions(item, category_key, item_title, source, nav_context, row)
+    local item_name = XrayParser.getItemName(item, category_key)
+    local self_ref = self
+    local live_main = not self.scope and not self.metadata.checkpoint and self.metadata.book_file
+    local matchable = not DISTRIBUTION_EXCLUDED[category_key]
+    local dialog
+    local buttons = {}
+    local function add(text, fn)
+        table.insert(buttons, {{ text = text, callback = function()
+            UIManager:close(dialog)
+            fn()
+        end }})
+    end
+    local function back()
+        self_ref:editSearchTerms(item, category_key, item_title, source, nav_context)
+    end
+    -- The row as it is now: a pick, or the name index landing, changes it
+    local ActionCache = require("koassistant.artifacts.action_cache")
+    local book_file = self.metadata.book_file
+    local low = row.name:lower()
+    for _idx, r in ipairs(XrayBrowser.nameRows(item, category_key,
+            ActionCache.getUserAliases(book_file)[item_name], ActionCache.autoCaps(book_file))) do
+        if r.name:lower() == low then
+            row = r
+            break
+        end
+    end
+    -- How it is matched (S1 to S3): one choice, the one in force marked
+    local shown = XrayParser.capsExample(row.name)
+    local choices = XrayBrowser.nameChoices(row, matchable)
+    if #choices > 1 then
+        local current = not row.matched and "off" or row.case or "auto"
+        for _idx, c in ipairs(choices) do
+            local how = c[1]
+            add((how == current and "● " or "○ ") .. c[2], function()
+                if how == current then
+                    self_ref:_showNameOptions(item, category_key, item_title, source, nav_context, row)
+                else
+                    self_ref:_setNameMatching(item, category_key, item_title, source, nav_context, row, how)
+                end
+            end)
+        end
+        table.insert(buttons, {})
+    end
+    if row.kind == "main" then
+        if live_main then
+            add(_("Rename…"), function() self_ref:_renameEntity(item, category_key, self_ref._detail_viewer) end)
+        end
+    elseif live_main then
+        add(_("Make it the main name"), function()
+            self_ref:_commitRename(category_key, item_name, row.name, self_ref._detail_viewer)
+        end)
+    end
+    if row.kind == "added" and matchable then
+        add(_("Delete"), function()
+            self_ref:_editSearchTermAction(item, category_key, item_title, source, item_name,
+                row.name, "remove", nav_context)
+        end)
+    elseif row.kind == "typed" and live_main then
+        add(_("Delete"), function()
+            self_ref:_deleteTypedName(item, category_key, item_title, source, nav_context, row.name)
+        end)
+    end
+    table.insert(buttons, {{ text = _("Back"), id = "close", callback = function()
+        UIManager:close(dialog)
+        back()
+    end }})
+    local title = T(_("%1 · %2"), row.name, NAME_KINDS[row.kind])
+    if shown and #choices > 1 then
+        title = title .. "\n" .. XrayBrowser.automaticLine(book_file, self.xray_data, item, category_key, row.name)
+    end
+    dialog = ButtonDialog:new{
+        title = title,
+        buttons = buttons,
+        tap_close_callback = back,
+    }
+    UIManager:show(dialog)
+end
+
+--- A name's matching picked (B533): "auto" | "capitals" | "any" | "off".
+--- The record and the view change, then the name's options show again with
+--- the new choice marked.
+function XrayBrowser:_setNameMatching(item, category_key, item_title, source, nav_context, row, how)
+    local item_name = XrayParser.getItemName(item, category_key)
+    local actions
+    if how == "off" then
+        actions = { "ignore" }
+    else
+        actions = { (how == "capitals" and "capitals") or (how == "any" and "anycase") or "autocase" }
+        if not row.matched then table.insert(actions, 1, "restore") end
+    end
+    local self_ref = self
+    self:_editSearchTermAction(item, category_key, item_title, source, item_name, row.name, actions, nav_context,
+        function()
+            self_ref:_showNameOptions(item, category_key, item_title, source, nav_context, row)
+        end)
+end
+
+--- Delete a name the reader typed (B533): out of the live X-Ray's aliases and
+--- the built checkpoints', out of the record.
+function XrayBrowser:_deleteTypedName(item, category_key, item_title, source, nav_context, name)
+    local book_file = self.metadata.book_file
+    local item_name = XrayParser.getItemName(item, category_key)
+    local WriteBack = require("koassistant.xray.artifact_writeback")
+    local ActionCache = require("koassistant.artifacts.action_cache")
+    local edit = WriteBack.dropAliasesEdit(category_key, item_name, { name })
+    if not self:_commitDormantOp(edit, T(_("\"%1\" deleted."), name)) then return end
+    WriteBack.replayIntoRungs(book_file, edit)
+    local all = ActionCache.getUserAliases(book_file)
+    local rec = type(all[item_name]) == "table" and all[item_name] or {}
+    for _idx, key in ipairs({ "typed", "ignore" }) do
+        local list = type(rec[key]) == "table" and rec[key] or {}
+        for i = #list, 1, -1 do
+            if type(list[i]) == "string" and list[i]:lower() == name:lower() then table.remove(list, i) end
+        end
+        rec[key] = list
+    end
+    all[item_name] = rec
+    ActionCache.setUserAliases(book_file, all)
+    self:_refreshNames(item, category_key, item_title, source, nav_context)
+end
+
+--- After an edit that rewrote the X-Ray: the view read again, the entry page
+--- and the names screen shown for the entry as it is now.
+function XrayBrowser:_refreshNames(item, category_key, item_title, source, nav_context)
+    local item_name = XrayParser.getItemName(item, category_key)
+    self:reloadLiveMain(self.metadata.book_file)
+    local fresh = item
+    for _idx, it in ipairs((self.xray_data and self.xray_data[category_key]) or {}) do
+        if XrayParser.getItemName(it, category_key) == item_name then
+            fresh = it
+            break
+        end
+    end
+    if self._dist_cache then self._dist_cache[tostring(item)] = nil end
+    if self._detail_viewer then
+        UIManager:close(self._detail_viewer)
+        self._detail_viewer = nil
+    end
+    self:showItemDetail(fresh, category_key, item_title, source, nav_context)
+    self:editSearchTerms(fresh, category_key, item_title, source, nav_context)
+end
+
+function XrayBrowser:_confirmResetNames(item, category_key, item_title, source, nav_context)
+    local self_ref = self
+    local ConfirmBox = require("ui/widget/confirmbox")
+    UIManager:show(ConfirmBox:new{
+        text = T(_("Give \"%1\" the AI's names again?\nThe names you typed or added are deleted, and every name the AI gave it is matched again, with capitals decided automatically."),
+            XrayParser.getItemName(item, category_key)),
+        ok_text = _("Reset"),
+        ok_callback = function()
+            self_ref:_resetNames(item, category_key, item_title, source, nav_context)
+        end,
+        cancel_callback = function()
+            self_ref:editSearchTerms(item, category_key, item_title, source, nav_context)
+        end,
+    })
+end
+
+--- Reset to the AI's names (B533 R4): the AI's main name back (the rename
+--- undone, in the built checkpoints too), the names the reader typed out of
+--- the aliases, the record cleared (added names, names not matched).
+function XrayBrowser:_resetNames(item, category_key, item_title, source, nav_context)
+    local book_file = self.metadata.book_file
+    local ActionCache = require("koassistant.artifacts.action_cache")
+    local WriteBack = require("koassistant.xray.artifact_writeback")
+    local name = XrayParser.getItemName(item, category_key)
+    local all = ActionCache.getUserAliases(book_file)
+    local rec = type(all[name]) == "table" and all[name] or {}
+    local ai_name = (type(rec.ai_name) == "string" and rec.ai_name ~= "") and rec.ai_name or name
+    local typed = type(rec.typed) == "table" and rec.typed or {}
+    if ai_name ~= name or #typed > 0 then
+        local function edit(data)
+            local changed = false
+            if ai_name ~= name then
+                changed = WriteBack.renameEdit(category_key, name, ai_name)(data)
+            end
+            return XrayParser.dropAliases(data, category_key, ai_name, typed) or changed
+        end
+        if not self:_commitDormantOp(edit, T(_("\"%1\" has the AI's names again."), ai_name)) then return end
+        if ai_name ~= name then ActionCache.renameEntityKeys(book_file, category_key, name, ai_name) end
+        WriteBack.replayIntoRungs(book_file, edit)
+    end
+    all = ActionCache.getUserAliases(book_file)
+    all[ai_name] = nil
+    ActionCache.setUserAliases(book_file, all)
+    self:reloadLiveMain(book_file)
+    if ai_name ~= name then
+        self:_dismissDetail(self._detail_viewer)
+        self:_rebuildToDetail(category_key, ai_name)
+        return
+    end
+    item._name_off, item._caps = nil, nil
+    self:_refreshNames(item, category_key, item_title, source, nav_context)
 end
 
 --- Handle add/remove/ignore/restore actions on search terms
@@ -4253,63 +4975,18 @@ end
 --- @param source table|nil Navigation source
 --- @param item_name string The item display name (storage key)
 --- @param alias string The alias being acted on
---- @param action string "remove"|"ignore"|"restore"
+--- @param action string|table "remove"|"ignore"|"restore"|"capitals"|"anycase"|"autocase", or a list of them
 --- @param nav_context table|nil Category navigation context
-function XrayBrowser:_editSearchTermAction(item, category_key, item_title, source, item_name, alias, action, nav_context)
+--- @param after function|nil what shows next (default: the names screen)
+function XrayBrowser:_editSearchTermAction(item, category_key, item_title, source, item_name, alias, action, nav_context, after)
     local ActionCache = require("koassistant.artifacts.action_cache")
     local all_data = ActionCache.getUserAliases(self.metadata.book_file)
     local entry = all_data[item_name] or { add = {}, ignore = {} }
     entry.add = entry.add or {}
     entry.ignore = entry.ignore or {}
-    local alias_lower = alias:lower()
-
-    if action == "remove" then
-        -- Remove user-added alias from storage
-        for i = #entry.add, 1, -1 do
-            if entry.add[i]:lower() == alias_lower then
-                table.remove(entry.add, i)
-            end
-        end
-        -- Remove from in-memory
-        if type(item.aliases) == "table" then
-            for i = #item.aliases, 1, -1 do
-                if item.aliases[i]:lower() == alias_lower then
-                    table.remove(item.aliases, i)
-                end
-            end
-        end
-
-    elseif action == "ignore" then
-        -- Add to ignore list (if not already there)
-        local already = false
-        for _idx, ign in ipairs(entry.ignore) do
-            if ign:lower() == alias_lower then already = true; break end
-        end
-        if not already then
-            table.insert(entry.ignore, alias)
-        end
-        -- Remove from in-memory
-        if type(item.aliases) == "table" then
-            for i = #item.aliases, 1, -1 do
-                if item.aliases[i]:lower() == alias_lower then
-                    table.remove(item.aliases, i)
-                end
-            end
-        end
-
-    elseif action == "restore" then
-        -- Remove from ignore list
-        for i = #entry.ignore, 1, -1 do
-            if entry.ignore[i]:lower() == alias_lower then
-                table.remove(entry.ignore, i)
-            end
-        end
-        -- Add back to in-memory aliases
-        if type(item.aliases) ~= "table" then
-            item.aliases = item.aliases and { item.aliases } or {}
-        end
-        table.insert(item.aliases, alias)
-    end
+    local self_ref = self
+    XrayBrowser.applyNameAction(entry, item, item_name, alias, action,
+        function() return ActionCache.autoCaps(self_ref.metadata.book_file) end)
 
     -- Save
     all_data[item_name] = entry
@@ -4327,6 +5004,10 @@ function XrayBrowser:_editSearchTermAction(item, category_key, item_title, sourc
     end
     self:showItemDetail(item, category_key, item_title, source, nav_context)
 
+    if after then
+        after()
+        return
+    end
     -- Re-open edit dialog to reflect changes
     self:editSearchTerms(item, category_key, item_title, source, nav_context)
 end
@@ -4344,7 +5025,7 @@ function XrayBrowser:_addSearchTermInput(item, category_key, item_title, source,
 
     local input_dialog
     input_dialog = InputDialog:new{
-        title = T(_("Add search term for \"%1\""), item_name),
+        title = T(_("Add a name for \"%1\""), item_name),
         input = "",
         input_hint = _("Enter alternate name or spelling"),
         buttons = {
@@ -4377,12 +5058,15 @@ function XrayBrowser:_addSearchTermInput(item, category_key, item_title, source,
                         entry.ignore = entry.ignore or {}
                         local new_lower = new_alias:lower()
 
-                        -- Check existing aliases (both AI and user)
-                        local current = type(item.aliases) == "table" and item.aliases or {}
+                        -- Check existing names (the main name, the AI's and the reader's aliases)
+                        local current = { item_name }
+                        for _idx, alias in ipairs(type(item.aliases) == "table" and item.aliases or {}) do
+                            current[#current + 1] = alias
+                        end
                         for _idx, alias in ipairs(current) do
                             if alias:lower() == new_lower then
                                 UIManager:show(InfoMessage:new{
-                                    text = _("This search term already exists."),
+                                    text = _("This name is already there."),
                                     timeout = 2,
                                 })
                                 self_ref:editSearchTerms(item, category_key, item_title, source, nav_context)
@@ -4476,6 +5160,9 @@ function XrayBrowser:chatAboutItem(detail_text, entity)
         config.features.book_metadata = freshBookMetadata(config.features.book_metadata,
             self.metadata.book_file, self.metadata.title, self.metadata.book_author)
     end
+    -- The entry's book, for the request's per-book settings: this X-Ray need
+    -- not be the open book's (set or cleared on every open, as the block below)
+    config.features._xray_entry_book = self.metadata.book_file or nil
     -- Clear stale selection data - the "highlight" is AI-generated, not a real book selection,
     -- so "Save to Note" must be disabled (prevents saving to a random prior highlight position)
     config.features.selection_data = nil
@@ -4601,6 +5288,8 @@ function XrayBrowser:runWikiForItem(item, category_key, title, source, nav_conte
         config.features.book_metadata = freshBookMetadata(config.features.book_metadata,
             file, self.metadata.title, self.metadata.book_author)
     end
+    -- and the request reads that book's own settings (see chatAboutItem)
+    config.features._xray_entry_book = file
 
     -- Set item description as disambiguation context (consumed by _forced_surrounding_context)
     config.features._forced_surrounding_context = XrayParser.formatItemDetail(item, category_key)
@@ -5794,8 +6483,16 @@ function XrayBrowser:_mentionsFromIndex(layout, first, last)
             for _idx2, item in ipairs(cat.items) do
                 local set = XrayParser.matchTermSet(item)
                 if set then
-                    local counts, total = XrayIndex.entityPages(layout, set,
-                        XrayParser.containingMatchHandles(self.xray_data, item), first, last)
+                    -- the containing handles (the costly part) only for a
+                    -- name the index holds at all: they only remove spans,
+                    -- as _carriedMentionsFromIndex counts (the sweep of 2026-11-06)
+                    local counts, total = XrayIndex.entityPages(layout, set, nil, first, last)
+                    if total and total > 0 then
+                        local handles = XrayParser.containingMatchHandles(self.xray_data, item)
+                        if handles then
+                            counts, total = XrayIndex.entityPages(layout, set, handles, first, last)
+                        end
+                    end
                     if hidden and counts then
                         total = 0
                         for p, c in pairs(counts) do
@@ -6479,7 +7176,9 @@ local function indexMentionRows(document, pages, set, handles)
         if text ~= "" then
             local pieces = XrayParser.textPieces(text)
             local norm, ranges = XrayParser.normalizePieces(pieces)
-            for k, o in ipairs(XrayParser.occurrencesIn(norm, set, handles)) do
+            -- A name set to capitals only reads the capitals (B533 S2)
+            local keep = set.caps and XrayParser.normalizePieces(pieces, true) or nil
+            for k, o in ipairs(XrayParser.occurrencesIn(norm, set, handles, keep)) do
                 local f, l = XrayParser.piecesForSpan(ranges, o[1], o[2])
                 if f then
                     local before, match, after = XrayParser.snippetFromPieces(pieces, f, l)
@@ -6513,8 +7212,15 @@ function XrayBrowser:_mentionXPointer(mention)
     if not ok or not pieces then return nil end
     local ranges = {}
     for i, pc in ipairs(pieces) do ranges[i] = pc.range or false end
+    -- Counted as the row was (capitals only, B533 S2)
+    local keep
+    if mention.set.caps then
+        local kb = XrayParser.newPieceNormalizer(true)
+        for _q, pc in ipairs(pieces) do kb.add(pc.text) end
+        keep = kb.result()
+    end
     local n = 0
-    for _idx, o in ipairs(XrayParser.occurrencesIn(norm, mention.set, mention.handles)) do
+    for _idx, o in ipairs(XrayParser.occurrencesIn(norm, mention.set, mention.handles, keep)) do
         local f, l = XrayParser.piecesForSpan(ranges, o[1], o[2])
         if f then
             for q = f, l do
@@ -6723,7 +7429,7 @@ function XrayBrowser:_showChapterMentions(item, category_key, item_title, chapte
         else
             require("ui/trapper"):wrap(function()
                 local Trapper = require("ui/trapper")
-                local info = InfoMessage:new{ text = _("Collecting the mentions… (tap to cancel)") }
+                local info = require("koassistant.ui.waiting").message{ text = _("Collecting the mentions… (tap to cancel)") }
                 UIManager:show(info)
                 UIManager:forceRePaint()
                 local completed, rows = Trapper:dismissableRunInSubprocess(function()
@@ -6790,9 +7496,9 @@ function XrayBrowser:_gotoMentionAndSearch(category_key, item_title, mention, te
         launchSearchSession(ui, mention.term.text, false, return_info)
     else
         -- EPUB: regex-OR of every term so prev/next walks aliases too
-        local pattern = buildSearchPattern(terms)
+        local pattern, cased = buildSearchPattern(terms)
         if pattern then
-            launchSearchSession(ui, pattern, true, return_info)
+            launchSearchSession(ui, pattern, true, return_info, cased, terms[1] and terms[1].text)
         else
             launchSearchSession(ui, terms[1].text, false, return_info)
         end
@@ -7050,7 +7756,7 @@ function XrayBrowser:_openOtherXrayAtItem(group, result)
 
     -- Merge user aliases
     if self.metadata.book_file then
-        local user_aliases = ActionCache.getUserAliases(self.metadata.book_file)
+        local user_aliases = ActionCache.matchOverlay(self.metadata.book_file)
         if next(user_aliases) then
             XrayParser.mergeUserAliases(data, user_aliases)
         end
@@ -8003,6 +8709,19 @@ function XrayBrowser:showOptions()
         or XrayParser.isFiction(self.xray_data) and _("Fiction")
         or _("Non-Fiction")
     table.insert(info_parts, _("Type:") .. " " .. type_label)
+    -- What it was built with (B568), from the saved entry itself, read at the
+    -- tap like the checkpoints line below: the shown version's own entry, a
+    -- section's, or the live X-Ray's
+    do
+        local built_entry = self.metadata.checkpoint and self.metadata.checkpoint_data or nil
+        if not self.metadata.checkpoint and self.metadata.book_file then
+            built_entry = require("koassistant.artifacts.action_cache").get(self.metadata.book_file,
+                (self.scope and self.scope.cache_key) or "_xray_cache")
+        end
+        for _idx, line in ipairs(XrayBrowser.buildLines(built_entry, XrayParser.isAcademic(self.xray_data))) do
+            table.insert(info_parts, line)
+        end
+    end
     if self.metadata.source_label then
         table.insert(info_parts, _("Source:") .. " " .. self.metadata.source_label)
     end
@@ -8033,8 +8752,8 @@ function XrayBrowser:showOptions()
                 local src = ProvActionCache.getXrayCache(rec.file)
                 local src_ts = src and tonumber(src.timestamp)
                 if src_ts then
-                    line = line .. " — " .. (src_ts > tonumber(rec.source_ts)
-                        and _("changed since the AI merge") or _("up to date"))
+                    line = line .. " (" .. (src_ts > tonumber(rec.source_ts)
+                        and _("changed since the AI merge") or _("up to date")) .. ")"
                 end
             end
             table.insert(info_parts, line)
@@ -8208,5 +8927,8 @@ function XrayBrowser:_showReaderRequired(navigate_to)
         })
     end
 end
+
+-- Test seam: the headless scenarios run the pattern KOReader's search gets
+XrayBrowser._buildSearchPattern = buildSearchPattern
 
 return XrayBrowser

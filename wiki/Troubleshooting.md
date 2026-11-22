@@ -44,9 +44,11 @@ Why it asks: extraction sends the book's content to the provider, raises token u
 
 **Quick check:** if a Recap or a context-aware highlight action answers from the book's title and author alone, the book's text was not allowed for that run. X-Ray shows the refusal with a button to the screen that holds the value.
 
+**A scanned PDF has no text to send.** A PDF made of page images (a scan without a text layer) gives no text even with Book text allowed: before an action sends, "No text could be extracted from this document" asks whether to send anyway, in which case the AI answers from its general knowledge, not the book. An X-Ray building checkpoints in the background stops instead. A copy of the PDF run through an OCR tool has a text layer the plugin can read.
+
 ## Emoji font setup
 
-Emoji icons in the plugin's menus and buttons (Emoji Menu Icons, Emoji Data Access Indicators) need an emoji font installed in KOReader, which ships none. The icons work in menus, the action manager, the X-Ray browser and chat-window buttons; they do not render inside the Markdown chat view, whose renderer (MuPDF) has no per-glyph font fallback. That is a KOReader limitation.
+Emoji icons in the plugin's menus and buttons (Emoji Menu Icons, Emoji Data Access Indicators) need an emoji font installed in KOReader, which ships none. The icons work in menus, the action manager, the X-Ray browser and chat-window buttons. The Markdown chat view needs no install: it draws emoji with the plugin's bundled copy of the same font. Plain Text windows, and the Minimal Popup when your View Mode is Plain Text, use KOReader's interface fonts, so they show emoji only once the font is installed.
 
 **The short route:** **Settings → Display Settings → Emoji → Emoji Font** installs the bundled Noto Emoji font into KOReader's fonts folder, enables it as a UI fallback font and asks for a restart; after the restart the same row shows a display test whose **Yes, enable** turns the icons on (with the icons already on, its buttons read **Yes, looks good** and **No, reinstall the font**, which copies the font again). The row's label says where you are (Not Installed, Restart KOReader, Installed). The Setup Wizard's Icons step (**Settings → Setup Wizard**) runs the same install and test. If the icons are on and no emoji font is there, the plugin offers the install once when it starts. The steps below are the same thing by hand.
 
@@ -71,15 +73,24 @@ Still not working? The font must be Noto Emoji itself (the fallback menu lists n
 
 ## Font issues with Arabic and other right-to-left scripts
 
-If text renders wrongly in the Markdown view, switch to plain text: on the fly with the **MD ON / TXT ON** button in the chat window, or for good with **Settings → Display Settings → Rendering → View Mode → Plain Text**. The Markdown view uses KOReader's MuPDF HTML renderer, which lacks per-glyph font fallback; plain text uses KOReader's native text rendering with proper font support, and keeps headers, bold and lists readable ([Chat Windows](Chat-Windows#markdown-and-plain-text)).
+The Markdown view draws Arabic, Persian and Urdu in Noto Naskh Arabic, Hebrew in FreeSans, Devanagari in KOReader's Noto UI face and emoji with the bundled Noto Emoji: its renderer (KOReader's MuPDF) cannot fall back letter by letter, but it takes a named font file for a run of text, and that is how each script gets its face wherever it appears, a word inside an English sentence included. A letter none of those faces cover (Thai, for one) goes to a fixed fallback face (the CJK font, then FreeSerif). If text renders wrongly there, switch to plain text: on the fly with the **MD ON / TXT ON** button in the chat window, or for good with **Settings → Display Settings → Rendering → View Mode → Plain Text**; plain text uses KOReader's interface fonts letter by letter and keeps headers, bold and lists readable ([Chat Windows](Chat-Windows#markdown-and-plain-text)). For the Arabic face, **Settings → Display Settings → Rendering → Right-to-left text font** picks Noto Sans Arabic UI, any font KOReader knows, or None.
 
-Right-to-left answers already switch to plain text on their own (dictionary and translate windows by their language, chat and artifact windows by their content), unless you turned the automatic switches off ([Languages](Languages#right-to-left-scripts)). Direction itself is not a font question: in the Markdown view every paragraph is laid out in its own direction ([Chat Windows](Chat-Windows#markdown-and-plain-text)).
+The Kindle build caches these fonts in `data/koassistant/images/koassistant_fonts/` under KOReader's data folder. This lets MuPDF load script fonts and local image previews from the chat window's resource directory. A missing cached font is copied again when an answer needs it.
+
+Every window stays in your view mode whatever the language; plain text is your choice (the button, View Mode, or **Text Mode for Dictionary** for the dictionary windows), never automatic ([Languages](Languages#right-to-left-scripts)). Direction itself is not a font question: in the Markdown view every paragraph is laid out in its own direction ([Chat Windows](Chat-Windows#markdown-and-plain-text)).
 
 ## "No API key found"
 
 Add the key for the selected provider in **Settings → API Keys & Auth** or in `apikeys.lua`. A key still set to a placeholder from `apikeys.lua.sample` (such as `YOUR_GEMINI_API_KEY`) counts as no key. Pasted keys are cleaned on read: spaces, line breaks (including one in the middle of the key, which is how a key copied from a wrapped text file usually fails) and invisible characters are dropped, so a key saved with them starts working without re-entering it; saving a key in Settings says how many stray characters it removed.
 
 Once any provider has a key, the provider pickers (inside the **Settings → Model** row and in Quick Settings) list only the providers that have one, plus keyless ones such as Ollama and the current provider marked "(no key)"; **Show all providers** at the end of the list shows the rest. A provider missing from the list has no key yet.
+
+## "API key not valid"
+
+The provider did not recognize the key it was sent. Under such an error, KOAssistant names the key that was sent: its name if you gave it one, whether it was added in the app or comes from `apikeys.lua`, its first 3 characters and its length. Compare them with your key:
+
+- **The start differs?** A key copied from a file opened in KOReader often loses its start. KOReader's selection starts at the start of the letters and digits under your finger, and a dot, dash or underscore ends them, so a selection that does not begin on the key's first character leaves out its first few characters (the `AQ.` of a Gemini key, the `sk-` of an OpenAI key). What is left still looks like a key, so it saves without complaint. Hold the key's first character and drag to its end, check the start after pasting (the key window's gray note says the same), or put the key in `apikeys.lua`.
+- **Not the key you meant?** The key in use is the one marked ● in the provider's key list (**Settings → API Keys & Auth**, then the provider). A key you save in the app becomes the one in use; a key you add to `apikeys.lua` does not replace one entered in the app, so tap it in the list.
 
 ## No response or a timeout
 
@@ -88,6 +99,18 @@ Once any provider has a key, the provider pickers (inside the **Settings → Mod
 3. Try **Settings → Advanced → Test Connection**.
 4. Be patient with very long requests: the plugin waits up to 15 minutes for the provider to send something, so a big X-Ray or a full-document run on a slow model is not cut off early.
 5. If the provider stopped the answer for a reason of its own (a content filter, a recitation block, a refusal), the reply says so by name instead of reporting a broken response; a partial answer is kept and marked as cut short, never saved as complete. For Gemini, see **Settings → Advanced → Provider Settings → Gemini Content Filter**.
+
+## A wait stops until you touch the screen
+
+Some Android e-readers put the processor to sleep a few seconds after the last touch, even while a page is on screen; on a Boox it was about 5 seconds. KOReader stops with the device and goes on when it wakes, at your next touch or the next change on screen. While KOAssistant waits, something on the screen keeps moving, which keeps such a device awake: the chat window's waiting dots, a line with the seconds and dots under a waiting message, and dots after an answer that pauses (during a web search, or when the provider is slow).
+
+These can still stop until you touch the screen:
+
+- **KOReader's start.** KOReader draws nothing while it starts, so a start that takes longer than those few seconds goes on only when the device wakes. Every plugin adds a little to the start.
+- **Work in the background.** X-Ray updates while you read, checkpoint builds and AI merges go on at each page turn.
+- **Work that holds the screen still.** A backup or a restore, an update's install, an index rebuild and Ollama's **Refresh installed models** show nothing moving while they run.
+
+What helps is a touch: tap the screen once when a start or a wait seems stuck. KOReader's own **Keep screen on** (gear menu → Screen → Screen timeout) does not stop this sleep: on the Boox where it was tried, starts stayed as slow with it, while touching the screen during a start cut it from 30 seconds or more to about 10. A start that finishes within those few seconds is never interrupted, which is why the same device starts in 3 seconds one time and in a minute the next. Your device may have a power-saving option of its own for the app. The background is in [issue #126](https://github.com/zeeyado/koassistant.koplugin/issues/126).
 
 ## Streaming not working
 

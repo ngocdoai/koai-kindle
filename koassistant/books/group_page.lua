@@ -4,8 +4,8 @@ singletons in the Book Hub's shape.
 
 - The GROUP HUB: THE per-group screen — GroupsUI.showGroup opens it, so every
   entry point and every group flow's reopen lands here. Rows: the ACTION
-  rows first (Group Settings… = koassistant/books/group_settings.lua, the fold
-  row, the kind-named Chat/Action row) so a long book list never pushes them onto the next
+  rows first (Group Settings… = koassistant/books/group_settings.lua, the
+  kind-named Chat/Action row) so a long book list never pushes them onto the next
   page, then a dim hint and the members in order (tap = that book's Book
   Hub, hold = the move / open / remove dialog; the open book's row says
   "open"), and LAST the add rows (Add from history…, Add from files (a book or a
@@ -222,8 +222,8 @@ local function hubBuild(ctx)
     local function row(text, fn)
         items[#items + 1] = { text = text, callback = fn }
     end
-    -- ACTION rows FIRST (round 9, maintainer): the group settings, the fold
-    -- and the Chat/Action sit above the members, in a predictable place a
+    -- ACTION rows FIRST (round 9, maintainer): the group settings and the
+    -- Chat/Action sit above the members, in a predictable place a
     -- long book list can never push onto the next page.
     -- G1: the settings the group sets for its members (docs/group_hub_plan.md §2.1)
     row(E("\u{2699}\u{FE0F}", require("koassistant.books.group_settings").rowLabel(ctx.group_id) .. "\u{2026}", em),
@@ -233,16 +233,9 @@ local function hubBuild(ctx)
                 on_close = function() GroupsUI.showGroup(ctx.group_id, flow_opts) end,
             })
         end)
-    -- A2/A3: the fold surface the kind picker promises — series chain or
-    -- project fan-in. Plain groups share nothing by design: no row.
-    if #group.books > 1 and ctx.plugin and ctx.plugin._startCrossBookXrayFlow
-        and BookGroups.sharesKnowledge(group) then
-        -- B394 slice 1: the row says what it costs before it is tapped
-        row(E("\u{1F500}", kind == BookGroups.KIND_PROJECT
-                and _("AI merge the group into one book (1 request per book)…")
-                or _("AI merge the series (1 request per book)…"), em),
-            function() GroupsUI.foldFlow(ctx.group_id, flow_opts) end)
-    end
+    -- No AI merge row here (B768): the hub leads with what is free, and the
+    -- paid merges stay inside an X-Ray's own "Link and merge…" group until
+    -- their name links are measured.
     -- Item 48(a): the group as launch surface — library chat/actions with the
     -- members pre-selected. Named after the kind (maintainer, G0 round 3),
     -- in the Book Hub's "Book Chat/Action" shape with its 💬.
@@ -260,6 +253,17 @@ local function hubBuild(ctx)
         dim = true,
         callback = function() end,
     }
+    -- The later volumes the series holds back from the book this hub was
+    -- opened for, or the open book (B591; the "→ Group" popup's rule, B418):
+    -- their rows say so and ask before the member's Book Hub opens, since its
+    -- rows open that volume's X-Ray and Recap. Nothing is held back when no
+    -- book led here (the Groups list).
+    local held = {}
+    local from_file = ctx.file or open_file
+    if from_file then
+        local ok_held, set = pcall(require("koassistant.artifacts.action_cache").heldBackLaterFiles, from_file)
+        if ok_held and type(set) == "table" then held = set end
+    end
     local authors, seen = {}, {}
     for i, path in ipairs(group.books) do
         local captured = path
@@ -276,17 +280,23 @@ local function hubBuild(ctx)
         if not BookGroups.fileExists(captured) then
             title = title .. " " .. _("(missing)")
         end
+        if held[captured] then
+            title = GroupsUI.laterLabel(title)
+        end
+        local function openHub()
+            -- A member row opens the member's Book Hub; it stacks over this
+            -- page, and its up-arrow comes back here
+            require("koassistant.books.book_page").show({
+                file = captured, plugin = ctx.plugin, ui = ctx.ui,
+                title = raw_title, author = author, enable_emoji = em,
+            })
+        end
         items[#items + 1] = {
             text = E("\u{1F4D6}", i .. ". " .. title, em),
             mandatory = captured == open_file and _("open") or nil,
-            callback = function()
-                -- A member row opens the member's Book Hub; it stacks over this
-                -- page, and its up-arrow comes back here
-                require("koassistant.books.book_page").show({
-                    file = captured, plugin = ctx.plugin, ui = ctx.ui,
-                    title = raw_title, author = author, enable_emoji = em,
-                })
-            end,
+            callback = held[captured]
+                and function() GroupsUI.confirmLaterVolume(raw_title, openHub) end
+                or openHub,
             hold_callback = function()
                 GroupsUI.showMoveDialog(ctx.group_id, captured, flow_opts)
             end,
@@ -351,7 +361,8 @@ function GroupPage.close(opts) closePage("", opts) end
 
 --- Show (or refresh) the hub for one group.
 --- @param opts table { group_id (required), plugin, ui, on_close, front,
----   enable_emoji (nil = the icons setting) }
+---   enable_emoji (nil = the icons setting), file (the book the hub is
+---   opened for: a later volume of its series is held back, B591) }
 function GroupPage.show(opts)
     local group_id = opts and opts.group_id
     if not group_id then return end
@@ -366,7 +377,7 @@ function GroupPage.show(opts)
     logger.dbg("KOAssistant GroupHub: show", group_id)
     openPage("", {
         key = group_id, group_id = group_id, plugin = opts.plugin, ui = opts.ui,
-        on_close = opts.on_close, front = opts.front,
+        file = opts.file, on_close = opts.on_close, front = opts.front,
         enable_emoji = emojiSetting(opts.plugin, opts.enable_emoji),
     }, hubBuild, {
         hamburger = hubHamburger,

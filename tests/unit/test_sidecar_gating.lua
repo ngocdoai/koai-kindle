@@ -97,6 +97,12 @@ package.loaded["koassistant.chat.notebook"] = {
         if path then return mock_notebook_content end
         return ""
     end,
+    -- what a request reads (B727): the notebook without the plugin's own
+    -- header; this stand-in's content has none
+    readForRequest = function(path)
+        if path then return mock_notebook_content end
+        return ""
+    end,
 }
 
 -- Mock ActionCache for cache tests
@@ -137,6 +143,11 @@ end
 local function setupSidecarData(data)
     mock_sidecar_data = data or {}
     mock_sidecar_data._valid_path = true
+    -- the shape ReaderHighlight writes: every highlight carries its drawer (a
+    -- page bookmark has none and is not a highlight, ContextExtractor.isHighlight)
+    for _idx, a in ipairs(mock_sidecar_data.annotations or {}) do
+        if type(a) == "table" and a.drawer == nil then a.drawer = "lighten" end
+    end
 end
 
 --- Helper: reset all mock data
